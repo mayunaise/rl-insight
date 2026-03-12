@@ -1,8 +1,8 @@
-# Cluster Analyse - RL Timeline 可视化工具
+# Cluster Analysis - RL Timeline 可视化工具
 
 ## 一、简介
 
-Cluster Analyse 是一个强化学习性能数据快速分析的可视化工具，基于 VeRL 框架采集的 profiling 数据进行解析，生成强化学习各阶段的 Timeline 图表。
+Cluster Analysis 是一个强化学习性能数据快速分析的可视化工具，基于 VeRL 框架采集的 profiling 数据进行解析，生成强化学习各阶段的 Timeline 图表。
 
 ### 主要功能
 
@@ -92,7 +92,8 @@ python -m cluster_analysis.cluster_analysis \
 2. 至少采集 level0 及以上数据（不支持level_none级数据）
 3. 采用离散模式采集 `discrete=True`
 4. MSTX 数据满足以下要求：
-   - 采集数据需经过解析，建议使用离线解析方式
+   - 采集数据需经过解析，仅支持使用离线解析方式（analyse=False）
+   - 离线解析参考 [MSTX profiling 离线解析](/docs/utils/mstx_preprocessing.md)
    - 输入路径下需包含 `*_ascend_pt` 目录
    - 每个 ascend_pt 目录下需包含 `profiler_info_*.json` 文件
    - trace_view.json 文件位于 `ASCEND_PROFILER_OUTPUT` 子目录中
