@@ -130,7 +130,7 @@ HTTP endpoints (prefix `/api/v1`):
   experiments return 404.
 
 CLI (talks to a running server; `--server-url` defaults to
-`$RL_INSIGHT_SERVER_URL` or `http://127.0.0.1:18080`):
+`$RL_INSIGHT_SERVER_URL` or `127.0.0.1:18080`):
 
 ```bash
 rl-insight server experiments list [--project project-a]

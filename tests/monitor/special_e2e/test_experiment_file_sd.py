@@ -148,6 +148,7 @@ def prometheus(tmp_path: Any) -> Iterator[PrometheusProcess]:
     binary = _find_prometheus()
     if binary is None:
         pytest.skip("no real Prometheus binary available")
+    assert binary is not None  # mypy can't see pytest.skip's NoReturn
     data_dir = tmp_path / "data"
     targets_file = data_dir / "targets" / "prometheus-targets.yml"
     targets_file.parent.mkdir(parents=True, exist_ok=True)
