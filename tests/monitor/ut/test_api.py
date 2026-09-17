@@ -378,3 +378,65 @@ def test_trace_span_and_trace_op_should_produce_same_event_shape(
     # the one intended difference is the compat-only segment marker
     assert decorator_event["attributes"]["monitor.trace_segment"] == "duration"
     assert "monitor.trace_segment" not in direct_event["attributes"]
+
+
+def test_init_should_reject_identity_with_only_one_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="both"):
+        api.init(
+            project="project-a",
+            config={"server": {"url": "http://monitor:18080"}},
+        )
+
+
+def test_init_should_pass_normalized_identity_to_the_hub_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: dict[str, Any] = {}
+
+    def create_client(conf: Any) -> RecordingClient:
+        received["project"] = conf.server.get("project", None)
+        received["experiment_name"] = conf.server.get("experiment_name", None)
+        return RecordingClient()
+
+    monkeypatch.setattr(api, "create_monitor_client", create_client)
+    api.init(
+        project=" project-a ",
+        experiment_name=" exp-1 ",
+        config={"server": {"url": "http://monitor:18080"}},
+    )
+
+    assert received == {"project": "project-a", "experiment_name": "exp-1"}
+    assert api._STATE.labels == {"project": "project-a", "experiment_name": "exp-1"}
+
+
+def test_metric_labels_may_not_override_init_identity(
+    recording_client: RecordingClient,
+) -> None:
+    api.metric_count("steps", amount=1, project="project-a")
+
+    with pytest.raises(ValueError, match="reserved"):
+        api.metric_count("steps", amount=1, project="project-b")
+
+    with pytest.raises(ValueError, match="reserved"):
+        api.metric_gauge("reward", value=1.0, experiment_name="experiment-b")
+
+
+def test_trace_attributes_may_not_override_init_identity(
+    recording_client: RecordingClient,
+) -> None:
+    api.trace_span(
+        name="step",
+        start_time_ns=1,
+        end_time_ns=2,
+        attributes={"project": "project-a"},
+    )
+
+    with pytest.raises(ValueError, match="reserved"):
+        api.trace_span(
+            name="step",
+            start_time_ns=1,
+            end_time_ns=2,
+            attributes={"project": "project-b"},
+        )

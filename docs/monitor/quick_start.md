@@ -148,7 +148,7 @@ To add a dashboard, put the JSON in an existing subdirectory, or add a new subdi
 
 Prometheus metrics and Tempo traces are persisted under `~/.rl-insight/data` by default. Stopping the server does not delete collected data.
 
-Prometheus scrape targets registered by trainers or `rl-insight server targets add` are stored separately in `~/.rl-insight/data/targets/prometheus-targets.yml`. The generated `prometheus.yml` references this persistent file through Prometheus file-based service discovery, so restarting the server stack does not clear registered targets. Target updates are written atomically under a cross-process lock. Existing registration paths continue to reload Prometheus for API compatibility, while file-based service discovery also refreshes the target file every five seconds.
+Prometheus scrape targets registered by trainers or `rl-insight server targets add` are stored separately: targets registered with an experiment identity (see [Experiment Isolation & Archiving](experiment_isolation.md)) live under `~/.rl-insight/data/projects/...`, all others in `~/.rl-insight/data/targets/prometheus-targets.yml`. The generated `prometheus.yml` references this persistent file through Prometheus file-based service discovery, so restarting the server stack does not clear registered targets. Target updates are written atomically under a cross-process lock. Existing registration paths continue to reload Prometheus for API compatibility, while file-based service discovery also refreshes the target file every five seconds.
 
 ## 6. Stop Services
 
