@@ -355,3 +355,27 @@ def test_concurrent_register_should_serialize_same_experiment_and_keep_other_exp
         store.active_file("project-a", "exp-1").read_text(encoding="utf-8")
     )
     assert isinstance(active, list) and len(active) == 4
+
+
+def test_reads_should_not_rewrite_an_unchanged_manifest(
+    store: ExperimentTargetStore,
+) -> None:
+    store.register("project-a", "exp-1", "job", [_target("10.0.0.1:9092")])
+    manifest = store.manifest_file("project-a", "exp-1")
+    inode_before = manifest.stat().st_ino
+
+    store.list_experiments("project-a")
+    store.show_targets("project-a", "exp-1")
+
+    assert manifest.stat().st_ino == inode_before
+
+
+def test_reads_should_keep_archived_state_when_all_discovery_files_vanish(
+    store: ExperimentTargetStore,
+) -> None:
+    store.register("project-a", "exp-1", "job", [_target("10.0.0.1:9092")])
+    store.archive("project-a", "exp-1")
+    store.archived_file("project-a", "exp-1").unlink()
+
+    assert store.list_experiments("project-a")[0]["state"] == "archived"
+    assert store.show_targets("project-a", "exp-1")["state"] == "archived"

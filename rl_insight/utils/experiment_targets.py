@@ -16,11 +16,12 @@
 
 Experiments are identified by the case-sensitive ``(project, experiment_name)``
 name pair. Each experiment owns an isolated manifest plus Prometheus discovery
-files under ``<data_dir>/projects/<sha256(project)>/experiments/<sha256(experiment_name)>/``;
-the digest keys keep untrusted names out of the filesystem paths. Archiving an
-experiment only moves its discovery file out of the Prometheus watch set —
-history already written to the shared TSDB/Tempo stays queryable until normal
-retention expires.
+files under ``<data_dir>/projects/<sha256(project)>__<sha256(experiment_name)>``
+as ``.active.yml`` (watched), ``.archived.yml`` (archive snapshot) and
+``.manifest.yaml`` siblings; the digest keys keep untrusted names out of the
+filesystem paths. Archiving an experiment only moves its discovery file out of
+the Prometheus watch set — history already written to the shared TSDB/Tempo
+stays queryable until normal retention expires.
 """
 
 from __future__ import annotations
@@ -579,12 +580,16 @@ class ExperimentTargetStore:
 
     def _write_manifest(self, stem: str, manifest: dict[str, Any]) -> None:
         manifest_file = self._manifest_file(stem)
+        payload = yaml.safe_dump(manifest, sort_keys=False)
+        if (
+            manifest_file.is_file()
+            and manifest_file.read_text(encoding="utf-8") == payload
+        ):
+            return
         manifest_file.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = manifest_file.with_name(f".{manifest_file.name}.{os.getpid()}.tmp")
         try:
-            tmp_path.write_text(
-                yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8"
-            )
+            tmp_path.write_text(payload, encoding="utf-8")
             os.replace(tmp_path, manifest_file)
         except BaseException:
             try:
@@ -600,21 +605,26 @@ class ExperimentTargetStore:
 
         The discovery file position is the source of truth: a crash between the
         archive/restore rename and the manifest update is fixed on the next
-        read, so a stale manifest never misstates an experiment.
+        read, so a stale manifest never misstates an experiment. Exception: when
+        both discovery files are gone, the stored manifest state wins so an
+        archived experiment is not silently resurrected.
         """
         active_exists = self._active_file(stem).exists()
         archived_exists = self._archived_file(stem).exists()
-        state = (
-            ExperimentTargets.STATE_ARCHIVED
-            if archived_exists and not active_exists
-            else ExperimentTargets.STATE_ACTIVE
-        )
         manifest = self._read_manifest(stem) or {
             "schema_version": ExperimentTargets.SCHEMA_VERSION,
             "project": project,
             "experiment_name": experiment_name,
             "created_at": _utc_now(),
         }
+        if archived_exists and not active_exists:
+            state = ExperimentTargets.STATE_ARCHIVED
+        elif active_exists or archived_exists:
+            state = ExperimentTargets.STATE_ACTIVE
+        elif manifest.get("state") == ExperimentTargets.STATE_ARCHIVED:
+            state = ExperimentTargets.STATE_ARCHIVED
+        else:
+            state = ExperimentTargets.STATE_ACTIVE
         manifest.setdefault("schema_version", ExperimentTargets.SCHEMA_VERSION)
         manifest["project"] = project
         manifest["experiment_name"] = experiment_name

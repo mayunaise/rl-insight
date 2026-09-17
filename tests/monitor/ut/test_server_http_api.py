@@ -246,6 +246,10 @@ def test_experiment_endpoints_should_validate_identity_and_unknown_experiments(
         show()
     assert missing_show.value.status_code == 400
 
+    with pytest.raises(HTTPException) as blank_show:
+        show(project=" ", experiment_name="exp-1")
+    assert blank_show.value.status_code == 400
+
     with pytest.raises(HTTPException) as unknown_show:
         show(project="project-a", experiment_name="missing")
     assert unknown_show.value.status_code == 404
@@ -313,3 +317,16 @@ def test_create_app_should_migrate_identified_records_from_the_legacy_global_fil
     assert remaining == [
         {"targets": ["b:9100"], "labels": {"rl_insight_job": "node_exporter"}}
     ]
+
+
+def test_create_app_should_keep_serving_when_legacy_migration_fails(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(PrometheusTargetStore, "reload", MagicMock(return_value=True))
+    global_file = tmp_path / "data" / "targets" / "prometheus-targets.yml"
+    global_file.parent.mkdir(parents=True, exist_ok=True)
+    global_file.write_text("{not: [valid", encoding="utf-8")
+
+    app = create_app(_conf(tmp_path))
+
+    assert _route(app, "/api/v1/experiments", method="GET")() == []

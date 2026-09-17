@@ -76,6 +76,8 @@ class _MonitorState:
 
 _STATE = _MonitorState()
 
+_LEGACY_IDENTITY_WARNING_EMITTED = False
+
 
 def _reject_identity_override(labels: Mapping[str, Any]) -> None:
     """Fail explicitly when call-level labels try to override the ``init`` identity.
@@ -83,8 +85,26 @@ def _reject_identity_override(labels: Mapping[str, Any]) -> None:
     ``project`` / ``experiment_name`` are reserved once ``init`` set them: a
     conflicting value would silently split one experiment's metrics or traces
     across label sets, so it is rejected instead of being merged over.
+    Without an ``init`` identity (legacy/global mode) the same names are plain
+    labels and pass through, with a one-time warning pointing at ``init()``.
     """
+    global _LEGACY_IDENTITY_WARNING_EMITTED
     identity_labels = _STATE.labels
+    if not identity_labels:
+        if (
+            any(key in labels for key in ("project", "experiment_name"))
+            and not _LEGACY_IDENTITY_WARNING_EMITTED
+        ):
+            _LEGACY_IDENTITY_WARNING_EMITTED = True
+            warnings.warn(
+                "[rl-insight] 'project'/'experiment_name' labels were passed per "
+                "call while init() has no experiment identity; they are kept as "
+                "plain labels. Call init(project=..., experiment_name=...) to "
+                "scope metrics and traces to one experiment.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return
     for key in ("project", "experiment_name"):
         if key in labels and str(labels[key]) != str(identity_labels.get(key)):
             raise ValueError(

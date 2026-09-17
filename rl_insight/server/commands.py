@@ -472,12 +472,15 @@ def _add_experiments_subcommands(
         ),
         (
             "archive",
-            "Stop Prometheus discovery for one experiment (idempotent).",
+            "Stop Prometheus discovery for one experiment (idempotent). Runs "
+            "reusing the same experiment name in one project share one logical "
+            "experiment, so archiving stops all of them.",
             commands.experiments_archive,
         ),
         (
             "restore",
-            "Re-enable discovery for one archived experiment (idempotent).",
+            "Re-enable discovery for one archived experiment (idempotent). All "
+            "runs sharing the same experiment name in one project resume together.",
             commands.experiments_restore,
         ),
     ):

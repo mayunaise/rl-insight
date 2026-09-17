@@ -23,6 +23,7 @@ import yaml
 from omegaconf import OmegaConf
 
 from rl_insight.server import runtime as runtime_module
+from rl_insight.utils.constants import ExperimentTargets
 
 _render_prometheus_config = runtime_module._render_prometheus_config
 
@@ -114,7 +115,15 @@ def test_render_prometheus_config_should_not_watch_archived_experiment_files(
         for file in config.get("files") or []
     ]
     assert any(file.endswith("projects/*.active.yml") for file in watched_files)
-    assert all("archived-targets.yml" not in file for file in watched_files)
+    assert all(
+        not file.endswith(
+            (
+                ExperimentTargets.ARCHIVED_TARGETS_SUFFIX,
+                ExperimentTargets.MANIFEST_SUFFIX,
+            )
+        )
+        for file in watched_files
+    )
 
 
 def test_render_prometheus_config_should_migrate_existing_static_targets(

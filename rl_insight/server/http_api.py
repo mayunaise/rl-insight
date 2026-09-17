@@ -96,7 +96,16 @@ def create_app(conf: DictConfig) -> FastAPI:
     app.state.legacy_targets = store
     app.state.experiments = experiments
 
-    migration = experiments.migrate_legacy_targets(store.targets_file)
+    try:
+        migration = experiments.migrate_legacy_targets(store.targets_file)
+    except Exception as exc:  # noqa: BLE001 - a broken legacy file must not take the server down
+        logger.error(
+            "[rl-insight] Legacy target migration failed (%s); keeping the global "
+            "file untouched and continuing startup. The next start retries the "
+            "migration, and legacy registration will surface the underlying error.",
+            exc,
+        )
+        migration = {"changed": False, "scanned": False}
     if migration["changed"]:
         logger.warning(
             "[rl-insight] Migrated %d identified target record(s) from the legacy "
@@ -260,6 +269,10 @@ def create_app(conf: DictConfig) -> FastAPI:
             )
         try:
             return experiments.show_targets(project, experiment_name)
+        except ExperimentIdentityError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            ) from exc
         except ExperimentNotFoundError as exc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)

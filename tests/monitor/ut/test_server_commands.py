@@ -288,3 +288,14 @@ def test_experiments_archive_should_fail_on_http_error(
 
     assert code == 1
     assert "experiment is archived" in capsys.readouterr().err
+
+
+def test_experiments_archive_and_restore_help_should_note_same_name_limitation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = commands_module._experiments_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--help"])
+    flattened = " ".join(capsys.readouterr().out.split())
+    assert "same experiment name" in flattened

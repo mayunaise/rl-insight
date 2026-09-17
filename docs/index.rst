@@ -22,7 +22,6 @@ For offline Recipe utilities, see the
    Agent Loop Protocol <monitor/agent_loop_protocol>
    Server Installation <monitor/server_installation>
    Data Directory Migration <monitor/data_migration>
-   Experiment Isolation & Archiving <monitor/experiment_isolation>
    Hardware Monitoring <monitor/hardware/index>
 
 .. toctree::
