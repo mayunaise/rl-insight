@@ -21,9 +21,10 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -341,10 +342,12 @@ class DependencyManager:
         candidates: list[Path] = []
         for exe in spec.executables:
             candidates.extend(root.rglob(exe))
+            if os.name == "nt":
+                candidates.extend(root.rglob(exe + ".exe"))
         candidates = [path for path in candidates if cls._is_executable_file(path)]
         if not candidates:
             return None
-        return sorted(candidates, key=lambda path: len(path.parts))[0]
+        return min(candidates, key=lambda path: len(path.parts))
 
     @staticmethod
     def _binary_version(binary: Path) -> str:

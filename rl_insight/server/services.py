@@ -75,8 +75,12 @@ class ServerServiceManager:
     def active_state(self) -> dict[str, Any] | None:
         return self.runtime.active_state()
 
-    def start(self, *, detach: bool, attach_logs: bool) -> StartedStack | None:
-        return self.runtime.start(detach=detach, attach_logs=attach_logs)
+    def start(
+        self, *, detach: bool, attach_logs: bool, auto_port: bool = False
+    ) -> StartedStack | None:
+        return self.runtime.start(
+            detach=detach, attach_logs=attach_logs, auto_port=auto_port
+        )
 
     def wait(self, stack: StartedStack, *, attach_logs: bool) -> int:
         return self.runtime.wait(stack, attach_logs=attach_logs)

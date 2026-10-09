@@ -1,0 +1,42 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (route, model) (rl_insight_monitor_uni_agent_router_requests_total)",
+          "legendFormat": "{{route}} → {{model}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Uni-Agent Router Requests",
+      "type": "timeseries"
+    }
+  ],
+  "schemaVersion": 41,
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
+  "title": "Uni-Agent Router Smoke",
+  "uid": "uni-agent-router-smoke",
+  "version": 1
+}

@@ -65,6 +65,7 @@ PROMETHEUS_PORT = int(os.environ.get("RL_INSIGHT_PROMETHEUS_PORT", "9090"))
 GRAFANA_PORT = 3000
 SCRAPE_WAIT_S = 15
 AGGREGATE_WAIT_S = 30
+EVENT_DRAIN_TIMEOUT_S = 15
 NS = "rl_insight_monitor"
 CHECKPOINT_FILE = os.environ.get(
     "RL_INSIGHT_STRESS_CHECKPOINT", "stress_checkpoint.json"
@@ -183,6 +184,15 @@ def _hub_events_count() -> int:
         except Exception:
             return -1
     return -1
+
+
+def _wait_for_hub_events(expected: int, timeout_s: float) -> int:
+    deadline = time.monotonic() + timeout_s
+    events = _hub_events_count()
+    while events < expected and time.monotonic() < deadline:
+        time.sleep(0.1)
+        events = _hub_events_count()
+    return events
 
 
 def _promql_value(service_ip: str, metric: str) -> float | None:
@@ -460,7 +470,9 @@ def run_concurrency_test(
             p.terminate()
             p.join(timeout=5)
 
-    hub_after = _hub_events_count()
+    hub_after = _wait_for_hub_events(
+        hub_before + total_submitted, EVENT_DRAIN_TIMEOUT_S
+    )
     hub_delta = hub_after - hub_before if hub_before >= 0 and hub_after >= 0 else -1
 
     if hub_delta >= 0 and total_submitted > 0:

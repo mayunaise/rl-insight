@@ -21,6 +21,7 @@ dependencies = [
   "opentelemetry-sdk",
   "opentelemetry-exporter-otlp-proto-http",
   "pyyaml",
+  "psutil",
 ]
 
 [project.optional-dependencies]
@@ -62,6 +63,7 @@ rl_insight = [
   "config/services/grafana/provisioning/datasources/*.yml",
   "config/services/grafana/provisioning/dashboards/*.yml",
   "config/services/grafana/dashboards/*.json",
+  "config/services/grafana/dashboards/*/*.json",
 ]
 recipe = [
   "config/*.yaml",

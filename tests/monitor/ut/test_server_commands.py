@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from unittest.mock import MagicMock, call
 
 import pytest
 import requests
+from omegaconf import OmegaConf
 
 from rl_insight import cli
 from rl_insight.server import commands as commands_module
@@ -36,6 +38,46 @@ def test_parser_should_accept_targets_add_command(tmp_path) -> None:
 
     assert args.target_file == target_file
     assert args.func.__name__ == "add_targets"
+
+
+@pytest.mark.parametrize("flags", [[], ["--auto-port", "--detach"]])
+def test_parser_should_accept_log_dir_for_server_start(tmp_path, flags) -> None:
+    log_dir = tmp_path / "rl-insight-data"
+
+    args = cli._build_parser().parse_args(
+        ["server", "start", "--log-dir", str(log_dir), *flags]
+    )
+
+    assert args.log_dir == log_dir
+    assert args.detach == bool(flags)
+    assert args.auto_port == bool(flags)
+    assert args.func.__name__ == "start"
+
+
+def test_parser_should_accept_relative_extra_dashboard_dir() -> None:
+    args = cli._build_parser().parse_args(
+        ["server", "start", "--extra-dashboard-dir", "relative/dashboards"]
+    )
+
+    assert args.extra_dashboard_dir == Path("relative/dashboards")
+
+
+def test_apply_log_dir_should_override_server_data_dir(tmp_path) -> None:
+    conf = OmegaConf.create({"server": {"data_dir": None}})
+
+    commands_module.ServerCommands._apply_log_dir(conf, tmp_path / "logs")
+
+    assert conf.server.data_dir == str(tmp_path / "logs")
+
+
+def test_data_dir_should_resolve_explicit_and_default_paths(tmp_path) -> None:
+    explicit = OmegaConf.create({"server": {"data_dir": str(tmp_path / "logs")}})
+    default = OmegaConf.create({"server": {}})
+
+    assert commands_module.ServerCommands._data_dir(explicit) == tmp_path / "logs"
+    assert commands_module.ServerCommands._data_dir(default) == (
+        commands_module.DEFAULT_STATE_ROOT / "data"
+    )
 
 
 def test_add_targets_should_register_each_job_and_reload_once(
@@ -56,11 +98,19 @@ jobs:
 """.strip(),
         encoding="utf-8",
     )
+    runtime_config = OmegaConf.create({"prometheus": {"prometheus_port": 54321}})
+    OmegaConf.save(runtime_config, tmp_path / "server.yaml")
+    monkeypatch.setattr(
+        commands_module.ServerServiceManager,
+        "active_state",
+        lambda self: {"runtime_dir": str(tmp_path)},
+    )
     store = MagicMock()
+    factory = MagicMock(return_value=store)
     monkeypatch.setattr(
         commands_module.PrometheusTargetStore,
         "from_config",
-        MagicMock(return_value=store),
+        factory,
     )
 
     result = commands_module.ServerCommands().add_targets(
@@ -68,6 +118,8 @@ jobs:
     )
 
     assert result == 0
+    actual = factory.call_args.args[0]
+    assert actual.prometheus.prometheus_port == 54321
     assert store.register.call_args_list == [
         call(
             "npu-exporter",

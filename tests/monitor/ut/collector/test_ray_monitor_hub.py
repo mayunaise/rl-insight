@@ -25,7 +25,6 @@ from omegaconf import OmegaConf
 from rl_insight.collector import ray_monitor_hub as hub_module
 from rl_insight.utils.constants import MonitorEventKind, MonitorRayActor
 
-
 HubImplementation = cast(
     Any, hub_module.MonitorHubActor
 ).__ray_metadata__.modified_class
@@ -162,3 +161,111 @@ def test_get_status_should_describe_endpoint_when_hub_is_initialized(hub: Any) -
         "otel_traces_enabled": True,
         "events_applied": 4,
     }
+
+
+# ------------------------------------------------------------------ S3 session mode
+
+_CONTEXT = {
+    "context_version": 1,
+    "identity": {
+        "id": "run-1",
+        "source": "managed",
+        "project": "proj",
+        "experiment_name": "exp",
+    },
+    "services": {"server": "http://s:1", "otlp_http": "http://s:1/v1/traces"},
+    "capabilities": ["identity_v1"],
+    "publisher": {"adapter": "managed"},
+    "server_instance_id": "srv-1",
+    "lifecycle_epoch": 3,
+}
+
+
+def _session_conf() -> Any:
+    return OmegaConf.create(
+        {
+            "server": {"namespace": "trainer", "url": "http://host:18080"},
+            "prometheus": {"metrics_report_port": 9092},
+        }
+    )
+
+
+def _patched_hub_environment(
+    monkeypatch: pytest.MonkeyPatch, *, accepted: bool = True
+) -> Any:
+    session = MagicMock()
+    session.metrics = MagicMock()
+    session.tracer = MagicMock(enabled=True)
+    endpoint = MagicMock()
+    endpoint.publication.accepted = accepted
+    endpoint.publication.code = "OWNERSHIP_CONFLICT"
+    endpoint.publication.message = "taken"
+    endpoint.server.port = 4321
+    session.start_metrics_endpoint.return_value = endpoint
+    monkeypatch.setattr(hub_module, "attach", MagicMock(return_value=session))
+    monkeypatch.setattr(hub_module.ray.util, "get_node_ip_address", lambda: "10.0.0.8")
+    monkeypatch.setattr(
+        hub_module.ray,
+        "get_runtime_context",
+        lambda: MagicMock(get_job_id=lambda: "job-1"),
+    )
+    monkeypatch.setattr(hub_module, "start_metrics_http_server", MagicMock())
+    monkeypatch.setattr(hub_module, "update_prometheus_config", MagicMock())
+    monkeypatch.setattr(hub_module, "get_server_services", MagicMock())
+    return session
+
+
+def test_session_hub_attaches_freezes_context_and_publishes_its_bound_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _patched_hub_environment(monkeypatch)
+    instance = HubImplementation.__new__(HubImplementation)
+
+    instance.__init__(_session_conf(), _CONTEXT)
+
+    hub_module.attach.assert_called_once_with(  # type: ignore[attr-defined]
+        # the actor re-builds the frozen context from the serialized dict
+        hub_module.Context.from_dict(_CONTEXT),
+        metrics_namespace="trainer",
+    )
+    assert instance._registry is session.metrics
+    assert instance._trace_collector is session.tracer
+    session.start_metrics_endpoint.assert_called_once_with(
+        component=MonitorRayActor.COMPONENT,
+        instance_key="hub/job-1",
+        host="10.0.0.8",
+        port=9092,
+        advertise_host="10.0.0.8",
+    )
+    session.start_renewal.assert_called_once_with()
+    assert instance._metrics_port == 4321
+    # no legacy discovery or file-SD write happens for a session hub
+    hub_module.start_metrics_http_server.assert_not_called()  # type: ignore[attr-defined]
+    hub_module.update_prometheus_config.assert_not_called()  # type: ignore[attr-defined]
+    hub_module.get_server_services.assert_not_called()  # type: ignore[attr-defined]
+
+
+def test_session_hub_with_rejected_publication_exposes_no_metrics_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _patched_hub_environment(monkeypatch, accepted=False)
+    instance = HubImplementation.__new__(HubImplementation)
+
+    instance.__init__(_session_conf(), _CONTEXT)
+
+    session.start_renewal.assert_not_called()
+    assert instance._metrics_port == 0
+
+
+def test_session_hub_reports_its_identity_and_stops_its_own_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _patched_hub_environment(monkeypatch)
+    instance = HubImplementation.__new__(HubImplementation)
+    instance.__init__(_session_conf(), _CONTEXT)
+
+    assert instance.get_identity() == _CONTEXT["identity"]
+
+    instance.shutdown()
+
+    session.close.assert_called_once_with()

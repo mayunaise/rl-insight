@@ -18,26 +18,49 @@ from __future__ import annotations
 
 import configparser
 import datetime as _dt
+import errno
 import json
 import os
+import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
+import psutil
+import requests
 import yaml
 from omegaconf import DictConfig, OmegaConf
 
-from .catalog import DEFAULT_STATE_ROOT, STATE_FILE
-from .network import format_host_port, local_addresses
-from .dependencies import (
-    MissingDependencyError,
-    DependencyManager,
+from ..utils.constants import (
+    PrometheusScrape,
+    managed_targets_file_from_config,
+    prometheus_targets_file_from_config,
 )
+from .catalog import DEFAULT_STATE_ROOT, STATE_FILE
+from .dependencies import (
+    DependencyManager,
+    MissingDependencyError,
+)
+from .network import format_host_port, local_addresses
+
+_HEALTH_ENDPOINTS = {
+    "rl-insight-server": ("server.port", "/healthz"),
+    "prometheus": ("prometheus.prometheus_port", "/-/ready"),
+    "tempo": ("tempo.query_port", "/ready"),
+    "grafana": ("grafana.port", "/api/health"),
+}
+
+
+class PortConflictError(RuntimeError):
+    """A child process lost its allocated port before binding."""
 
 
 @dataclass(frozen=True)
@@ -115,7 +138,118 @@ class LocalServiceRuntime:
             grafana_homepath=self.dependencies.resolve_grafana_homepath(grafana_binary),
         )
 
-    def start(self, *, detach: bool, attach_logs: bool) -> StartedStack | None:
+    def start(
+        self, *, detach: bool, attach_logs: bool, auto_port: bool = False
+    ) -> StartedStack | None:
+        for attempt in range(3 if auto_port else 1):
+            try:
+                return self._start_once(
+                    detach=detach, attach_logs=attach_logs, auto_port=auto_port
+                )
+            except PortConflictError:
+                if attempt == 2 or not auto_port:
+                    raise
+        return None
+
+    def _assign_ports(self) -> None:
+        """Plan distinct ports, reserving them together until allocation finishes."""
+        ports = {key: service for service, (key, _) in _HEALTH_ENDPOINTS.items()}
+        ports["otel.otel_port"] = "tempo"
+        if OmegaConf.select(self.conf, "tempo.enable", default=True):
+            tempo = yaml.safe_load(
+                Path(str(self.conf.tempo.config_file)).read_text(encoding="utf-8")
+            )
+            for key, section, field, default in (
+                ("grpc_port", "server", "grpc_listen_port", 9095),
+                ("memberlist_port", "memberlist", "bind_port", 7946),
+            ):
+                path = f"tempo.{key}"
+                if OmegaConf.select(self.conf, path) is None:
+                    port = (tempo or {}).get(section, {}).get(field, default)
+                    OmegaConf.update(self.conf, path, port)
+                ports[path] = "tempo"
+        address = local_addresses()
+        family = socket.AF_INET6 if address["family"] == "ipv6" else socket.AF_INET
+        with ExitStack() as reservations:
+            for key, service in ports.items():
+                section = "server" if service == "rl-insight-server" else service
+                if not OmegaConf.select(self.conf, f"{section}.enable", default=True):
+                    continue
+                port = int(OmegaConf.select(self.conf, key))
+                if not 0 <= port <= 65535:
+                    raise RuntimeError(f"Invalid port for {key}: {port}")
+                kinds = [socket.SOCK_STREAM]
+                if key == "tempo.memberlist_port":
+                    kinds.append(socket.SOCK_DGRAM)
+                for _ in range(32):
+                    with ExitStack() as candidate:
+                        try:
+                            for kind in kinds:
+                                sock = candidate.enter_context(
+                                    socket.socket(family, kind)
+                                )
+                                if sys.platform == "win32":
+                                    sock.setsockopt(
+                                        socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1
+                                    )
+                                sock.bind((address["bind"], port))
+                                port = sock.getsockname()[1]
+                        except OSError as exc:
+                            if exc.errno not in (errno.EADDRINUSE, errno.EACCES):
+                                raise RuntimeError(
+                                    f"Cannot allocate {key}: {exc}"
+                                ) from exc
+                            port = 0
+                            continue
+                        reservations.enter_context(candidate.pop_all())
+                        OmegaConf.update(self.conf, key, port)
+                        break
+                else:
+                    raise RuntimeError(f"Could not allocate a port for {key}")
+
+    def _wait_ready(self, service: StartedService, offset: int) -> None:
+        """Check readiness and classify only this attempt's startup errors."""
+        key, path = _HEALTH_ENDPOINTS[service.name]
+        host = "::1" if local_addresses()["family"] == "ipv6" else "127.0.0.1"
+        url = (
+            "http://" + format_host_port(host, OmegaConf.select(self.conf, key)) + path
+        )
+        deadline = time.monotonic() + 60
+        with requests.Session() as session:
+            session.trust_env = False
+            while True:
+                if service.process.poll() is not None:
+                    with service.log_file.open("rb") as log:
+                        log.seek(offset)
+                        message = log.read().decode("utf-8", errors="replace").lower()
+                    conflict = any(
+                        text in message
+                        for text in (
+                            "address already in use",
+                            "only one usage of each socket address",
+                            "[errno 10048]",
+                            "[winerror 10048]",
+                            "forbidden by its access permissions",
+                        )
+                    )
+                    error = PortConflictError if conflict else RuntimeError
+                    raise error(
+                        f"{service.name} exited during startup. See log: {service.log_file}"
+                    )
+                try:
+                    if session.get(url, timeout=1).status_code == 200:
+                        return
+                except requests.RequestException:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"{service.name} not ready after 60s. See log: {service.log_file}"
+                    )
+                time.sleep(0.2)
+
+    def _start_once(
+        self, *, detach: bool, attach_logs: bool, auto_port: bool
+    ) -> StartedStack | None:
         """Start local service processes and write the PID state file."""
         active_state = load_active_state(self.state_file)
         if active_state:
@@ -126,6 +260,8 @@ class LocalServiceRuntime:
         if missing:
             raise MissingDependencyError(missing)
 
+        if auto_port:
+            self._assign_ports()
         status_by_name = {status.name: status for status in statuses}
         tempo_status = status_by_name.get("tempo")
         grafana_status = status_by_name.get("grafana")
@@ -147,6 +283,7 @@ class LocalServiceRuntime:
                     name, binary, self.conf, runtime_files, self.install_root
                 )
                 log_file = log_dir / f"{name}.log"
+                offset = log_file.stat().st_size if log_file.exists() else 0
                 process = _spawn_service(name, command, log_file)
                 started.append(
                     StartedService(
@@ -156,6 +293,8 @@ class LocalServiceRuntime:
                         log_file=log_file,
                     )
                 )
+                if auto_port:
+                    self._wait_ready(started[-1], offset)
                 time.sleep(0.3)
                 return_code = process.poll()
                 if return_code is not None:
@@ -167,6 +306,7 @@ class LocalServiceRuntime:
                 name = "rl-insight-server"
                 command = _server_command(self.conf, runtime_files)
                 log_file = log_dir / "rl-insight-server.log"
+                offset = log_file.stat().st_size if log_file.exists() else 0
                 process = _spawn_service(name, command, log_file)
                 started.append(
                     StartedService(
@@ -176,6 +316,8 @@ class LocalServiceRuntime:
                         log_file=log_file,
                     )
                 )
+                if auto_port:
+                    self._wait_ready(started[-1], offset)
                 time.sleep(0.3)
                 return_code = process.poll()
                 if return_code is not None:
@@ -322,6 +464,8 @@ def load_active_state(state_file: Path) -> dict[str, Any] | None:
 def is_process_running(pid: int) -> bool:
     if pid <= 0:
         return False
+    if sys.platform == "win32":
+        return psutil.pid_exists(pid)
     try:
         os.kill(pid, 0)
     except OSError:
@@ -378,10 +522,289 @@ def _service_data_root(conf: DictConfig, _install_root: Path) -> Path:
 
 def _render_prometheus_config(conf: DictConfig, runtime_dir: Path) -> Path:
     target = runtime_dir / "prometheus.yml"
+    targets_file = prometheus_targets_file_from_config(conf)
+    legacy_targets_file = (runtime_dir / PrometheusScrape.TARGETS_FILE_NAME).resolve()
     source = Path(str(OmegaConf.select(conf, "prometheus.config_file")))
     data = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
-    target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    scrape_configs = data.get("scrape_configs") or []
+    if not isinstance(scrape_configs, list):
+        raise ValueError("Prometheus scrape_configs must be a list")
+
+    with _prometheus_targets_lock(targets_file):
+        if not targets_file.exists():
+            migrated_targets = (
+                _read_file_sd_targets(legacy_targets_file)
+                if legacy_targets_file.exists()
+                else _migrate_prometheus_static_targets(
+                    target, scrape_configs, targets_file
+                )
+            )
+            _write_yaml_atomically(targets_file, migrated_targets)
+
+    scrape_configs = [
+        item
+        for item in scrape_configs
+        if not _is_managed_prometheus_job(item, targets_file)
+        and not _is_controlled_prometheus_job(item)
+    ]
+    source_job_names: list[str] = []
+    managed_jobs: list[dict[str, Any]] = []
+    for source_job in scrape_configs:
+        if not isinstance(source_job, dict):
+            continue
+        source_job_name = str(source_job.get("job_name") or "").strip()
+        if not source_job_name:
+            continue
+        source_job_names.append(source_job_name)
+        profile_name = _available_prometheus_job_name([*scrape_configs, *managed_jobs])
+        managed_jobs.append(
+            _profiled_prometheus_job(
+                profile_name, source_job_name, source_job, targets_file
+            )
+        )
+
+    dynamic_job_name = _available_prometheus_job_name([*scrape_configs, *managed_jobs])
+    managed_jobs.append(
+        _managed_prometheus_job(
+            dynamic_job_name, targets_file, excluded_jobs=source_job_names
+        )
+    )
+    scrape_configs.extend(managed_jobs)
+    scrape_configs.append(_managed_identity_job(managed_targets_file_from_config(conf)))
+    data["scrape_configs"] = scrape_configs
+    _write_yaml_atomically(target, data)
     return target
+
+
+def _managed_identity_job(managed_targets_file: Path) -> dict[str, Any]:
+    """Controlled identity job over the Registry projection (S2 §4.1/§4.2).
+
+    ``honor_labels`` is off and no user relabel profile is attached, so the
+    identity labels Prometheus stores are exactly the ones the Registry
+    generated; a stale file-SD target is still refused by the scrape route,
+    which re-checks the live lease on every fetch.
+    """
+    return {
+        "job_name": PrometheusScrape.MANAGED_JOB,
+        "honor_labels": False,
+        "file_sd_configs": [
+            {
+                "files": [str(managed_targets_file)],
+                "refresh_interval": PrometheusScrape.TARGETS_REFRESH_INTERVAL,
+            }
+        ],
+    }
+
+
+def _is_controlled_prometheus_job(item: Any) -> bool:
+    return (
+        isinstance(item, dict) and item.get("job_name") == PrometheusScrape.MANAGED_JOB
+    )
+
+
+def _managed_prometheus_job(
+    job_name: str,
+    targets_file: Path,
+    *,
+    excluded_jobs: Sequence[str] = (),
+) -> dict[str, Any]:
+    relabel_configs: list[dict[str, Any]] = []
+    if excluded_jobs:
+        relabel_configs.append(
+            {
+                "source_labels": [PrometheusScrape.DYNAMIC_JOB_LABEL],
+                "regex": "|".join(re.escape(name) for name in excluded_jobs),
+                "action": "drop",
+            }
+        )
+    relabel_configs.extend(
+        [
+            {
+                "source_labels": [PrometheusScrape.DYNAMIC_JOB_LABEL],
+                "target_label": "job",
+            },
+            {
+                "regex": PrometheusScrape.DYNAMIC_JOB_LABEL,
+                "action": "labeldrop",
+            },
+        ]
+    )
+    return {
+        "job_name": job_name,
+        "file_sd_configs": [
+            {
+                "files": [str(targets_file)],
+                "refresh_interval": PrometheusScrape.TARGETS_REFRESH_INTERVAL,
+            }
+        ],
+        "relabel_configs": relabel_configs,
+    }
+
+
+def _profiled_prometheus_job(
+    profile_name: str,
+    source_job_name: str,
+    source_job: dict[str, Any],
+    targets_file: Path,
+) -> dict[str, Any]:
+    discovery_keys = {
+        key
+        for key in source_job
+        if key == "static_configs" or key.endswith("_sd_configs")
+    }
+    profile = {
+        "job_name": profile_name,
+        **{
+            key: value
+            for key, value in source_job.items()
+            if key not in discovery_keys and key not in {"job_name", "relabel_configs"}
+        },
+        "file_sd_configs": [
+            {
+                "files": [str(targets_file)],
+                "refresh_interval": PrometheusScrape.TARGETS_REFRESH_INTERVAL,
+            }
+        ],
+        "relabel_configs": [
+            {
+                "source_labels": [PrometheusScrape.DYNAMIC_JOB_LABEL],
+                "regex": re.escape(source_job_name),
+                "action": "keep",
+            },
+            {
+                "source_labels": [PrometheusScrape.DYNAMIC_JOB_LABEL],
+                "target_label": "job",
+            },
+            {
+                "regex": PrometheusScrape.DYNAMIC_JOB_LABEL,
+                "action": "labeldrop",
+            },
+            *(source_job.get("relabel_configs") or []),
+        ],
+    }
+    return profile
+
+
+def _is_managed_prometheus_job(item: Any, targets_file: Path) -> bool:
+    if not isinstance(item, dict):
+        return False
+    name = str(item.get("job_name") or "")
+    if not name.startswith(PrometheusScrape.DYNAMIC_CONFIG_JOB):
+        return False
+    file_sd_configs = item.get("file_sd_configs") or []
+    if not any(
+        isinstance(config, dict) and config.get("files") == [str(targets_file)]
+        for config in file_sd_configs
+    ):
+        return False
+    return any(
+        isinstance(config, dict)
+        and config.get("regex") == PrometheusScrape.DYNAMIC_JOB_LABEL
+        and config.get("action") == "labeldrop"
+        for config in item.get("relabel_configs") or []
+    )
+
+
+def _available_prometheus_job_name(scrape_configs: list[Any]) -> str:
+    used_names = {
+        str(item.get("job_name"))
+        for item in scrape_configs
+        if isinstance(item, dict) and item.get("job_name") is not None
+    }
+    base = PrometheusScrape.DYNAMIC_CONFIG_JOB
+    if base not in used_names:
+        return base
+    suffix = 1
+    while f"{base}-{suffix}" in used_names:
+        suffix += 1
+    return f"{base}-{suffix}"
+
+
+def _write_yaml_atomically(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+@contextmanager
+def _prometheus_targets_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = path.with_name(f".{path.name}.lock")
+    with lock_file.open("a+", encoding="utf-8") as handle:
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if sys.platform == "win32":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _read_file_sd_targets(path: Path) -> list[dict[str, Any]]:
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or []
+    if not isinstance(data, list):
+        raise ValueError("Prometheus file_sd targets must be a list")
+    return data
+
+
+def _migrate_prometheus_static_targets(
+    config_file: Path,
+    source_scrape_configs: list[Any],
+    targets_file: Path,
+) -> list[dict[str, Any]]:
+    if not config_file.exists():
+        return []
+    legacy = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
+    source_targets = {
+        (str(job.get("job_name") or ""), str(target))
+        for job in source_scrape_configs
+        if isinstance(job, dict)
+        for static_group in job.get("static_configs") or []
+        if isinstance(static_group, dict)
+        for target in static_group.get("targets") or []
+    }
+    groups: list[dict[str, Any]] = []
+    for job in legacy.get("scrape_configs") or []:
+        if not isinstance(job, dict):
+            continue
+        job_name = str(job.get("job_name") or "").strip()
+        if not job_name or _is_managed_prometheus_job(job, targets_file):
+            continue
+        for static_group in job.get("static_configs") or []:
+            if not isinstance(static_group, dict):
+                continue
+            targets = [
+                str(item)
+                for item in static_group.get("targets") or []
+                if (job_name, str(item)) not in source_targets
+            ]
+            if not targets:
+                continue
+            labels = {
+                str(key): str(value)
+                for key, value in (static_group.get("labels") or {}).items()
+            }
+            labels[PrometheusScrape.DYNAMIC_JOB_LABEL] = job_name
+            groups.append({"targets": targets, "labels": labels})
+    return groups
 
 
 def _render_tempo_config(
@@ -397,6 +820,12 @@ def _render_tempo_config(
     server_data = data.setdefault("server", {})
     server_data["http_listen_port"] = query_port
     server_data["http_listen_address"] = local_addresses()["bind"]
+    for key, section, field in (
+        ("grpc_port", "server", "grpc_listen_port"),
+        ("memberlist_port", "memberlist", "bind_port"),
+    ):
+        if OmegaConf.select(conf, f"tempo.{key}") is not None:
+            data.setdefault(section, {})[field] = int(conf.tempo[key])
     receiver = (
         data.setdefault("distributor", {})
         .setdefault("receivers", {})
@@ -504,12 +933,14 @@ def _render_grafana_provisioning(
             {
                 "name": "RL-Insight",
                 "orgId": 1,
-                "folder": "RL-Insight",
                 "type": "file",
                 "disableDeletion": False,
                 "updateIntervalSeconds": 10,
                 "allowUiUpdates": True,
-                "options": {"path": str(dashboard_path)},
+                "options": {
+                    "path": str(dashboard_path.resolve()),
+                    "foldersFromFilesStructure": True,
+                },
             }
         ],
     }
@@ -521,14 +952,48 @@ def _render_grafana_provisioning(
 def _stage_grafana_dashboards(conf: DictConfig, runtime_dir: Path) -> Path:
     source = Path(str(OmegaConf.select(conf, "grafana.dashboards_dir"))).resolve()
     target = (runtime_dir / "dashboards").resolve()
-    if source == target:
-        target.mkdir(parents=True, exist_ok=True)
-        return target
-
     target.mkdir(parents=True, exist_ok=True)
+    if source != target and source.exists():
+        shutil.rmtree(target)
+        target.mkdir(parents=True)
+        _copy_dashboard_directory(source, target)
 
-    if not source.exists():
+    extra = OmegaConf.select(conf, "grafana.extra_dashboard_dir")
+    if extra is None:
         return target
+
+    planned_json = {
+        path.relative_to(target)
+        for path in target.rglob("*")
+        if path.is_file() and path.suffix.casefold() == ".json"
+    }
+    extra_source = Path(str(extra)).resolve()
+    if extra_source == target:
+        return target
+    if not extra_source.exists():
+        raise RuntimeError(
+            f"Extra Grafana dashboard directory {str(extra_source)!r} does not exist."
+        )
+    if not extra_source.is_dir():
+        raise RuntimeError(
+            f"Extra Grafana dashboard path {str(extra_source)!r} is not a directory."
+        )
+    for path in extra_source.rglob("*"):
+        if not path.is_file() or path.suffix.casefold() != ".json":
+            continue
+        relative_path = path.relative_to(extra_source)
+        if relative_path in planned_json:
+            raise RuntimeError(
+                f"Grafana dashboard {relative_path.as_posix()!r} from extra "
+                f"source {str(extra_source)!r} already exists in runtime dashboards."
+            )
+        planned_json.add(relative_path)
+
+    _copy_dashboard_directory(extra_source, target)
+    return target
+
+
+def _copy_dashboard_directory(source: Path, target: Path) -> None:
     for item in source.iterdir():
         destination = target / item.name
         if item.is_file():
@@ -537,9 +1002,8 @@ def _stage_grafana_dashboards(conf: DictConfig, runtime_dir: Path) -> Path:
             shutil.copy2(item, destination)
         elif item.is_dir():
             if destination.exists() and not destination.is_dir():
-                continue
+                destination.unlink()
             shutil.copytree(item, destination, dirs_exist_ok=True)
-    return target
 
 
 def _service_specific_data_dir(conf: DictConfig, name: str, data_root: Path) -> Path:
@@ -606,6 +1070,9 @@ def _spawn_service(
     env = os.environ.copy()
     log_file.parent.mkdir(parents=True, exist_ok=True)
     stdout = log_file.open("ab")
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NO_WINDOW
     try:
         process = subprocess.Popen(
             list(command),
@@ -613,7 +1080,8 @@ def _spawn_service(
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             env=env,
-            start_new_session=True,
+            start_new_session=sys.platform != "win32",
+            creationflags=creationflags,
         )
         stdout.close()
         return process
@@ -625,6 +1093,10 @@ def _spawn_service(
 def _terminate_process(process: subprocess.Popen[Any]) -> None:
     if process.poll() is not None:
         return
+    if sys.platform == "win32":
+        _terminate_pid(process.pid)
+        process.wait(timeout=8)
+        return
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except OSError:
@@ -634,6 +1106,23 @@ def _terminate_process(process: subprocess.Popen[Any]) -> None:
 
 def _terminate_pid(pid: int) -> None:
     if pid <= 0:
+        return
+    if sys.platform == "win32":
+        try:
+            parent = psutil.Process(pid)
+            processes = parent.children(recursive=True) + [parent]
+            for process in processes:
+                try:
+                    process.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            _, alive = psutil.wait_procs(processes, timeout=8)
+            if alive:
+                raise RuntimeError(
+                    f"Failed to stop processes: {[p.pid for p in alive]}"
+                )
+        except psutil.NoSuchProcess:
+            pass
         return
     try:
         os.killpg(pid, signal.SIGTERM)

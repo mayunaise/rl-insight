@@ -17,19 +17,44 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any, cast
 
 import ray
 from omegaconf import DictConfig
 
 from ..collector.ray_monitor_hub import MonitorHubActor
+from ..sdk.identity import Context
 from ..utils.constants import MonitorEnv, MonitorRayActor
 from .base import MonitorClient
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 
-__all__ = ["MonitorRayClient", "create_ray_monitor_client", "get_or_create_monitor_hub"]
+__all__ = [
+    "HubIdentityConflict",
+    "MonitorRayClient",
+    "create_ray_monitor_client",
+    "get_or_create_monitor_hub",
+    "release_monitor_hub",
+]
+
+
+class HubIdentityConflict(RuntimeError):
+    """An existing hub actor belongs to a different run and is never reused."""
+
+
+# Session-mode handles borrowed by this process: actor name -> (handle, refcount).
+# A worker's close releases one reference; only the last borrower stops the hub.
+_HUB_HANDLES: dict[str, tuple[Any, int]] = {}
+
+
+def _coerce_context(
+    context: Context | Mapping[str, Any] | None,
+) -> Context | None:
+    if context is None or isinstance(context, Context):
+        return context
+    return Context.from_dict(context)
 
 
 def _current_job_actor_name() -> str:
@@ -39,24 +64,64 @@ def _current_job_actor_name() -> str:
     return f"{MonitorRayActor.NAME}_{job_id_str}"
 
 
-def get_or_create_monitor_hub(conf: DictConfig) -> Any:
+def _hub_actor_name(context: Context) -> str:
+    """Hub name for one run: full run_key plus Ray job id, never the display name."""
+    return f"{_current_job_actor_name()}_{context.identity.run_key}"
+
+
+def _retain(actor_name: str, handle: Any) -> None:
+    _, count = _HUB_HANDLES.get(actor_name, (handle, 0))
+    _HUB_HANDLES[actor_name] = (handle, count + 1)
+
+
+def release_monitor_hub(actor_name: str) -> None:
+    """Drop one reference to a hub; the last borrower stops its session resources."""
+    entry = _HUB_HANDLES.get(actor_name)
+    if entry is None:
+        return
+    handle, count = entry
+    if count > 1:
+        _HUB_HANDLES[actor_name] = (handle, count - 1)
+        return
+    _HUB_HANDLES.pop(actor_name, None)
+    handle.shutdown.remote()
+
+
+def _check_hub_identity(handle: Any, context: Context) -> None:
+    """Refuse to reuse a hub that serves another run."""
+    existing = ray.get(handle.get_identity.remote())
+    wanted = context.identity.to_dict()
+    if existing != wanted:
+        raise HubIdentityConflict(
+            f"monitor hub serves {existing!r}, refusing to reuse it for {wanted!r}"
+        )
+
+
+def get_or_create_monitor_hub(
+    conf: DictConfig,
+    context: Context | Mapping[str, Any] | None = None,
+) -> Any:
     """Get or create a job-scoped MonitorHubActor with health check.
 
-    Each Ray job gets its own hub actor named
-    ``MonitorRayActor.NAME_{job_id}``. The actor is not detached, so it
-    cleans up automatically when the job exits.
+    Without a context the hub is job-scoped (legacy single-session behavior).
+    With a context the hub is scoped to that run and Ray job, its identity is
+    compared before reuse, and this process holds one reference.
 
     Args:
         conf: Merged trainer monitor config passed to the actor constructor.
+        context: Frozen run context, when the caller is an explicit session.
 
     Returns:
         Ray actor handle for ``MonitorHubActor``.
 
     Raises:
         RuntimeError: If Ray is not initialized.
+        HubIdentityConflict: If the existing hub serves a different run.
     """
-
-    actor_name = _current_job_actor_name()
+    resolved = _coerce_context(context)
+    actor_name = (
+        _hub_actor_name(resolved) if resolved is not None else _current_job_actor_name()
+    )
     namespace = MonitorRayActor.NAMESPACE
 
     try:
@@ -64,6 +129,9 @@ def get_or_create_monitor_hub(conf: DictConfig) -> Any:
         logger.info(
             "[rl-insight] Connected to existing monitor hub actor %r.", actor_name
         )
+        if resolved is not None:
+            _check_hub_identity(handle, resolved)
+            _retain(actor_name, handle)
         return handle
     except ValueError:
         logger.info(
@@ -75,28 +143,43 @@ def get_or_create_monitor_hub(conf: DictConfig) -> Any:
         "namespace": namespace,
     }
     server_url = str(conf.server.url).strip()
-    if server_url:
+    # The legacy hub finds its server through the environment; a session hub gets
+    # the frozen services in its context and must not re-read the environment.
+    if server_url and resolved is None:
         actor_options["runtime_env"] = {
             "env_vars": {MonitorEnv.SERVER_URL: server_url},
         }
 
     try:
         actor_cls = cast(Any, MonitorHubActor)
-        return actor_cls.options(**actor_options).remote(conf)
+        handle = (
+            actor_cls.options(**actor_options).remote(conf)
+            if resolved is None
+            else actor_cls.options(**actor_options).remote(conf, resolved.to_dict())
+        )
     except ValueError:
         logger.info(
             "[rl-insight] Monitor hub actor %r was created concurrently; "
             "connecting to it.",
             actor_name,
         )
-        return ray.get_actor(actor_name, namespace=namespace)
+        handle = ray.get_actor(actor_name, namespace=namespace)
+        if resolved is not None:
+            _check_hub_identity(handle, resolved)
+    if resolved is not None:
+        _retain(actor_name, handle)
+    return handle
 
 
-def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
+def create_ray_monitor_client(
+    conf: DictConfig,
+    context: Context | Mapping[str, Any] | None = None,
+) -> MonitorRayClient | None:
     """Build a client that talks to ``MonitorHubActor`` over Ray.
 
     Args:
         conf: Merged monitor configuration.
+        context: Frozen run context, when the caller is an explicit session.
 
     Returns:
         Client instance, or ``None`` if Ray is not initialized (monitoring disabled).
@@ -105,19 +188,25 @@ def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
         logger.warning("[rl-insight] Ray is not initialized; monitoring is disabled.")
         return None
 
-    handle = get_or_create_monitor_hub(conf)
-    return MonitorRayClient(handle)
+    resolved = _coerce_context(context)
+    handle = get_or_create_monitor_hub(conf, resolved)
+    actor_name = _hub_actor_name(resolved) if resolved is not None else ""
+    return MonitorRayClient(handle, actor_name=actor_name)
 
 
 class MonitorRayClient(MonitorClient):
     """Ray facade: ``apply_event`` submits work to the hub without blocking on completion."""
 
-    def __init__(self, actor_handle: Any) -> None:
+    def __init__(self, actor_handle: Any, actor_name: str = "") -> None:
         """
         Args:
             actor_handle: Return value of ``get_or_create_monitor_hub``.
+            actor_name: Session-mode hub name used to release this client's
+                reference on close; empty for a legacy client.
         """
         self._actor = actor_handle
+        self._actor_name = actor_name
+        self._closed = False
 
     def apply_event(self, event: dict[str, Any]) -> None:
         """Submit ``MonitorHubActor.apply_event`` on the actor (fire-and-forget; no ``ray.get``).
@@ -129,3 +218,10 @@ class MonitorRayClient(MonitorClient):
             Errors on the hub side are not surfaced here. Ordering follows Ray actor scheduling.
         """
         self._actor.apply_event.remote(event)
+
+    def close(self) -> None:
+        """Release this client's hub reference; idempotent and legacy-safe."""
+        if self._closed or not self._actor_name:
+            return
+        self._closed = True
+        release_monitor_hub(self._actor_name)

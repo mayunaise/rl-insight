@@ -20,6 +20,7 @@ import argparse
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -28,10 +29,30 @@ import uvicorn
 from fastapi import Body, FastAPI, HTTPException, status
 from omegaconf import DictConfig, OmegaConf
 
-from ..utils.constants import MonitorEnv, MonitorServer, PrometheusScrape
+from ..archive.forwarder import TraceForwarder
+from ..archive.writer import ArchiveStore
+from ..query.router import create_query_router
+from ..utils.constants import (
+    MonitorEnv,
+    MonitorServer,
+    PrometheusScrape,
+    managed_targets_file_from_config,
+)
 from ..utils.monitor_config_loader import load_server_config_file
 from ..utils.prometheus_utils import PrometheusTarget, PrometheusTargetStore
-from .network import local_addresses
+from .discovery import DiscoveryPublisher
+from .grafana import GrafanaClient, RunViewService
+from .network import format_host_port, local_addresses
+from .run_api import (
+    create_run_router,
+    data_dir_from_config,
+    registry_path_from_config,
+    server_readiness,
+    services_payload,
+)
+from .run_registry import RunRegistry
+from .scrape import create_scrape_router
+from .views import create_view_router
 
 logger = logging.getLogger(__name__)
 
@@ -80,10 +101,107 @@ def get_server_services() -> dict[str, Any]:
     return {}
 
 
+def _server_url_for_port(port: int) -> str:
+    return "http://" + format_host_port(local_addresses()["loopback"], port)
+
+
 def create_app(conf: DictConfig) -> FastAPI:
     """Create the RL-Insight server application."""
-    app = FastAPI(title="RL-Insight server", version="0.1.0")
     store = PrometheusTargetStore.from_config(conf)
+
+    data_dir = data_dir_from_config(conf)
+    run_registry = RunRegistry(
+        registry_path_from_config(conf),
+        active_run_limit=OmegaConf.select(
+            conf, "server.active_run_limit", default=None
+        ),
+    )
+    archive_store = ArchiveStore(data_dir)
+
+    server_port = int(OmegaConf.select(conf, "server.port", default=18080))
+    prometheus_enabled = bool(OmegaConf.select(conf, "prometheus.enable", default=True))
+    tempo_enabled = bool(OmegaConf.select(conf, "tempo.enable", default=True))
+    grafana_enabled = bool(OmegaConf.select(conf, "grafana.enable", default=True))
+    readiness = server_readiness(
+        prometheus_enabled=prometheus_enabled,
+        tempo_enabled=tempo_enabled,
+        query_enabled=prometheus_enabled and tempo_enabled,
+        archive_dir=data_dir,
+    )
+
+    view_service = None
+    if grafana_enabled:
+        grafana_port = int(OmegaConf.select(conf, "grafana.port"))
+        view_service = RunViewService(
+            run_registry,
+            GrafanaClient(
+                _server_url_for_port(grafana_port),
+                token=str(OmegaConf.select(conf, "grafana.api_token", default="")),
+            ),
+            router_base=_server_url_for_port(server_port),
+            grafana_base=_server_url_for_port(grafana_port),
+            dashboard_uid=str(
+                OmegaConf.select(conf, "grafana.dashboard_uid", default="")
+            ),
+        )
+
+    discovery = DiscoveryPublisher(
+        run_registry,
+        managed_targets_file_from_config(conf),
+        proxy_url=_server_url_for_port(server_port),
+    )
+    forwarder = TraceForwarder(
+        run_registry,
+        archive_store,
+        tempo_endpoint=(
+            _server_url_for_port(int(OmegaConf.select(conf, "otel.otel_port")))
+            + "/v1/traces"
+        ),
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        # Publish the first snapshot before Prometheus can scrape, then keep
+        # the projection current in the background (S2 §4.1).
+        discovery.refresh()
+        discovery.start()
+        if tempo_enabled:
+            forwarder.start()
+        try:
+            yield
+        finally:
+            discovery.stop()
+            forwarder.stop()
+
+    app = FastAPI(title="RL-Insight server", version="0.1.0", lifespan=lifespan)
+
+    app.include_router(create_scrape_router(run_registry))
+    app.include_router(
+        create_query_router(
+            run_registry,
+            prometheus_url=_server_url_for_port(
+                int(OmegaConf.select(conf, "prometheus.prometheus_port"))
+            ),
+            tempo_url=_server_url_for_port(
+                int(OmegaConf.select(conf, "tempo.query_port"))
+            ),
+        ),
+        prefix=MonitorServer.API_PREFIX,
+    )
+    if view_service is not None:
+        # The UI pages live at the app root so their own relative links
+        # (/ui/compare, /ui/runs/<run_key>) resolve without extra rewriting.
+        app.include_router(create_view_router(run_registry, view_service))
+    app.include_router(
+        create_run_router(
+            run_registry,
+            archive_store,
+            readiness=readiness,
+            view_service=view_service,
+            on_registry_change=discovery.wake,
+        ),
+        prefix=MonitorServer.API_PREFIX,
+    )
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -93,24 +211,27 @@ def create_app(conf: DictConfig) -> FastAPI:
     @app.get(f"{MonitorServer.API_PREFIX}/services")
     def services() -> dict[str, Any]:
         """Expose enabled component ports for trainer-side endpoint discovery."""
-        return {
-            "status": "ok",
-            "otlp_port": (
-                int(OmegaConf.select(conf, "otel.otel_port"))
-                if bool(OmegaConf.select(conf, "tempo.enable", default=True))
-                else None
-            ),
-            "prometheus_port": (
-                int(OmegaConf.select(conf, "prometheus.prometheus_port"))
-                if bool(OmegaConf.select(conf, "prometheus.enable", default=True))
-                else None
-            ),
-            "grafana_port": (
-                int(OmegaConf.select(conf, "grafana.port"))
-                if bool(OmegaConf.select(conf, "grafana.enable", default=True))
-                else None
-            ),
-        }
+        return services_payload(
+            server_instance_id=run_registry.server_instance_id,
+            readiness=readiness,
+            legacy={
+                "otlp_port": (
+                    int(OmegaConf.select(conf, "otel.otel_port"))
+                    if tempo_enabled
+                    else None
+                ),
+                "prometheus_port": (
+                    int(OmegaConf.select(conf, "prometheus.prometheus_port"))
+                    if prometheus_enabled
+                    else None
+                ),
+                "grafana_port": (
+                    int(OmegaConf.select(conf, "grafana.port"))
+                    if grafana_enabled
+                    else None
+                ),
+            },
+        )
 
     @app.post(f"{MonitorServer.API_PREFIX}/prometheus/targets")
     def register_prometheus_targets(

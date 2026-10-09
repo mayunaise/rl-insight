@@ -32,7 +32,7 @@
                       "group": "tempo",
                       "version": "v0",
                       "datasource": {
-                        "name": "tempo"
+                        "name": "${traces_datasource}"
                       },
                       "spec": {
                         "limit": 1000,
@@ -324,7 +324,7 @@
                       "group": "tempo",
                       "version": "v0",
                       "datasource": {
-                        "name": "tempo"
+                        "name": "${traces_datasource}"
                       },
                       "spec": {
                         "limit": 100,
@@ -494,7 +494,7 @@
                       "group": "tempo",
                       "version": "v0",
                       "datasource": {
-                        "name": "tempo"
+                        "name": "${traces_datasource}"
                       },
                       "spec": {
                         "limit": 100,
@@ -625,7 +625,7 @@
         "spec": {
           "id": 327,
           "title": "Turn details",
-          "description": "Each row is one turn: type, tools, finish reason, and content (thought, or response if thought is empty).",
+          "description": "Each row is one turn: type, tools, tool arguments, finish reason, reasoning, and content. Reasoning is the text before </think>; content is what follows it. Both are empty when the model went straight to a tool call.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -639,12 +639,12 @@
                       "group": "tempo",
                       "version": "v0",
                       "datasource": {
-                        "name": "tempo"
+                        "name": "${traces_datasource}"
                       },
                       "spec": {
                         "limit": 500,
                         "metricsQueryType": "range",
-                        "query": "{span.state_lane_id =~ \"experiment=${experiment}/${session}/traj=${traj}\" && span.experiment_name =~ \"${experiment}\" && span.project =~ \"${project}\" && span.global_steps = ${step} && span.turn >= 0 && resource.service.name=\"rl_insight_monitor\"} | select(span.turn, span.type, span.tools, span.finish_reason, span.content, span.prompt_tokens, span.completion_tokens)",
+                        "query": "{span.state_lane_id =~ \"experiment=${experiment}/${session}/traj=${traj}\" && span.experiment_name =~ \"${experiment}\" && span.project =~ \"${project}\" && span.global_steps = ${step} && span.turn >= 0 && resource.service.name=\"rl_insight_monitor\"} | select(span.turn, span.type, span.tools, span.tool_args, span.finish_reason, span.reasoning, span.content, span.prompt_tokens, span.completion_tokens)",
                         "queryType": "traceql",
                         "serviceMapUseNativeHistograms": false,
                         "spss": 100,
@@ -681,10 +681,12 @@
                         "turn": 1,
                         "type": 2,
                         "tools": 3,
-                        "finish_reason": 4,
-                        "content": 5,
-                        "prompt_tokens": 6,
-                        "completion_tokens": 7
+                        "finish_reason": 5,
+                        "content": 7,
+                        "prompt_tokens": 8,
+                        "completion_tokens": 9,
+                        "tool_args": 4,
+                        "reasoning": 6
                       },
                       "renameByName": {
                         "time": "Start",
@@ -694,7 +696,9 @@
                         "finish_reason": "Finish reason",
                         "content": "Content",
                         "prompt_tokens": "Prompt tokens",
-                        "completion_tokens": "Completion tokens"
+                        "completion_tokens": "Completion tokens",
+                        "tool_args": "Tool args",
+                        "reasoning": "Reasoning"
                       }
                     }
                   }
@@ -973,7 +977,7 @@
                                           "group": "prometheus",
                                           "version": "v0",
                                           "datasource": {
-                                            "name": "${datasource}"
+                                            "name": "${metrics_datasource}"
                                           },
                                           "spec": {
                                             "query": "query_result(max_over_time(rl_insight_monitor_agent_loop_traj_info{project=~\"$project\", experiment_name=~\"$experiment\", global_steps=~\"$step\",leaf=~\"$session/traj=.*\"}[$__range]))",
@@ -1019,7 +1023,7 @@
                                 "group": "prometheus",
                                 "version": "v0",
                                 "datasource": {
-                                  "name": "${datasource}"
+                                  "name": "${metrics_datasource}"
                                 },
                                 "spec": {
                                   "query": "query_result(max_over_time(rl_insight_monitor_agent_loop_session_info{project=~\"$project\", experiment_name=~\"$experiment\", global_steps=~\"$step\",sample=~\"$sample\"}[$__range]))",
@@ -1078,7 +1082,7 @@
                       "group": "prometheus",
                       "version": "v0",
                       "datasource": {
-                        "name": "${datasource}"
+                        "name": "${metrics_datasource}"
                       },
                       "spec": {
                         "query": "query_result(max_over_time(rl_insight_monitor_agent_loop_sample_info{project=~\"$project\", experiment_name=~\"$experiment\", global_steps=~\"$step\"}[$__range]))",
@@ -1132,13 +1136,32 @@
       {
         "kind": "DatasourceVariable",
         "spec": {
-          "name": "datasource",
+          "name": "metrics_datasource",
           "pluginId": "prometheus",
           "refresh": "onDashboardLoad",
           "regex": "",
           "current": {
             "text": "Prometheus",
             "value": "Prometheus"
+          },
+          "options": [],
+          "multi": false,
+          "includeAll": false,
+          "hide": "hideVariable",
+          "skipUrlSync": false,
+          "allowCustomValue": true
+        }
+      },
+      {
+        "kind": "DatasourceVariable",
+        "spec": {
+          "name": "traces_datasource",
+          "pluginId": "tempo",
+          "refresh": "onDashboardLoad",
+          "regex": "",
+          "current": {
+            "text": "",
+            "value": ""
           },
           "options": [],
           "multi": false,
@@ -1162,7 +1185,7 @@
             "group": "prometheus",
             "version": "v0",
             "datasource": {
-              "name": "${datasource}"
+              "name": "${metrics_datasource}"
             },
             "spec": {
               "query": "label_values(rl_insight_monitor_agent_loop_run_info, project)",
@@ -1198,7 +1221,7 @@
             "group": "prometheus",
             "version": "v0",
             "datasource": {
-              "name": "${datasource}"
+              "name": "${metrics_datasource}"
             },
             "spec": {
               "query": "label_values(rl_insight_monitor_agent_loop_run_info{project=~\"$project\"}, experiment_name)",
@@ -1234,7 +1257,7 @@
             "group": "prometheus",
             "version": "v0",
             "datasource": {
-              "name": "${datasource}"
+              "name": "${metrics_datasource}"
             },
             "spec": {
               "query": "label_values(rl_insight_monitor_agent_loop_run_info{project=~\"$project\", experiment_name=~\"$experiment\"}, global_steps)",
@@ -1270,7 +1293,7 @@
             "group": "prometheus",
             "version": "v0",
             "datasource": {
-              "name": "${datasource}"
+              "name": "${metrics_datasource}"
             },
             "spec": {
               "query": "query_result(clamp_max(count(max_over_time(rl_insight_monitor_agent_loop_run_info{project=~\"$project\", experiment_name=~\"$experiment\", global_steps=~\"$step\"}[$__range])), 1) or vector(0))",
@@ -1291,6 +1314,11 @@
           "includeAll": false
         }
       }
+    ],
+    "tags": [
+      "RL-Insight",
+      "agent-loop",
+      "trajectory"
     ]
   }
 }

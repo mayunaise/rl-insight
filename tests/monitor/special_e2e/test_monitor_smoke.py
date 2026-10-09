@@ -35,15 +35,16 @@ from rl_insight.agent_loop import agent_loop_lane_id
 from rl_insight.client.ray_monitor_client import _current_job_actor_name
 from rl_insight.utils.constants import MonitorRayActor
 
-
 pytestmark = pytest.mark.skipif(
-    sys.platform != "linux", reason="the managed server stack only runs on Linux"
+    sys.platform not in {"linux", "win32"},
+    reason="the managed server stack supports Linux and Windows",
 )
 
 SERVER_URL = os.environ.get("RL_INSIGHT_SERVER_URL", "http://127.0.0.1:18080")
 TEMPO_QUERY_URL = os.environ.get("RL_INSIGHT_TEMPO_QUERY_URL", "http://127.0.0.1:3200")
 READY_TIMEOUT_SECONDS = 60
 TEST_RUN_ID = uuid.uuid4().hex
+EXPERIMENT_NAME = f"monitor-smoke-{TEST_RUN_ID}"
 
 
 @dataclass(frozen=True)
@@ -94,7 +95,17 @@ def monitor_stack() -> Generator[dict[str, str], None, None]:
     }
 
     ray.init(namespace=MonitorRayActor.NAMESPACE, ignore_reinit_error=True)
-    insight.init(project="rl-insight-e2e", experiment_name="monitor-smoke")
+    insight.init(
+        project="rl-insight-e2e",
+        experiment_name=EXPERIMENT_NAME,
+        config={
+            "prometheus": {
+                "metrics_report_port": int(
+                    os.environ.get("RL_INSIGHT_METRICS_REPORT_PORT", "9092")
+                )
+            }
+        },
+    )
     try:
         yield endpoints
     finally:
@@ -206,7 +217,7 @@ def test_agent_loop_dashboard_should_query_generated_protocol_data(
 ) -> None:
     """Generate one Agent Loop run and verify Tempo and Prometheus queryability."""
     project = "rl-insight-e2e"
-    experiment_name = f"monitor-smoke-agent-loop-{TEST_RUN_ID}"
+    experiment_name = EXPERIMENT_NAME
     sample = "0"
     session_index = "0"
     session_id = f"session-{TEST_RUN_ID}"

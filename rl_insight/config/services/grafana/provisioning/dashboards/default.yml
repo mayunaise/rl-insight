@@ -1,13 +1,13 @@
 apiVersion: 1
 
+# Copied to runtime and rewritten with an absolute path on server start.
 providers:
   - name: RL-Insight
     orgId: 1
-    folder: RL-Insight
-    folderUid: rl-insight
     type: file
     disableDeletion: false
     updateIntervalSeconds: 10
     allowUiUpdates: true
     options:
       path: dashboards
+      foldersFromFilesStructure: true

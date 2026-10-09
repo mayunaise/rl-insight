@@ -9,7 +9,7 @@
       "grafana.app/managedBy": "classic-file-provisioning",
       "grafana.app/managerAllowsEdits": "true",
       "grafana.app/managerId": "RL-Insight",
-      "grafana.app/folderTitle": "RL-Insight"
+      "grafana.app/folderTitle": "quick_start_demo"
     }
   },
   "spec": {
@@ -56,7 +56,7 @@
                       "group": "tempo",
                       "version": "v0",
                       "datasource": {
-                        "name": "tempo"
+                        "name": "${traces_datasource}"
                       },
                       "spec": {
                         "limit": 100,
@@ -250,7 +250,7 @@
                       "group": "prometheus",
                       "version": "v0",
                       "datasource": {
-                        "name": "prometheus"
+                        "name": "${metrics_datasource}"
                       },
                       "spec": {
                         "editorMode": "builder",
@@ -345,7 +345,7 @@
                       "group": "prometheus",
                       "version": "v0",
                       "datasource": {
-                        "name": "prometheus"
+                        "name": "${metrics_datasource}"
                       },
                       "spec": {
                         "editorMode": "builder",
@@ -463,7 +463,7 @@
                       "group": "prometheus",
                       "version": "v0",
                       "datasource": {
-                        "name": "prometheus"
+                        "name": "${metrics_datasource}"
                       },
                       "spec": {
                         "editorMode": "builder",
@@ -626,7 +626,11 @@
     "links": [],
     "liveNow": false,
     "preload": false,
-    "tags": [],
+    "tags": [
+      "RL-Insight",
+      "quick-start",
+      "demo"
+    ],
     "timeSettings": {
       "timezone": "browser",
       "from": "now-5m",
@@ -652,7 +656,7 @@
       {
         "kind": "DatasourceVariable",
         "spec": {
-          "name": "datasource",
+          "name": "metrics_datasource",
           "pluginId": "prometheus",
           "refresh": "onDashboardLoad",
           "regex": "",
@@ -666,6 +670,26 @@
           "hide": "hideVariable",
           "skipUrlSync": false,
           "description": "Filter queries of a specific Prometheus type.",
+          "allowCustomValue": true
+        }
+      },
+      {
+        "kind": "DatasourceVariable",
+        "spec": {
+          "name": "traces_datasource",
+          "pluginId": "tempo",
+          "refresh": "onDashboardLoad",
+          "regex": "",
+          "current": {
+            "text": "",
+            "value": ""
+          },
+          "options": [],
+          "multi": false,
+          "includeAll": false,
+          "hide": "hideVariable",
+          "skipUrlSync": false,
+          "description": "Filter queries of a specific Tempo type.",
           "allowCustomValue": true
         }
       }
