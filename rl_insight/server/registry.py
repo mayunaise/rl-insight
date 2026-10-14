@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import sqlite3
@@ -128,11 +127,7 @@ class RunRegistry:
         with self._lock:
             row = self._read_run(run_id)
             context = RunContext.from_dict(json.loads(row["context"]))
-            project = hashlib.sha256(context.project.encode()).hexdigest()[:24]
-            experiment = hashlib.sha256(context.experiment_name.encode()).hexdigest()[
-                :24
-            ]
-            directory = self.root / "experiments" / project / experiment
+            directory = self.root / "runs" / run_id
             metadata = {
                 "schema_version": 1,
                 "context": context.to_dict(),
@@ -140,18 +135,8 @@ class RunRegistry:
                 "status": "registered",
                 "ended_at": None,
             }
-            self._write(
-                directory / "experiment.json",
-                {
-                    "schema_version": 1,
-                    "project": context.project,
-                    "experiment_name": context.experiment_name,
-                },
-            )
-            self._write(directory / "runs" / run_id / "run.json", metadata)
-            self._write(
-                directory / "runs" / run_id / "config.json", json.loads(row["config"])
-            )
+            self._write(directory / "run.json", metadata)
+            self._write(directory / "config.json", json.loads(row["config"]))
             return metadata
 
     @staticmethod
