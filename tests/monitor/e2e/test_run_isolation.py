@@ -205,11 +205,13 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     assert {p.name for p in directories} == {first["run_id"], second["run_id"]}
     for directory in directories:
         assert directory.resolve().is_relative_to(stack.data)
-        context = json.loads((directory / "run.json").read_text())["context"]
+        context = json.loads((directory / "run.json").read_text(encoding="utf-8"))[
+            "context"
+        ]
         assert context["run_id"] == directory.name
         assert context["project"] == payload["project"]
         assert context["experiment_name"] == payload["experiment_name"]
-        assert "secret" not in (directory / "config.json").read_text()
+        assert "secret" not in (directory / "config.json").read_text(encoding="utf-8")
     first_directory = stack.data / "runs" / first["run_id"]
     (first_directory / "run.json").unlink()
     (first_directory / "config.json").unlink()
@@ -218,11 +220,14 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         assert restored.status_code == 200
         assert restored.json()["context"] == first
         assert (
-            json.loads((first_directory / "run.json").read_text())["context"] == first
+            json.loads((first_directory / "run.json").read_text(encoding="utf-8"))[
+                "context"
+            ]
+            == first
         )
-        assert json.loads((first_directory / "config.json").read_text()) == {
-            "server": {"namespace": "demo"}
-        }
+        assert json.loads(
+            (first_directory / "config.json").read_text(encoding="utf-8")
+        ) == {"server": {"namespace": "demo"}}
     run_id = first["run_id"]
     root = stack.url + "/api/v1/runs/" + run_id
     stack.backend.results["/api/v1/query"] = {
