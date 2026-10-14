@@ -33,16 +33,22 @@ Under the existing `server.data_dir`, configuration and readable metadata are
 organized as:
 
 ```text
-experiments/<project-key>/<experiment-key>/runs/<run_id>/
+runs/<run_id>/
     run.json
     config.json
 ```
 
-Directory grouping uses stable hashes; original names are retained in metadata.
+Directories use the full Run ID; project and experiment names stay in metadata.
+Names are never used as path components, so renaming display metadata requires
+no directory relocation. Short Run IDs are for display only.
 SQLite is the identity catalog. JSON files are recoverable projections, not
 editable control configuration. Only allowlisted observability config fields are
 saved. These directories do not partition Prometheus/Tempo raw storage and do
 not guarantee indefinite sample retention or implement data export.
+
+Existing catalog entries remain valid. Reading a Run's metadata endpoint or
+retrying its creation rebuilds snapshots at the new path from SQLite. Old
+experimental directory snapshots are not automatically moved or deleted.
 
 Run-scoped query endpoints are:
 

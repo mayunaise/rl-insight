@@ -164,19 +164,28 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         timeout=3,
     ).json()
     assert first["run_id"] != second["run_id"]
-    directories = list(stack.data.glob("experiments/*/*/runs/*"))
+    directories = list((stack.data / "runs").iterdir())
     assert {p.name for p in directories} == {first["run_id"], second["run_id"]}
     for directory in directories:
         assert directory.resolve().is_relative_to(stack.data)
-        assert (
-            json.loads((directory / "run.json").read_text())["context"]["run_id"]
-            == directory.name
-        )
+        context = json.loads((directory / "run.json").read_text())["context"]
+        assert context["run_id"] == directory.name
+        assert context["project"] == payload["project"]
+        assert context["experiment_name"] == payload["experiment_name"]
         assert "secret" not in (directory / "config.json").read_text()
+    first_directory = stack.data / "runs" / first["run_id"]
+    (first_directory / "run.json").unlink()
+    (first_directory / "config.json").unlink()
     with serve(create_app(stack.conf)) as reopened:
         restored = requests.get(reopened + "/api/v1/runs/" + first["run_id"], timeout=3)
         assert restored.status_code == 200
         assert restored.json()["context"] == first
+        assert (
+            json.loads((first_directory / "run.json").read_text())["context"] == first
+        )
+        assert json.loads((first_directory / "config.json").read_text()) == {
+            "server": {"namespace": "demo"}
+        }
 
     run_id = first["run_id"]
     root = stack.url + "/api/v1/runs/" + run_id
@@ -376,7 +385,7 @@ def test_existing_ray_api_keeps_one_run_identity(stack):
         and "replica: '0'" in targets
         and "replica: '1'" in targets
     )
-    assert len(list(stack.data.glob("experiments/*/*/runs/*"))) == 1
+    assert len(list((stack.data / "runs").iterdir())) == 1
 
 
 def _ray_scenario(url, port, real_backends=False):
