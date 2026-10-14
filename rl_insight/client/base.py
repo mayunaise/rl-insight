@@ -51,6 +51,10 @@ class MonitorClient(ABC):
         """Optional identity support; existing third-party clients remain valid."""
         return None
 
+    def flush(self) -> None:
+        """Optional bounded drain; existing clients need no implementation."""
+        pass
+
 
 def register_monitor_client(backend: str, factory: MonitorClientFactory) -> None:
     """Register a client factory for ``server.backend``."""

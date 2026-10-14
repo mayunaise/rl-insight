@@ -139,6 +139,10 @@ class MonitorRayClient(MonitorClient):
     def get_context(self) -> RunContext | None:
         return self._context
 
+    def flush(self) -> None:
+        """Drain this client's prior submissions before the Ray job can exit."""
+        ray.get(self._actor.flush.remote(), timeout=35)
+
     def apply_event(self, event: dict[str, Any]) -> None:
         """Submit ``MonitorHubActor.apply_event`` on the actor (fire-and-forget; no ``ray.get``).
 

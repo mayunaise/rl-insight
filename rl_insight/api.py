@@ -156,13 +156,17 @@ def _client_initialized() -> bool:
 
 
 def finish() -> None:
-    """Clear in-process monitor state so further emits are no-ops.
-
-    Does not stop the hub HTTP server or kill the detached Ray actor.
-    """
+    """Flush pending data within the client's budget, then disable local emits."""
     global _STATE
-    _STATE = _MonitorState()
-    _LANES.clear()
+    try:
+        flush = getattr(_STATE.client, "flush", None)
+        if flush is not None:
+            flush()
+    except Exception:
+        logger.exception("[rl-insight] Could not flush monitor data before finish")
+    finally:
+        _STATE = _MonitorState()
+        _LANES.clear()
 
 
 def metric_count(

@@ -26,9 +26,10 @@ from typing import Any, Sequence
 
 import requests
 import uvicorn
-from fastapi import Body, FastAPI, HTTPException, Request, status
+from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from omegaconf import DictConfig, OmegaConf
+from starlette.concurrency import run_in_threadpool
 
 from ..protocol import RunContext, RunError
 from ..utils.constants import MonitorEnv, MonitorPaths, MonitorServer, PrometheusScrape
@@ -99,6 +100,7 @@ def create_app(conf: DictConfig) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app):
         try:
+            await run_in_threadpool(refresh_views)
             yield
         finally:
             registry.close()
@@ -109,14 +111,18 @@ def create_app(conf: DictConfig) -> FastAPI:
     from .run_views import install_views
 
     install_queries(app, registry, conf)
-    install_views(app, registry, conf)
+    refresh_views = install_views(app, registry, conf)
 
     @app.exception_handler(RunError)
     async def run_error(_request, exc):
         return JSONResponse({"detail": str(exc)}, status_code=exc.status)
 
     @app.post("/api/v1/runs")
-    def create_run(request: Request, payload: dict[str, Any] = Body(...)):
+    def create_run(
+        request: Request,
+        background: BackgroundTasks,
+        payload: dict[str, Any] = Body(...),
+    ):
         context = registry.create(
             payload.get("request_id", ""),
             payload.get("project", "uncategorized"),
@@ -124,6 +130,7 @@ def create_app(conf: DictConfig) -> FastAPI:
             str(OmegaConf.select(conf, "server.public_url") or request.base_url),
             payload.get("config", {}),
         )
+        background.add_task(refresh_views, str(request.base_url))
         return context.to_dict()
 
     @app.get("/api/v1/runs/{run_id}")
