@@ -345,8 +345,10 @@ fail explicitly.
 
 `/ui/runs/<run_id>` opens the original full verl/vLLM dashboard with Run-scoped
 data sources. Its native Grafana filter bar includes a single-select **Run ID**
-variable alongside the existing experiment filters. Each option displays and
-selects the full Run ID.
+variable alongside the existing experiment filters, present by default even
+before the first training job (with no options until a Run is registered). Each
+option displays and selects the full Run ID. Finished jobs remain selectable
+from the persistent Run catalog; a live trainer or worker is not required.
 Selecting a Run switches both Prometheus and Tempo to that Run's scoped data
 sources. There is no All/multi-Run option. The existing dashboard keeps its UID,
 title and folder permissions; no per-Run dashboard is created. It is available
