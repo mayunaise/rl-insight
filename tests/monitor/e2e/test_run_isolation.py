@@ -260,7 +260,8 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         "name": "train",
         "startTimeUnixNano": "1000000",
         "durationNanos": "2000000",
-        "attributes": attrs(run_id),
+        "attributes": attrs(run_id)
+        + [{"key": "state_lane_id", "value": {"stringValue": "rank_0"}}],
     }
     stack.backend.results["/api/search"] = {
         "traces": [
@@ -278,11 +279,18 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     )
     assert searched.status_code == 200, searched.text
     assert searched.json()["traces"][0]["rootTraceName"] == "train"
+    assert searched.json()["traces"][0]["spanSets"][0]["spans"][0]["attributes"] == [
+        {"key": "state_lane_id", "value": {"stringValue": "rank_0"}}
+    ]
     assert (
         "resource.rl_insight.run_id"
         in parse_qs(urlsplit(stack.backend.calls[-1][0]).query)["q"][0]
     )
     assert parse_qs(urlsplit(stack.backend.calls[-1][0]).query)["spss"] == ["1000"]
+    selected = parse_qs(urlsplit(stack.backend.calls[-1][0]).query)["q"][0]
+    assert selected.endswith(
+        " | select(resource.rl_insight.run_id, name, span.state_lane_id)"
+    )
     assert (
         requests.get(
             root + "/tempo/api/search", params={"spss": "10001"}, timeout=3

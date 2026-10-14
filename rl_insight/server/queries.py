@@ -179,9 +179,7 @@ def prometheus(query: str, identity: RunContext) -> str:
 
 def trace_search(query: str, identity: RunContext) -> str:
     return traces(query, identity) + (
-        " | select(resource."
-        + "rl_insight.run_id"
-        + ", name, span.state_name, span.state_lane_id, span.monitor.trace_segment)"
+        " | select(resource.rl_insight.run_id, name, span.state_lane_id)"
     )
 
 
@@ -285,6 +283,12 @@ def project_search(payload, context: RunContext) -> int:
                     raise RunError(
                         "Backend returned a foreign or unidentified span", 502
                     )
+                # Ownership is checked above; keep the original timeline fields.
+                span["attributes"] = [
+                    a
+                    for a in span.get("attributes", [])
+                    if a.get("key") != "rl_insight.run_id"
+                ]
             groups_out.append({"spans": spans, "matched": matched})
             members.extend(spans)
         if not members:
