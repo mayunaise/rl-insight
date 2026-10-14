@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any, cast
+from uuid import uuid4
 
 import ray
 from omegaconf import DictConfig
@@ -29,6 +30,8 @@ from .base import MonitorClient
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
+
+_owned_hubs: dict[str, str] = {}
 
 __all__ = ["MonitorRayClient", "create_ray_monitor_client", "get_or_create_monitor_hub"]
 
@@ -97,7 +100,10 @@ def get_or_create_monitor_hub(conf: DictConfig) -> Any:
 
     try:
         actor_cls = cast(Any, MonitorHubActor)
-        return actor_cls.options(**actor_options).remote(conf)
+        token = uuid4().hex
+        handle = actor_cls.options(**actor_options).remote(conf, owner_token=token)
+        _owned_hubs[actor_name] = token
+        return handle
     except ValueError:
         logger.info(
             "[rl-insight] Monitor hub actor %r was created concurrently; "
@@ -122,26 +128,49 @@ def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
 
     handle = get_or_create_monitor_hub(conf)
     value = ray.get(handle.get_context.remote(), timeout=15)
-    return MonitorRayClient(handle, RunContext.from_dict(value) if value else None)
+    return MonitorRayClient(
+        handle,
+        RunContext.from_dict(value) if value else None,
+        _owned_hubs.get(_current_job_actor_name()),
+    )
 
 
 class MonitorRayClient(MonitorClient):
     """Ray facade: ``apply_event`` submits work to the hub without blocking on completion."""
 
-    def __init__(self, actor_handle: Any, context: RunContext | None = None) -> None:
+    def __init__(
+        self,
+        actor_handle: Any,
+        context: RunContext | None = None,
+        owner_token: str | None = None,
+    ) -> None:
         """
         Args:
             actor_handle: Return value of ``get_or_create_monitor_hub``.
         """
         self._actor = actor_handle
         self._context = context
+        self._owner_token = owner_token
 
     def get_context(self) -> RunContext | None:
         return self._context
 
     def flush(self) -> None:
         """Drain this client's prior submissions before the Ray job can exit."""
-        ray.get(self._actor.flush.remote(), timeout=35)
+        operation = (
+            self._actor.prepare_finish.remote(self._owner_token)
+            if self._owner_token
+            else self._actor.flush.remote()
+        )
+        ray.get(operation, timeout=35)
+
+    def close(self) -> None:
+        if self._owner_token:
+            try:
+                ray.get(self._actor.end_run.remote(self._owner_token), timeout=15)
+            finally:
+                _owned_hubs.pop(_current_job_actor_name(), None)
+                self._owner_token = None
 
     def apply_event(self, event: dict[str, Any]) -> None:
         """Submit ``MonitorHubActor.apply_event`` on the actor (fire-and-forget; no ``ray.get``).
