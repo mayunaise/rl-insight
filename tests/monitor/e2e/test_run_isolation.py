@@ -367,6 +367,7 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         for path, body in stack.backend.calls
     )
     variables = {v["spec"]["name"]: v for v in posted["spec"]["variables"]}
+    assert len(variables) == len(posted["spec"]["variables"])
     selector = variables["run_id"]["spec"]
     assert selector["label"] == "Run ID"
     assert selector["current"]["value"] == run_id
@@ -436,6 +437,19 @@ def test_existing_ray_api_keeps_one_run_identity(stack):
         ExportTraceServiceRequest,
     )
 
+    from rl_insight.utils.constants import MonitorPaths
+    from rl_insight.server.runtime import DEFAULT_TEMPLATE
+
+    template = json.loads(
+        (MonitorPaths.GRAFANA_DASHBOARDS_DIR / DEFAULT_TEMPLATE).read_text()
+    )
+    selector = next(
+        variable["spec"]
+        for variable in template["spec"]["variables"]
+        if variable["spec"]["name"] == "run_id"
+    )
+    assert selector["hide"] == "dontHide" and selector["options"] == []
+
     with socket.socket() as reserve:
         reserve.bind(("127.0.0.1", 0))
         port = reserve.getsockname()[1]
@@ -477,6 +491,33 @@ def test_existing_ray_api_keeps_one_run_identity(stack):
         and "replica: '1'" in targets
     )
     assert len(list((stack.data / "runs").iterdir())) == 1
+    path = (
+        "/apis/dashboard.grafana.app/v2/namespaces/default/dashboards/"
+        + template["metadata"]["name"]
+    )
+    selector = next(
+        variable["spec"]
+        for variable in stack.backend.results[path]["spec"]["variables"]
+        if variable["spec"]["name"] == "run_id"
+    )
+    assert [option["value"] for option in selector["options"]] == [context["run_id"]]
+    # The producer has finished; restart from the original provisioned template.
+    stack.backend.results[path] = template
+    with serve(create_app(stack.conf)) as restarted:
+        selector = next(
+            variable["spec"]
+            for variable in stack.backend.results[path]["spec"]["variables"]
+            if variable["spec"]["name"] == "run_id"
+        )
+        assert [option["value"] for option in selector["options"]] == [
+            context["run_id"]
+        ]
+        assert (
+            requests.get(
+                restarted + "/api/v1/runs/" + context["run_id"], timeout=3
+            ).status_code
+            == 200
+        )
 
 
 def _ray_scenario(url, port, real_backends=False):

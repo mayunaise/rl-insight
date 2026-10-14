@@ -963,6 +963,11 @@ def run_dashboard(
             for item in choices
         ]
         current = next(item for item in options if item["value"] == context.run_id)
+        spec["variables"] = [
+            variable
+            for variable in spec["variables"]
+            if variable["spec"]["name"] != "run_id"
+        ]
         spec["variables"].insert(
             0,
             {
