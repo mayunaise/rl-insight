@@ -363,11 +363,21 @@ def install_queries(app, registry, conf):
         else:
             if path == "search":
                 values = [v for k, v in fields if k == "q"]
-                if len(values) > 1 or any(k in {"tags", "spss"} for k, _ in fields):
+                if len(values) > 1 or any(k == "tags" for k, _ in fields):
                     raise RunError("Unsupported search options", 422)
-                fields = [(k, v) for k, v in fields if k != "q"] + [
+                budgets = [v for k, v in fields if k == "spss"]
+                if len(budgets) > 1 or (
+                    budgets
+                    and (
+                        not re.fullmatch(r"[0-9]{1,5}", budgets[0])
+                        or not 1 <= int(budgets[0]) <= 10000
+                    )
+                ):
+                    raise RunError("Invalid span search budget", 422)
+                budget = max(1000, int(budgets[0]) if budgets else 1000)
+                fields = [(k, v) for k, v in fields if k not in {"q", "spss"}] + [
                     ("q", trace_search(values[0] if values else "", context)),
-                    ("spss", "1000"),
+                    ("spss", str(budget)),
                 ]
             elif not re.fullmatch(r"traces/[0-9a-fA-F]{32}", path):
                 raise RunError("Unsupported trace query path", 404)

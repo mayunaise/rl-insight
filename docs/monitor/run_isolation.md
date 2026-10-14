@@ -64,7 +64,15 @@ Responses and requests have bounded budgets; oversized or incomplete searches
 fail explicitly.
 
 `/ui/runs/<run_id>` opens the original full verl/vLLM dashboard with Run-scoped
-data sources. `/api/v1/runs/<run_id>/view?template=<relative-json-path>` supports
+data sources. Its native Grafana filter bar includes a single-select **Run ID**
+variable alongside the existing experiment filters. Each option displays and
+selects the full Run ID.
+Selecting a Run switches both Prometheus and Tempo to that Run's scoped data
+sources. There is no All/multi-Run option. The dashboard title is neutral so it
+stays accurate after switching. Reopening the RL-Insight entry refreshes the
+catalog options, including Runs that have no remaining backend samples.
+
+`/api/v1/runs/<run_id>/view?template=<relative-json-path>` supports
 another deployed Grafana v2 template using the same data sources. Panel layout,
 visualization and metric expressions remain unchanged. Templates requiring
 unsupported query syntax report that limitation; this increment does not claim

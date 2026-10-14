@@ -113,6 +113,13 @@ class RunRegistry:
     def get(self, run_id: str) -> RunContext:
         return RunContext.from_dict(json.loads(self._read_run(run_id)["context"]))
 
+    def list_runs(self) -> list[RunContext]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT context FROM runs ORDER BY created_at DESC, run_id DESC"
+            ).fetchall()
+        return [RunContext.from_dict(json.loads(row["context"])) for row in rows]
+
     def _read_run(self, run_id: str) -> sqlite3.Row:
         validate_id(run_id)
         with self._lock:

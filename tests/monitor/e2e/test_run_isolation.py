@@ -132,7 +132,7 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     payload = {
         "request_id": uuid4().hex,
         "project": "../项目",
-        "experiment_name": "same-name",
+        "experiment_name": "same-name <script>alert(1)</script> 100%_",
         "config": {
             "server": {"namespace": "demo", "password": "secret"},
             "token": "secret",
@@ -186,7 +186,6 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         assert json.loads((first_directory / "config.json").read_text()) == {
             "server": {"namespace": "demo"}
         }
-
     run_id = first["run_id"]
     root = stack.url + "/api/v1/runs/" + run_id
     stack.backend.results["/api/v1/query"] = {
@@ -273,13 +272,22 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         ]
     }
     searched = requests.get(
-        root + "/tempo/api/search", params={"q": '{name="train"}'}, timeout=3
+        root + "/tempo/api/search",
+        params={"q": '{name="train"}', "spss": "100"},
+        timeout=3,
     )
     assert searched.status_code == 200, searched.text
     assert searched.json()["traces"][0]["rootTraceName"] == "train"
     assert (
         "resource.rl_insight.run_id"
         in parse_qs(urlsplit(stack.backend.calls[-1][0]).query)["q"][0]
+    )
+    assert parse_qs(urlsplit(stack.backend.calls[-1][0]).query)["spss"] == ["1000"]
+    assert (
+        requests.get(
+            root + "/tempo/api/search", params={"spss": "10001"}, timeout=3
+        ).status_code
+        == 422
     )
     span["attributes"] = attrs(second["run_id"])
     assert requests.get(root + "/tempo/api/search", timeout=3).status_code == 502
@@ -308,6 +316,35 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     assert all(
         "rli-" + run_id in value for value in prepared.json()["datasources"].values()
     )
+    posted = json.loads(stack.backend.calls[-1][1])
+    variables = {v["spec"]["name"]: v for v in posted["spec"]["variables"]}
+    selector = variables["run_id"]["spec"]
+    assert selector["label"] == "Run ID"
+    assert selector["current"]["value"] == run_id
+    assert selector["multi"] is False and selector["includeAll"] is False
+    choices = json.loads(selector["query"])
+    assert {item["value"] for item in choices} == {first["run_id"], second["run_id"]}
+    for item in choices:
+        assert item["text"] == item["value"]
+        assert item["prometheus"] == "rli-" + item["value"] + "-p"
+        assert item["tempo"] == "rli-" + item["value"] + "-t"
+    assert variables["experiment_name"]["kind"] == "QueryVariable"
+    assert variables["project"]["kind"] == "QueryVariable"
+    assert "${run_id.prometheus}" in json.dumps(posted)
+    assert "${run_id.tempo}" in json.dumps(posted)
+    registered = [
+        json.loads(body)
+        for path, body in stack.backend.calls
+        if path == "/api/datasources" and body
+    ]
+    assert {body["uid"] for body in registered} >= {
+        "rli-" + item["value"] + suffix for item in choices for suffix in ("-p", "-t")
+    }
+    opened = requests.get(
+        stack.url + "/ui/runs/" + run_id, allow_redirects=False, timeout=3
+    )
+    assert opened.status_code == 307
+    assert "/d/rli-" + run_id in opened.headers["Location"]
     assert (
         requests.get(
             root + "/view", params={"template": "../../config.yaml"}, timeout=3
