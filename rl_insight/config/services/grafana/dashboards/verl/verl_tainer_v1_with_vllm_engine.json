@@ -4477,7 +4477,20 @@
                     "spanNulls": false
                   }
                 },
-                "overrides": []
+                "overrides": [
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "traceName"
+                    },
+                    "properties": [
+                      {
+                        "id": "displayName",
+                        "value": "${__field.labels.state_lane_id}"
+                      }
+                    ]
+                  }
+                ]
               }
             }
           }

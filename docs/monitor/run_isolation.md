@@ -78,6 +78,10 @@ visualization and metric expressions remain unchanged. Templates requiring
 unsupported query syntax report that limitation; this increment does not claim
 all Agentic/third-party templates are validated.
 
+The default verl timeline names lanes by `state_lane_id` (for example `rank_0`
+or `replica_0`), without Grafana's `Trace Name` field prefix. Its state values,
+colors and ordering are preserved.
+
 Legacy servers and clients retain the original behavior. Run scoping applies
 only when both sides support Run identity, and is not authentication/RBAC.
 Direct access to the shared backends bypasses these query routes.
