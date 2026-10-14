@@ -17,7 +17,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
+from threading import Lock
+from urllib.parse import urlencode, urlsplit
 
 import requests
 from fastapi import Request
@@ -29,6 +32,7 @@ from ..utils.constants import MonitorPaths
 from .network import format_host_port, local_addresses
 
 DEFAULT_TEMPLATE = "verl/verl_tainer_v1_with_vllm_engine.json"
+logger = logging.getLogger(__name__)
 
 
 def run_dashboard(
@@ -43,15 +47,10 @@ def run_dashboard(
         )
     )
     dashboard["metadata"] = {
-        "name": "rli-" + context.run_id,
-        "annotations": {"rl-insight/run-id": context.run_id},
+        "name": dashboard["metadata"]["name"],
     }
     spec = dashboard["spec"]
-    spec["title"] = context.experiment_name + " · " + context.run_id[:8]
-    spec["editable"] = False
     if runs is not None:
-        # A neutral title stays accurate when the user switches Runs in-place.
-        spec["title"] = "RL-Insight · Runs"
         choices = [
             {
                 "text": run.run_id,
@@ -150,6 +149,7 @@ def run_dashboard(
 
 
 def install_views(app, registry, conf):
+    lock = Lock()
     root = Path(
         str(
             OmegaConf.select(
@@ -164,7 +164,11 @@ def install_views(app, registry, conf):
         int(OmegaConf.select(conf, "grafana.port", default=3000)),
     )
 
-    def prepare(run_id, request, template):
+    def prepare(run_id, base_url, template):
+        with lock:
+            return update(run_id, base_url, template)
+
+    def update(run_id, base_url, template):
         context = registry.get(run_id)
         if not bool(OmegaConf.select(conf, "grafana.enable", default=True)):
             raise RunError("Grafana disabled", 503)
@@ -175,14 +179,13 @@ def install_views(app, registry, conf):
             or not file.is_file()
         ):
             raise RunError("Unknown dashboard template", 404)
-        base = str(
-            OmegaConf.select(conf, "server.public_url") or request.base_url
-        ).rstrip("/")
+        base = str(OmegaConf.select(conf, "server.public_url") or base_url).rstrip("/")
         identifiers = {
             kind: "rli-" + run_id + "-" + kind[0] for kind in ("prometheus", "tempo")
         }
         runs = registry.list_runs()
         dashboard = run_dashboard(context, identifiers, file, runs)
+        staged = json.dumps(dashboard, ensure_ascii=False, indent=2)
         with requests.Session() as session:
             session.trust_env = False
             token = OmegaConf.select(conf, "grafana.api_token", default="")
@@ -233,29 +236,54 @@ def install_views(app, registry, conf):
             path = "/apis/dashboard.grafana.app/v2/namespaces/default/dashboards"
             uid = dashboard["metadata"]["name"]
             current = call("GET", path + "/" + uid)
-            if current.status_code != 404:
-                dashboard["metadata"]["resourceVersion"] = current.json()["metadata"][
-                    "resourceVersion"
-                ]
-            call(
-                "POST" if current.status_code == 404 else "PUT",
-                path if current.status_code == 404 else path + "/" + uid,
-                json=dashboard,
-            )
+            if current.status_code == 404:
+                raise RunError("Original dashboard is not provisioned in Grafana", 503)
+            # Keep its folder, permissions and provisioning ownership.
+            dashboard["metadata"] = current.json()["metadata"]
+            call("PUT", path + "/" + uid, json=dashboard)
+        runtime = OmegaConf.select(conf, "server.runtime_dir")
+        if runtime:
+            folder = (Path(str(runtime)) / "dashboards").resolve()
+            target = (folder / template).resolve()
+            if target.is_relative_to(folder) and target.is_file():
+                temporary = target.with_suffix(".json.tmp")
+                temporary.write_text(staged, encoding="utf-8")
+                temporary.replace(target)
+        address = urlsplit(base_url)
         public = str(
             OmegaConf.select(conf, "grafana.public_url")
             or (
-                request.url.scheme
+                address.scheme
                 + "://"
-                + format_host_port(request.url.hostname, int(conf.grafana.port))
+                + format_host_port(address.hostname, int(conf.grafana.port))
             )
         )
-        return {"url": public.rstrip("/") + "/d/" + uid, "datasources": identifiers}
+        selection = urlencode(
+            {"var-run_id": run_id, "var-datasource": identifiers["prometheus"]}
+        )
+        return {
+            "url": public.rstrip("/") + "/d/" + uid + "?" + selection,
+            "datasources": identifiers,
+        }
+
+    def refresh(base_url=None):
+        runs = registry.list_runs()
+        if runs and bool(OmegaConf.select(conf, "grafana.enable", default=True)):
+            try:
+                prepare(
+                    runs[0].run_id, base_url or runs[0].server_url, DEFAULT_TEMPLATE
+                )
+            except (RunError, OSError) as exc:
+                logger.warning(
+                    "[rl-insight] Could not refresh the original dashboard: %s", exc
+                )
 
     @app.get("/api/v1/runs/{run_id}/view")
     def view(run_id: str, request: Request, template: str = DEFAULT_TEMPLATE):
-        return prepare(run_id, request, template)
+        return prepare(run_id, str(request.base_url), template)
 
     @app.get("/ui/runs/{run_id}")
     def page(run_id: str, request: Request, template: str = DEFAULT_TEMPLATE):
-        return RedirectResponse(prepare(run_id, request, template)["url"])
+        return RedirectResponse(prepare(run_id, str(request.base_url), template)["url"])
+
+    return refresh

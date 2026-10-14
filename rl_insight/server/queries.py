@@ -293,13 +293,15 @@ def project_search(payload, context: RunContext) -> int:
             members.extend(spans)
         if not members:
             raise RunError("Backend trace has no identifiable spans", 502)
+        if not re.fullmatch(r"[0-9a-fA-F]{1,32}", trace["traceID"]):
+            raise RunError("Invalid backend trace ID", 502)
         start = min(int(s["startTimeUnixNano"]) for s in members)
         end = max(
             int(s["startTimeUnixNano"]) + int(s["durationNanos"]) for s in members
         )
         output.append(
             {
-                "traceID": trace["traceID"],
+                "traceID": trace["traceID"].zfill(32),
                 "rootTraceName": members[0]["name"],
                 "rootServiceName": "",
                 "startTimeUnixNano": str(start),

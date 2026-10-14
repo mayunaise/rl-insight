@@ -60,6 +60,17 @@ def serve(app):
 @pytest.fixture
 def stack(tmp_path):
     state = SimpleNamespace(calls=[], traces=[], results={}, fail_writes=False)
+    dashboard_uid = "a4cabbce-92af-4a84-9399-4deba24ae6d1"
+    dashboard_path = (
+        "/apis/dashboard.grafana.app/v2/namespaces/default/dashboards/" + dashboard_uid
+    )
+    state.results[dashboard_path] = {
+        "metadata": {
+            "name": dashboard_uid,
+            "resourceVersion": "1",
+            "annotations": {"grafana.app/folder": "existing-verl"},
+        }
+    }
 
     class Backend(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -69,6 +80,13 @@ def stack(tmp_path):
             state.calls.append((self.path, b""))
             path = self.path.split("?")[0]
             body = json.dumps(state.results.get(path, {})).encode()
+            if path == "/api/v1/query" and "rl_insight_sdk_flush_sequence" in self.path:
+                body = json.dumps(
+                    {
+                        "status": "success",
+                        "data": {"result": [{"value": [time.time(), "1"]}]},
+                    }
+                ).encode()
             self.send_response(
                 404
                 if (path.startswith("/api/datasources/") or path.startswith("/apis/"))
@@ -240,7 +258,7 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     def attrs(owned):
         return [{"key": "rl_insight.run_id", "value": {"stringValue": owned}}]
 
-    trace_id = "a" * 32
+    trace_id = "0" + "a" * 31
     stack.backend.results["/api/traces/" + trace_id] = {
         "batches": [{"resource": {"attributes": attrs(second["run_id"])}}]
     }
@@ -266,7 +284,7 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     stack.backend.results["/api/search"] = {
         "traces": [
             {
-                "traceID": trace_id,
+                "traceID": trace_id.lstrip("0"),
                 "rootTraceName": "untrusted-root",
                 "spanSets": [{"matched": 1, "spans": [span]}],
             }
@@ -278,6 +296,7 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         timeout=3,
     )
     assert searched.status_code == 200, searched.text
+    assert searched.json()["traces"][0]["traceID"] == trace_id
     assert searched.json()["traces"][0]["rootTraceName"] == "train"
     assert searched.json()["traces"][0]["spanSets"][0]["spans"][0]["attributes"] == [
         {"key": "state_lane_id", "value": {"stringValue": "rank_0"}}
@@ -312,6 +331,8 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         ).read_text()
     )
     assert dashboard["spec"]["layout"] == template["spec"]["layout"]
+    assert dashboard["metadata"]["name"] == template["metadata"]["name"]
+    assert dashboard["spec"]["title"] == template["spec"]["title"]
     timeline = dashboard["spec"]["elements"]["panel-40"]["spec"]["vizConfig"]
     assert timeline["spec"]["fieldConfig"]["overrides"] == [
         {
@@ -333,7 +354,18 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     assert all(
         "rli-" + run_id in value for value in prepared.json()["datasources"].values()
     )
-    posted = json.loads(stack.backend.calls[-1][1])
+    posted = json.loads(
+        next(
+            body
+            for path, body in reversed(stack.backend.calls)
+            if path.endswith(template["metadata"]["name"]) and body
+        )
+    )
+    assert posted["metadata"]["annotations"]["grafana.app/folder"] == "existing-verl"
+    assert not any(
+        path == "/apis/dashboard.grafana.app/v2/namespaces/default/dashboards" and body
+        for path, body in stack.backend.calls
+    )
     variables = {v["spec"]["name"]: v for v in posted["spec"]["variables"]}
     selector = variables["run_id"]["spec"]
     assert selector["label"] == "Run ID"
@@ -361,7 +393,12 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         stack.url + "/ui/runs/" + run_id, allow_redirects=False, timeout=3
     )
     assert opened.status_code == 307
-    assert "/d/rli-" + run_id in opened.headers["Location"]
+    assert "/d/" + template["metadata"]["name"] in opened.headers["Location"]
+    assert "var-run_id=" + run_id in opened.headers["Location"]
+    other_view = requests.get(
+        stack.url + "/api/v1/runs/" + second["run_id"] + "/view", timeout=3
+    ).json()
+    assert other_view["url"].split("?")[0] == prepared.json()["url"].split("?")[0]
     assert (
         requests.get(
             root + "/view", params={"template": "../../config.yaml"}, timeout=3
@@ -532,7 +569,9 @@ def _ray_scenario(url, port, real_backends=False):
             view = requests.get(root + "/view", timeout=20)
             assert view.status_code == 200, view.text
 
-        time.sleep(0.5)  # Allow the original batch exporter to submit its span.
+        time.sleep(0.5)  # The final metric below intentionally has no scrape delay.
+        if real_backends:
+            insight.metric_gauge("final_step", 2)
         print("CONTEXT " + json.dumps(context.to_dict()))
     finally:
         insight.finish()
@@ -590,6 +629,15 @@ def test_sequential_runs_on_managed_backends():
         assert all(
             item["metric"]["run_id"] == context["run_id"]
             for item in metrics["data"]["result"]
+        )
+        final = requests.get(
+            root + "/prometheus/api/v1/query",
+            params={"query": "max_over_time(rl_insight_monitor_final_step[10m])"},
+            timeout=12,
+        ).json()
+        assert (
+            final["data"]["result"]
+            and float(final["data"]["result"][0]["value"][1]) == 2
         )
         traces = requests.get(root + "/tempo/api/search", timeout=12).json()["traces"]
         assert traces

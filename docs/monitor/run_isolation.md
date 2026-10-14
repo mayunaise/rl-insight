@@ -68,9 +68,14 @@ data sources. Its native Grafana filter bar includes a single-select **Run ID**
 variable alongside the existing experiment filters. Each option displays and
 selects the full Run ID.
 Selecting a Run switches both Prometheus and Tempo to that Run's scoped data
-sources. There is no All/multi-Run option. The dashboard title is neutral so it
-stays accurate after switching. Reopening the RL-Insight entry refreshes the
-catalog options, including Runs that have no remaining backend samples.
+sources. There is no All/multi-Run option. The existing dashboard keeps its UID,
+title and folder permissions; no per-Run dashboard is created. It is available
+from the original Grafana folder as well as the RL-Insight entry. Run creation
+and server startup refresh the options, including Runs with no remaining backend
+samples. Reopening the entry also refreshes them. A refresh failure is logged
+without preventing Run creation; the original dashboard must already be
+provisioned. Bound runtime files are updated so file provisioning retains the
+Run filter.
 
 `/api/v1/runs/<run_id>/view?template=<relative-json-path>` supports
 another deployed Grafana v2 template using the same data sources. Panel layout,
@@ -90,8 +95,18 @@ This increment implements data isolation, not concurrent-task orchestration.
 Port allocation, endpoint leases/proofs, fixed-entry metric aggregation and
 independent task shutdown are separate work. Native target attribution assumes
 the registered address still belongs to the publisher; port-reuse protection
-requires that later increment. `finish` keeps its original local behavior;
-catalog entries do not infer training completion from a worker finishing.
+requires that later increment. Catalog entries do not infer training completion
+from a worker finishing.
+
+`finish()` invokes the optional `MonitorClient.flush()` before clearing local
+state. The Ray client drains prior submissions, flushes queued OTLP spans and,
+when Run-aware Prometheus is enabled, waits for a scrape to store its internal
+`rl_insight_sdk_flush_sequence` marker. This keeps the Hub available for the
+final SDK metric sample without adding sleeps to training scripts. The Hub has
+a 30-second flush budget and the client waits at most 35 seconds. Failure is
+logged and local state is still cleared; unavailable backends cannot guarantee
+delivery. Custom clients may keep the default no-op. This does not stop the
+shared Hub or guarantee native exporter shutdown ordering.
 
 Local HTTP/Ray E2E tests run with the monitor suite. To run sequential Runs
 against a separately deployed real stack:
@@ -103,4 +118,6 @@ RL_INSIGHT_RUN_E2E_URL=http://<server-host>:18080 \
 
 The acceptance test uses explicit collector ports 19102 and 19103; ensure they
 are available. It checks actual stored metrics, traces, cross-Run trace-ID reads
-and Grafana provisioning. No concurrent training or accelerator is required.
+and reuse of the original Grafana dashboard. It emits a final metric immediately
+before finish and checks that value after Ray shutdown. No concurrent training
+or accelerator is required.
