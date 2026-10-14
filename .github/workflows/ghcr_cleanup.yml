@@ -1,0 +1,98 @@
+name: GHCR Cleanup
+
+on:
+  schedule:
+    - cron: "30 21 * * 6" # Weekly, Sunday 05:30 CST (Saturday 21:30 UTC).
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Only log what would be deleted"
+        type: boolean
+        default: false
+
+# Cleanup runs must not overlap each other. A nightly publish that races this
+# workflow is safe: its fresh version sorts newest, so it lands inside the
+# keep-10 set and is never a deletion candidate.
+concurrency:
+  group: ghcr-cleanup
+  cancel-in-progress: false
+
+env:
+  DRY_RUN: ${{ inputs.dry-run == true }}
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      packages: write # Delete image versions in GHCR.
+      contents: write # Delete obsolete nightly-* git marker tags.
+    steps:
+      # Step 1 — unlink the legacy `latest` tag. This must NOT set
+      # keep-n-tagged: the action gates untag operations against the keep
+      # set (an image keep-n-tagged protects never has a tag stripped), and
+      # the release image carrying `latest` sits inside the newest-10 for
+      # weeks, which would delay the unlink until it ages out. Without
+      # keep-n-tagged the gate is inactive and the tag is removed at once.
+      # The image itself survives: it still carries its semver tags.
+      - name: Unlink legacy latest tag
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          package: rl-insight
+          delete-tags: "latest"
+          older-than: 7 days
+          dry-run: ${{ env.DRY_RUN }}
+
+      # Step 2 — bound the nightly history. keep-n-tagged operates only on
+      # images matched by delete-tags (source: collectKeepNTaggedCandidates),
+      # so semver release tags are never candidates. Semver release tags
+      # (0.3.0, 0.3, ...) and the rolling `nightly` tag are additionally
+      # excluded from every delete rule — including ghost/partial/orphaned
+      # detection — so release images survive even if their platform children
+      # ever look incomplete. No `older-than` here: the nightly cap applies
+      # immediately, so the registry converges to 10 nightlies on the first
+      # run instead of waiting out an age window.
+      - name: Prune nightly image versions
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          package: rl-insight
+          delete-tags: "nightly-*"
+          exclude-tags: "nightly,0.*,[0-9]*"
+          keep-n-tagged: 10
+          delete-untagged: true
+          delete-ghost-images: true
+          delete-partial-images: true
+          delete-orphaned-images: true
+          dry-run: ${{ env.DRY_RUN }}
+
+      # The Docker workflow pushes one nightly-<date>-<sha> git marker tag per
+      # publish and its `changes` gate scans them, so prune the same history
+      # on the git side: keep the 10 newest marker tags. The strict pattern
+      # matches only nightly markers; every other tag is never touched.
+      - name: Prune old nightly git tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP_N: 10
+        run: |
+          set -euo pipefail
+          pattern='^refs/tags/nightly-[0-9]{8}-[0-9a-f]{7,40}$'
+          refs=$(gh api --paginate \
+            "/repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/nightly-" \
+            --jq '.[].ref' | grep -E "${pattern}" | sort || true)
+          count=$(printf '%s\n' "${refs}" | grep -c . || true)
+          echo "Found ${count} nightly marker tags (keep ${KEEP_N})"
+          if [ "${count}" -le "${KEEP_N}" ]; then
+            exit 0
+          fi
+          printf '%s\n' "${refs}" | head -n "-${KEEP_N}" | while read -r ref; do
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "[dry-run] would delete ${ref}"
+            else
+              echo "Deleting ${ref}"
+              gh api -X DELETE \
+                "/repos/${GITHUB_REPOSITORY}/git/refs/${ref#refs/}"
+            fi
+          done

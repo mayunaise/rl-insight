@@ -32,7 +32,7 @@ from omegaconf import DictConfig, OmegaConf
 from .client import create_monitor_client
 from .protocol import RunContext, RunError
 from .utils.monitor_config_loader import load_monitor_config
-from .utils import MonitorEventKind
+from .utils import MonitorBackend, MonitorEventKind
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -102,7 +102,10 @@ def init(
         return
 
     monitor_conf = load_monitor_config(config)
-    if not str(monitor_conf.server.url).strip():
+    backend = str(OmegaConf.select(monitor_conf, "server.backend") or "").strip()
+    # Only the Ray backend talks to the external RL-Insight server; direct-emit
+    # backends (e.g. push) intentionally run without a server URL.
+    if backend == MonitorBackend.RAY and not str(monitor_conf.server.url).strip():
         logger.error(
             "[rl-insight] RL-Insight server URL is required; set RL_INSIGHT_SERVER_URL "
             "or server.url in init config."
@@ -156,15 +159,21 @@ def _client_initialized() -> bool:
 
 
 def finish() -> None:
-    """Flush pending data within the client's budget, then disable local emits."""
+    """Flush pending data, release client resources, then disable local emits."""
     global _STATE
+    client = _STATE.client
     try:
-        flush = getattr(_STATE.client, "flush", None)
+        flush = getattr(client, "flush", None)
         if flush is not None:
             flush()
     except Exception:
         logger.exception("[rl-insight] Could not flush monitor data before finish")
     finally:
+        if client is not None and hasattr(client, "close"):
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 - shutdown must never raise
+                logger.debug("[rl-insight] client.close() failed", exc_info=True)
         _STATE = _MonitorState()
         _LANES.clear()
 

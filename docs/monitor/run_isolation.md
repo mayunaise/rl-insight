@@ -1,8 +1,9 @@
 # Run data isolation
 
-Each initialized training job receives an immutable Run identity. The existing
-public API and Ray Hub continue to collect metrics and traces; Run identity is
-added without changing metric prefixes, span names or service names.
+With the Ray backend and a Run-capable server, each initialized training job
+receives an immutable Run identity. The existing public API and Ray Hub continue
+to collect metrics and traces; Run identity is added without changing metric
+prefixes, span names or service names.
 
 ```python
 import rl_insight
@@ -91,6 +92,10 @@ Legacy servers and clients retain the original behavior. Run scoping applies
 only when both sides support Run identity, and is not authentication/RBAC.
 Direct access to the shared backends bypasses these query routes.
 
+The direct-emit push backend retains its URL-free initialization, local target
+registration and sink routing. It does not use this server-managed Run catalog
+or query isolation. No Run-capable server is required for push operation.
+
 This increment implements data isolation, not concurrent-task orchestration.
 Port allocation, endpoint leases/proofs, fixed-entry metric aggregation and
 independent task shutdown are separate work. Native target attribution assumes
@@ -98,8 +103,9 @@ the registered address still belongs to the publisher; port-reuse protection
 requires that later increment. Catalog entries do not infer training completion
 from a worker finishing.
 
-`finish()` invokes the optional `MonitorClient.flush()` before clearing local
-state. The Ray client drains prior submissions, flushes queued OTLP spans and,
+`finish()` invokes the optional `MonitorClient.flush()`, releases resources with
+`close()` when supported even if flushing fails, then clears local state. The
+Ray client drains prior submissions, flushes queued OTLP spans and,
 when Run-aware Prometheus is enabled, waits for a scrape to store its internal
 `rl_insight_sdk_flush_sequence` marker. This keeps the Hub available for the
 final SDK metric sample without adding sleeps to training scripts. The Hub has

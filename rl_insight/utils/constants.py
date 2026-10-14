@@ -49,6 +49,7 @@ class MonitorEnv:
 
     SERVER_URL = "RL_INSIGHT_SERVER_URL"
     SERVER_BACKEND = "RL_INSIGHT_SERVER_BACKEND"
+    CONFIG_PATH = "RL_INSIGHT_CONFIG"
 
 
 class MonitorDefaults:
@@ -62,6 +63,7 @@ class MonitorBackend:
     """Supported trainer-side monitor client backends (``server.backend`` registry keys)."""
 
     RAY = "ray"
+    PUSH = "push"
 
 
 class MonitorEventKind:

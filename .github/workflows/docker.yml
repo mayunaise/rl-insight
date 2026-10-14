@@ -112,12 +112,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # v0.3.0 -> 0.3.0, 0.3, latest ("latest" is skipped for pre-releases).
+      # v0.3.0 -> 0.3.0, 0.3. No rolling "latest" tag: users pin an explicit
+      # version, which avoids the ambiguity of a moving pointer.
       - name: Extract image tags
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -135,7 +137,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   # Publish a rolling `nightly` image from main, gated by the smoke test.
-  # `latest` stays reserved for stable releases.
+  # Stable releases publish semver tags only; no `latest` tag exists.
   nightly:
     # Event allow-list: a new trigger must be added here explicitly, so publishing
     # can never be enabled by accident. Manual dispatch only validates.
