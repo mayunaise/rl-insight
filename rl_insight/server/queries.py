@@ -1,0 +1,438 @@
+# Copyright (c) 2026 verl-project authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Small lexical query scope; unsupported syntax fails closed."""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from urllib.parse import parse_qsl
+
+import requests
+from fastapi import Request
+from fastapi.responses import Response
+from omegaconf import OmegaConf
+from starlette.concurrency import run_in_threadpool
+
+from ..protocol import RunContext, RunError
+from .network import format_host_port, local_addresses
+
+MAX_BYTES = 8 * 1024 * 1024
+MAX_SPANS = 10000
+
+_TOKEN = re.compile(
+    r'\s+|"(?:[^"\\]|\\.)*"|[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?(?:ms|[smhdwy])?|[A-Za-z_:][A-Za-z0-9_:]*|=~|!~|!=|==|>=|<=|[-+*/%^(),{}\[\]@=<>]'
+)
+_AGG = {
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "count",
+    "count_values",
+    "stddev",
+    "stdvar",
+    "topk",
+    "bottomk",
+    "quantile",
+    "group",
+}
+_GROUP = {"by", "without", "on", "ignoring", "group_left", "group_right"}
+
+
+def _tokens(query):
+    result = []
+    pos = 0
+    while pos < len(query):
+        match = _TOKEN.match(query, pos)
+        if match is None:
+            raise RunError("Unsupported PromQL token", 422)
+        if not match.group().isspace():
+            result.append((match.group(), match.start(), match.end()))
+        pos = match.end()
+    return result
+
+
+def prometheus(query: str, identity: RunContext) -> str:
+    """Constrain every metric/brace selector, including nested function args."""
+    if len(query) > 65536:
+        raise RunError("Query too large", 413)
+    tokens = _tokens(query)
+    if not tokens:
+        return "{run_id=" + json.dumps(identity.run_id) + "}"
+    edits = []
+    index = 0
+    matcher = "run_id=" + json.dumps(identity.run_id, ensure_ascii=True)
+    operand_expected = True
+    while index < len(tokens):
+        value, _start, end = tokens[index]
+        if value in _GROUP and index + 1 < len(tokens) and tokens[index + 1][0] == "(":
+            index += 2
+            while index < len(tokens) and tokens[index][0] != ")":
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*|,", tokens[index][0]):
+                    raise RunError("Unsupported query", 422)
+                index += 1
+        elif value == "{":
+            close = index + 1
+            while close < len(tokens) and tokens[close][0] != "}":
+                close += 1
+            if close == len(tokens):
+                raise RunError("Unsupported query", 422)
+            content = tokens[index + 1 : close]
+            cursor = 0
+            while cursor < len(content):
+                if cursor + 2 >= len(content):
+                    raise RunError("Unsupported query", 422)
+                label, operator, literal = (
+                    item[0] for item in content[cursor : cursor + 3]
+                )
+                if (
+                    not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", label)
+                    or operator not in {"=", "!=", "=~", "!~"}
+                    or not literal.startswith('"')
+                ):
+                    raise RunError("Unsupported query", 422)
+                if label == "run_id" and (
+                    operator != "=" or json.loads(literal) != identity.run_id
+                ):
+                    raise RunError("Query run_id conflicts with selected Run", 403)
+                cursor += 3
+                if cursor < len(content):
+                    if content[cursor][0] != ",":
+                        raise RunError("Unsupported query", 422)
+                    cursor += 1
+            insertion = ("," if content else "") + matcher
+            edits.append((tokens[close][1], tokens[close][1], insertion))
+            index = close
+            operand_expected = False
+        elif re.fullmatch(r"[A-Za-z_:][A-Za-z0-9_:]*", value):
+            following = tokens[index + 1][0] if index + 1 < len(tokens) else ""
+            previous = tokens[index - 1][0] if index else ""
+            # Keyword spelling does not make an identifier syntax: `sum`, `min`
+            # and `offset` can also be metric names. Recognize their actual role.
+            aggregate = value in _AGG and (
+                following == "(" or following in {"by", "without"}
+            )
+            binary = value in {"and", "or", "unless"} and not operand_expected
+            modifier = value == "bool" and previous in {
+                "==",
+                "!=",
+                ">",
+                "<",
+                ">=",
+                "<=",
+            }
+            duration = (
+                tokens[index + 2][0]
+                if following == "-" and index + 2 < len(tokens)
+                else following
+            )
+            offset = (
+                value == "offset"
+                and index > 0
+                and re.fullmatch(r"[0-9]+(?:ms|[smhdwy])", duration)
+            )
+            if following not in {"(", "{"} and not (
+                aggregate or binary or modifier or offset
+            ):
+                edits.append((end, end, "{" + matcher + "}"))
+                operand_expected = False
+            elif binary or aggregate or following == "(":
+                operand_expected = True
+        elif value in {
+            "(",
+            ",",
+            "+",
+            "-",
+            "*",
+            "/",
+            "%",
+            "^",
+            "==",
+            "!=",
+            ">",
+            "<",
+            ">=",
+            "<=",
+        }:
+            operand_expected = True
+        elif value in {")", "]"} or value.startswith('"') or value[0].isdigit():
+            operand_expected = False
+        index += 1
+    for left, right, replacement in reversed(edits):
+        query = query[:left] + replacement + query[right:]
+    return query
+
+
+def trace_search(query: str, identity: RunContext) -> str:
+    return traces(query, identity) + (
+        " | select(resource."
+        + "rl_insight.run_id"
+        + ", name, span.state_name, span.state_lane_id, span.monitor.trace_segment)"
+    )
+
+
+def traces(query: str, identity: RunContext) -> str:
+    """Boolean combinations of spansets; structural/pipeline syntax rejected."""
+    if len(query) > 65536:
+        raise RunError("Query too large", 413)
+    result, cursor, count = [], 0, 0
+    condition = "resource.rl_insight.run_id = " + json.dumps(identity.run_id)
+    while cursor < len(query):
+        char = query[cursor]
+        if char == "{":
+            end = cursor + 1
+            quoted = escaped = False
+            while end < len(query):
+                token = query[end]
+                if escaped:
+                    escaped = False
+                elif token == "\\" and quoted:
+                    escaped = True
+                elif token == '"':
+                    quoted = not quoted
+                elif token == "}" and not quoted:
+                    break
+                elif token in "{}|" and not quoted:
+                    raise RunError("Unsupported query", 422)
+                end += 1
+            if end == len(query):
+                raise RunError("Unsupported query", 422)
+            inner = query[cursor + 1 : end].strip()
+            # Existing identity conditions intersect the mandatory equality.
+            result.append("{ " + (f"({inner}) && " if inner else "") + condition + " }")
+            cursor = end + 1
+            count += 1
+        elif char.isspace() or char in "()":
+            result.append(char)
+            cursor += 1
+        elif query[cursor : cursor + 2] in {"&&", "||"}:
+            result.append(query[cursor : cursor + 2])
+            cursor += 2
+        else:
+            raise RunError("Unsupported TraceQL operator", 422)
+    if not count:
+        return "{ " + condition + " }" if not query.strip() else _unsupported()
+    return "".join(result)
+
+
+def _unsupported():
+    raise RunError("Unsupported query", 422)
+
+
+def read_backend(url: str, fields: list[tuple[str, str]], *, auth=None, headers=None):
+    """Bounded JSON reads from deployment-controlled services only."""
+    deadline = time.monotonic() + 10
+    with requests.Session() as session:
+        session.trust_env = False
+        try:
+            with session.get(
+                url,
+                params=fields,
+                auth=auth,
+                headers=headers,
+                timeout=(3, 3),
+                allow_redirects=False,
+                stream=True,
+            ) as response:
+                body = bytearray()
+                for chunk in response.iter_content(65536):
+                    body.extend(chunk)
+                    if len(body) > MAX_BYTES or time.monotonic() >= deadline:
+                        raise RunError("Backend response exceeds query budget", 502)
+                if 300 <= response.status_code < 400:
+                    raise RunError("Backend redirect rejected", 502)
+                return response.status_code, bytes(body)
+        except requests.RequestException as exc:
+            raise RunError("Backend query failed", 502) from exc
+
+
+def project_search(payload, context: RunContext) -> int:
+    """Keep only proven Run-local spans, never trace-wide root metadata."""
+    required, output = 0, []
+    for trace in payload.get("traces", []):
+        groups_out, members = [], []
+        for group in trace.get("spanSets") or [trace.get("spanSet", {})]:
+            spans = group["spans"]
+            matched = int(group["matched"])
+            if matched < len(spans) or matched > MAX_SPANS:
+                raise RunError("Trace search exceeds span budget", 502)
+            if matched > len(spans):
+                required = max(required, matched)
+            for span in spans:
+                pairs = [
+                    a
+                    for a in span.get("attributes", [])
+                    if a.get("key") == "rl_insight.run_id"
+                ]
+                if (
+                    len(pairs) != 1
+                    or pairs[0].get("value", {}).get("stringValue") != context.run_id
+                ):
+                    raise RunError(
+                        "Backend returned a foreign or unidentified span", 502
+                    )
+            groups_out.append({"spans": spans, "matched": matched})
+            members.extend(spans)
+        if not members:
+            raise RunError("Backend trace has no identifiable spans", 502)
+        start = min(int(s["startTimeUnixNano"]) for s in members)
+        end = max(
+            int(s["startTimeUnixNano"]) + int(s["durationNanos"]) for s in members
+        )
+        output.append(
+            {
+                "traceID": trace["traceID"],
+                "rootTraceName": members[0]["name"],
+                "rootServiceName": "",
+                "startTimeUnixNano": str(start),
+                "durationMs": max(0, end - start) // 1000000,
+                "spanSets": groups_out,
+                "spanSet": groups_out[0],
+            }
+        )
+    payload["traces"] = output
+    return required
+
+
+def trace_owned(payload, context: RunContext) -> bool:
+    resources = payload.get("batches", payload.get("resourceSpans", []))
+    if not resources:
+        return False
+    for resource in resources:
+        pairs = [
+            a
+            for a in resource.get("resource", {}).get("attributes", [])
+            if a.get("key") == "rl_insight.run_id"
+        ]
+        if (
+            len(pairs) != 1
+            or pairs[0].get("value", {}).get("stringValue") != context.run_id
+        ):
+            return False
+    return True
+
+
+def install_queries(app, registry, conf):
+    host = local_addresses()["loopback"]
+    endpoints = {
+        "prometheus": "http://"
+        + format_host_port(
+            host,
+            int(OmegaConf.select(conf, "prometheus.prometheus_port", default=9090)),
+        ),
+        "tempo": "http://"
+        + format_host_port(
+            host, int(OmegaConf.select(conf, "tempo.query_port", default=3200))
+        ),
+    }
+
+    def query(run_id, backend, path, fields):
+        context = registry.get(run_id)
+        if not bool(OmegaConf.select(conf, backend + ".enable", default=True)):
+            raise RunError("Backend disabled", 503)
+        if backend == "prometheus":
+            if path not in {
+                "query",
+                "query_range",
+                "series",
+                "labels",
+            } and not re.fullmatch(r"label/[A-Za-z_][A-Za-z0-9_]*/values", path):
+                raise RunError("Unsupported query path", 404)
+            field = "query" if path in {"query", "query_range"} else "match[]"
+            values = [v for k, v in fields if k == field]
+            if field == "query" and len(values) != 1:
+                raise RunError("Expected one query expression")
+            fields = [(k, v) for k, v in fields if k != field] + [
+                (field, prometheus(v, context)) for v in (values or [""])
+            ]
+            url = endpoints[backend] + "/api/v1/" + path
+        else:
+            if path == "search":
+                values = [v for k, v in fields if k == "q"]
+                if len(values) > 1 or any(k in {"tags", "spss"} for k, _ in fields):
+                    raise RunError("Unsupported search options", 422)
+                fields = [(k, v) for k, v in fields if k != "q"] + [
+                    ("q", trace_search(values[0] if values else "", context)),
+                    ("spss", "1000"),
+                ]
+            elif not re.fullmatch(r"traces/[0-9a-fA-F]{32}", path):
+                raise RunError("Unsupported trace query path", 404)
+            url = endpoints[backend] + "/api/" + path
+        status, body = read_backend(url, fields, headers={"Accept": "application/json"})
+        if backend == "tempo" and 200 <= status < 300:
+            try:
+                payload = json.loads(body)
+                if path == "search":
+                    needed = project_search(payload, context)
+                    if needed:
+                        fields = [(k, v) for k, v in fields if k != "spss"] + [
+                            ("spss", str(needed))
+                        ]
+                        status, body = read_backend(
+                            url, fields, headers={"Accept": "application/json"}
+                        )
+                        if not 200 <= status < 300:
+                            raise RunError("Complete trace search failed", 502)
+                        payload = json.loads(body)
+                        if project_search(payload, context):
+                            raise RunError("Trace search is incomplete", 502)
+                elif not trace_owned(payload, context):
+                    raise RunError("Trace not found in this Run", 404)
+                body = json.dumps(payload).encode()
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                if isinstance(exc, RunError):
+                    raise
+                raise RunError("Invalid backend trace response", 502) from exc
+        return Response(body, status_code=status, media_type="application/json")
+
+    @app.get("/api/v1/runs/{run_id}/prometheus/api/v1/{path:path}")
+    def metrics(run_id: str, path: str, request: Request):
+        return query(
+            run_id, "prometheus", path, list(request.query_params.multi_items())
+        )
+
+    @app.post("/api/v1/runs/{run_id}/prometheus/api/v1/{path:path}")
+    async def metrics_post(run_id: str, path: str, request: Request):
+        if (
+            request.headers.get("content-type", "").split(";")[0]
+            != "application/x-www-form-urlencoded"
+        ):
+            raise RunError("Expected form-encoded query", 415)
+        import asyncio
+
+        async def read_form():
+            body = bytearray()
+            async for chunk in request.stream():
+                body.extend(chunk)
+                if len(body) > 65536:
+                    raise RunError("Query body too large", 413)
+            return body.decode("utf-8")
+
+        try:
+            body = await asyncio.wait_for(read_form(), timeout=5)
+        except asyncio.TimeoutError as exc:
+            raise RunError("Query body timed out", 408) from exc
+        except UnicodeError as exc:
+            raise RunError("Invalid query encoding") from exc
+        fields = list(request.query_params.multi_items()) + parse_qsl(
+            body, keep_blank_values=True
+        )
+        return await run_in_threadpool(query, run_id, "prometheus", path, fields)
+
+    @app.get("/api/v1/runs/{run_id}/tempo/api/{path:path}")
+    def tempo(run_id: str, path: str, request: Request):
+        return query(run_id, "tempo", path, list(request.query_params.multi_items()))

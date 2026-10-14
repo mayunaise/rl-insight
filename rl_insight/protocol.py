@@ -45,13 +45,22 @@ class RunContext:
         validate_id(self.run_id)
         for name in (self.project, self.experiment_name):
             if not isinstance(name, str) or not name.strip() or len(name) > 256:
-                raise RunError("Run names must be non-empty strings of at most 256 characters")
+                raise RunError(
+                    "Run names must be non-empty strings of at most 256 characters"
+                )
             if any(ord(c) < 32 for c in name):
                 raise RunError("Run names cannot contain control characters")
         try:
             url = urlsplit(self.server_url)
-            if (url.scheme not in {"http", "https"} or not url.hostname or url.username
-                    or url.password or url.query or url.fragment or any(c.isspace() for c in self.server_url)):
+            if (
+                url.scheme not in {"http", "https"}
+                or not url.hostname
+                or url.username
+                or url.password
+                or url.query
+                or url.fragment
+                or any(c.isspace() for c in self.server_url)
+            ):
                 raise ValueError
             if url.port is not None and not 1 <= url.port <= 65535:
                 raise ValueError
@@ -67,7 +76,12 @@ class RunContext:
         try:
             if value.get("version") != 1:
                 raise ValueError
-            return cls(**{name: value[name] for name in ("run_id", "project", "experiment_name", "server_url")})
+            return cls(
+                **{
+                    name: value[name]
+                    for name in ("run_id", "project", "experiment_name", "server_url")
+                }
+            )
         except (KeyError, TypeError, ValueError) as exc:
             raise RunError("Invalid RunContext") from exc
 

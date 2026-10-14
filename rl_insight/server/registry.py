@@ -35,8 +35,13 @@ def _json(value: Any) -> str:
 
 def _config_snapshot(config: Mapping[str, Any]) -> dict[str, Any]:
     """Allowlist observability fields; never persist arbitrary framework config."""
+    if not isinstance(config, Mapping):
+        raise RunError("Observability config must be an object")
     result: dict[str, Any] = {}
-    for section, fields in {"server": ("namespace", "backend"), "prometheus": ("metrics_report_port",)}.items():
+    for section, fields in {
+        "server": ("namespace", "backend"),
+        "prometheus": ("metrics_report_port",),
+    }.items():
         raw = config.get(section, {})
         if not isinstance(raw, Mapping):
             raise RunError("Invalid observability config section")
@@ -53,7 +58,9 @@ class RunRegistry:
         self.root = root.expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._db = sqlite3.connect(self.root / "runs.sqlite", timeout=10, check_same_thread=False)
+        self._db = sqlite3.connect(
+            self.root / "runs.sqlite", timeout=10, check_same_thread=False
+        )
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("""CREATE TABLE IF NOT EXISTS runs (
@@ -62,44 +69,89 @@ class RunRegistry:
         )""")
         self._db.commit()
 
-    def create(self, request_id: str, project: str, experiment_name: str,
-               server_url: str, config: Mapping[str, Any]) -> RunContext:
+    def create(
+        self,
+        request_id: str,
+        project: str,
+        experiment_name: str,
+        server_url: str,
+        config: Mapping[str, Any],
+    ) -> RunContext:
         validate_id(request_id)
         context = RunContext(uuid4().hex, project, experiment_name, server_url)
         snapshot = _config_snapshot(config)
         with self._lock, self._db:
             self._db.execute("BEGIN IMMEDIATE")
-            row = self._db.execute("SELECT * FROM runs WHERE request_id=?", (request_id,)).fetchone()
+            row = self._db.execute(
+                "SELECT * FROM runs WHERE request_id=?", (request_id,)
+            ).fetchone()
             if row:
                 existing = RunContext.from_dict(json.loads(row["context"]))
-                if (existing.project, existing.experiment_name, json.loads(row["config"])) != (project, experiment_name, snapshot):
-                    raise RunError("Run creation request was reused with different metadata", 409)
+                if (
+                    existing.project,
+                    existing.experiment_name,
+                    json.loads(row["config"]),
+                ) != (project, experiment_name, snapshot):
+                    raise RunError(
+                        "Run creation request was reused with different metadata", 409
+                    )
                 context = existing
             else:
-                self._db.execute("INSERT INTO runs VALUES (?,?,?,?,?)", (
-                    context.run_id, request_id, _json(context.to_dict()), _json(snapshot), time.time(),
-                ))
+                self._db.execute(
+                    "INSERT INTO runs VALUES (?,?,?,?,?)",
+                    (
+                        context.run_id,
+                        request_id,
+                        _json(context.to_dict()),
+                        _json(snapshot),
+                        time.time(),
+                    ),
+                )
         # The DB owns identity. A failed projection can be rebuilt on get/retry.
         self.snapshot(context.run_id)
         return context
 
     def get(self, run_id: str) -> RunContext:
-        return RunContext.from_dict(self.snapshot(run_id)["context"])
+        return RunContext.from_dict(json.loads(self._read_run(run_id)["context"]))
 
-    def snapshot(self, run_id: str) -> dict[str, Any]:
+    def _read_run(self, run_id: str) -> sqlite3.Row:
         validate_id(run_id)
         with self._lock:
-            row = self._db.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            row = self._db.execute(
+                "SELECT * FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
             if row is None:
                 raise RunError("Run not found", 404)
+            return row
+
+    def snapshot(self, run_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._read_run(run_id)
             context = RunContext.from_dict(json.loads(row["context"]))
             project = hashlib.sha256(context.project.encode()).hexdigest()[:24]
-            experiment = hashlib.sha256(context.experiment_name.encode()).hexdigest()[:24]
+            experiment = hashlib.sha256(context.experiment_name.encode()).hexdigest()[
+                :24
+            ]
             directory = self.root / "experiments" / project / experiment
-            metadata = {"schema_version": 1, "context": context.to_dict(), "created_at": row["created_at"]}
-            self._write(directory / "experiment.json", {"schema_version": 1, "project": context.project, "experiment_name": context.experiment_name})
+            metadata = {
+                "schema_version": 1,
+                "context": context.to_dict(),
+                "created_at": row["created_at"],
+                "status": "registered",
+                "ended_at": None,
+            }
+            self._write(
+                directory / "experiment.json",
+                {
+                    "schema_version": 1,
+                    "project": context.project,
+                    "experiment_name": context.experiment_name,
+                },
+            )
             self._write(directory / "runs" / run_id / "run.json", metadata)
-            self._write(directory / "runs" / run_id / "config.json", json.loads(row["config"]))
+            self._write(
+                directory / "runs" / run_id / "config.json", json.loads(row["config"])
+            )
             return metadata
 
     @staticmethod
