@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
 import threading
@@ -25,7 +26,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from uuid import uuid4
 
-from ..protocol import RunContext, RunError, validate_id
+from ..protocol import RunContext, RunError, validate_id, endpoint_description
 
 
 def _json(value: Any) -> str:
@@ -53,7 +54,10 @@ def _config_snapshot(config: Mapping[str, Any]) -> dict[str, Any]:
 
 
 class RunRegistry:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, lease_ttl: float = 30):
+        if not 1 <= lease_ttl <= 3600:
+            raise RunError("Endpoint TTL must be between 1 and 3600 seconds")
+        self._lease_ttl = lease_ttl
         self.root = root.expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -66,7 +70,17 @@ class RunRegistry:
             run_id TEXT PRIMARY KEY, request_id TEXT UNIQUE NOT NULL,
             context TEXT NOT NULL, config TEXT NOT NULL, created_at REAL NOT NULL
         )""")
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(runs)")}
+        for name, definition in {
+            "status": "TEXT NOT NULL DEFAULT 'registered'",
+            "ended_at": "REAL",
+            "owner_hash": "TEXT NOT NULL DEFAULT ''",
+            "final_confirmed": "INTEGER",
+        }.items():
+            if name not in columns:
+                self._db.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
         self._db.commit()
+        self._endpoints: dict[str, dict[str, Any]] = {}
 
     def create(
         self,
@@ -75,8 +89,11 @@ class RunRegistry:
         experiment_name: str,
         server_url: str,
         config: Mapping[str, Any],
+        owner_token: str = "",
     ) -> RunContext:
         validate_id(request_id)
+        if owner_token:
+            validate_id(owner_token)
         context = RunContext(uuid4().hex, project, experiment_name, server_url)
         snapshot = _config_snapshot(config)
         with self._lock, self._db:
@@ -85,6 +102,15 @@ class RunRegistry:
                 "SELECT * FROM runs WHERE request_id=?", (request_id,)
             ).fetchone()
             if row:
+                expected_owner = (
+                    hashlib.sha256(owner_token.encode()).hexdigest()
+                    if owner_token
+                    else ""
+                )
+                if row["owner_hash"] != expected_owner:
+                    raise RunError(
+                        "Run creation owner conflicts with its original request", 409
+                    )
                 existing = RunContext.from_dict(json.loads(row["context"]))
                 if (
                     existing.project,
@@ -97,13 +123,16 @@ class RunRegistry:
                 context = existing
             else:
                 self._db.execute(
-                    "INSERT INTO runs VALUES (?,?,?,?,?)",
+                    "INSERT INTO runs (run_id,request_id,context,config,created_at,owner_hash) VALUES (?,?,?,?,?,?)",
                     (
                         context.run_id,
                         request_id,
                         _json(context.to_dict()),
                         _json(snapshot),
                         time.time(),
+                        hashlib.sha256(owner_token.encode()).hexdigest()
+                        if owner_token
+                        else "",
                     ),
                 )
         # The DB owns identity. A failed projection can be rebuilt on get/retry.
@@ -139,12 +168,164 @@ class RunRegistry:
                 "schema_version": 1,
                 "context": context.to_dict(),
                 "created_at": row["created_at"],
-                "status": "registered",
-                "ended_at": None,
+                "status": row["status"],
+                "ended_at": row["ended_at"],
+                "final_collection_confirmed": None
+                if row["final_confirmed"] is None
+                else bool(row["final_confirmed"]),
             }
             self._write(directory / "run.json", metadata)
             self._write(directory / "config.json", json.loads(row["config"]))
             return metadata
+
+    def assert_open(self, run_id: str, *, allow_closing: bool = True) -> None:
+        status = self._read_run(run_id)["status"]
+        if status == "ended" or (not allow_closing and status == "closing"):
+            raise RunError("Run is closed", 409)
+
+    def ended_runs(self) -> set[str]:
+        with self._lock:
+            return {
+                row[0]
+                for row in self._db.execute(
+                    "SELECT run_id FROM runs WHERE status='ended'"
+                )
+            }
+
+    def transition(
+        self, run_id: str, owner_token: str, status: str, final_confirmed=None
+    ) -> None:
+        validate_id(owner_token)
+        with self._lock, self._db:
+            row = self._read_run(run_id)
+            if (
+                not row["owner_hash"]
+                or row["owner_hash"] != hashlib.sha256(owner_token.encode()).hexdigest()
+            ):
+                raise RunError("Only the Run creator can close it", 409)
+            if row["status"] == "ended":
+                return
+            self._db.execute(
+                "UPDATE runs SET status=?,ended_at=? WHERE run_id=?",
+                (status, time.time() if status == "ended" else None, run_id),
+            )
+            if status == "ended":
+                self._db.execute(
+                    "UPDATE runs SET final_confirmed=? WHERE run_id=?",
+                    (
+                        int(final_confirmed)
+                        if isinstance(final_confirmed, bool)
+                        else None,
+                        run_id,
+                    ),
+                )
+                self._endpoints = {
+                    key: value
+                    for key, value in self._endpoints.items()
+                    if value["run_id"] != run_id
+                }
+        self.snapshot(run_id)
+
+    def register_endpoint(self, description: dict[str, Any]) -> dict[str, Any]:
+        run_id = description["run_id"]
+        with self._lock:
+            if self._read_run(run_id)["status"] != "registered":
+                raise RunError("Run is closing or closed", 409)
+            active = self.endpoints()
+            for item in active:
+                slot = ("run_id", "component", "instance")
+                if all(item[k] == description[k] for k in slot):
+                    if any(
+                        item[k] != description[k]
+                        for k in ("incarnation", "metrics_url")
+                    ):
+                        raise RunError(
+                            "Endpoint slot already belongs to an active publisher", 409
+                        )
+                    self.annotate_endpoint(item["lease_id"], description["labels"])
+                    return self.renew_endpoint(run_id, item["lease_id"])
+                if item["metrics_url"] == description["metrics_url"]:
+                    raise RunError(
+                        "Endpoint address already belongs to an active publisher", 409
+                    )
+            if sum(item["run_id"] == run_id for item in active) >= 64:
+                raise RunError("Run endpoint capacity exceeded", 429)
+            item = {
+                **description,
+                "lease_id": uuid4().hex,
+                "endpoint_id": hashlib.sha256(
+                    _json(
+                        {
+                            key: description[key]
+                            for key in (
+                                "run_id",
+                                "component",
+                                "instance",
+                                "incarnation",
+                            )
+                        }
+                    ).encode()
+                ).hexdigest()[:32],
+                "expires_at": time.monotonic() + self._lease_ttl,
+                "ttl": self._lease_ttl,
+            }
+            self._endpoints[item["lease_id"]] = item
+            return dict(item)
+
+    def annotate_endpoint(self, lease_id: str, labels: Mapping[str, Any]) -> None:
+        """Add descriptive labels without changing ownership or extending the lease."""
+        with self._lock:
+            self.endpoints()
+            item = self._endpoints.get(lease_id)
+            if item is None:
+                raise RunError("Endpoint lease expired or replaced", 409)
+            merged = dict(item["labels"])
+            for key, value in labels.items():
+                if key in merged and merged[key] != str(value):
+                    raise RunError("Endpoint description labels conflict", 409)
+                merged[key] = value
+            description = endpoint_description(
+                self.get(item["run_id"]), {**item, "labels": merged}
+            )
+            item["labels"] = description["labels"]
+
+    def endpoints(self, run_id: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            now = time.monotonic()
+            self._endpoints = {
+                key: val
+                for key, val in self._endpoints.items()
+                if val["expires_at"] > now
+            }
+            return [
+                dict(item)
+                for item in self._endpoints.values()
+                if run_id is None or item["run_id"] == run_id
+            ]
+
+    def endpoint_valid(self, item: dict[str, Any]) -> bool:
+        with self._lock:
+            return any(
+                current["lease_id"] == item["lease_id"]
+                for current in self.endpoints(item["run_id"])
+            )
+
+    def renew_endpoint(self, run_id: str, lease_id: str) -> dict[str, Any]:
+        with self._lock:
+            self.assert_open(run_id)
+            self.endpoints()
+            item = self._endpoints.get(validate_id(lease_id))
+            if item is None or item["run_id"] != run_id:
+                raise RunError("Endpoint lease expired or replaced", 409)
+            item["expires_at"] = time.monotonic() + item["ttl"]
+            return dict(item)
+
+    def revoke_endpoint(self, run_id: str, lease_id: str) -> None:
+        with self._lock:
+            item = self._endpoints.get(validate_id(lease_id))
+            if item is not None and item["run_id"] != run_id:
+                raise RunError("Endpoint lease belongs to another Run", 409)
+            self._endpoints.pop(lease_id, None)
 
     @staticmethod
     def _write(path: Path, value: Any) -> None:

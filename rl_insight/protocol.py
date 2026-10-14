@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import re
+import ipaddress
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 from urllib.parse import urlsplit
@@ -94,3 +95,72 @@ class RunContext:
         labels.pop("exported_run_id", None)
         labels["run_id"] = self.run_id
         return labels
+
+
+def proof_headers(context: RunContext, incarnation: str) -> dict[str, str]:
+    validate_id(incarnation)
+    return {"X-RLInsight-Run": context.run_id, "X-RLInsight-Incarnation": incarnation}
+
+
+def endpoint_description(
+    context: RunContext, value: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Validate a publisher's facts, independent of any framework or runtime."""
+    for key in ("component", "instance"):
+        name = value.get(key)
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name) > 256
+            or any(ord(c) < 32 for c in name)
+        ):
+            raise RunError("Invalid endpoint " + key)
+    incarnation = validate_id(value.get("incarnation", ""))
+    url = value.get("metrics_url")
+    if not isinstance(url, str):
+        raise RunError("Invalid metrics URL")
+    try:
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.fragment
+            or parsed.query
+            or any(c.isspace() for c in url)
+        ):
+            raise ValueError
+        if parsed.port is not None and not 1 <= parsed.port <= 65535:
+            raise ValueError
+        if "%" in parsed.hostname:
+            raise ValueError
+        ipaddress.ip_address(parsed.hostname)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise RunError(
+            "Metrics URL must contain a literal IPv4/IPv6 address and valid port"
+        ) from exc
+    supplied = value.get("labels", {})
+    if not isinstance(supplied, Mapping):
+        raise RunError("Endpoint labels must be an object")
+    labels = context.labels(supplied)
+    for key, val in labels.items():
+        if (
+            not re.fullmatch(r"[a-zA-Z_][a-zA-Z_0-9]*", key)
+            or key.startswith("__")
+            or not isinstance(val, (str, int, float, bool))
+        ):
+            raise RunError("Invalid endpoint label")
+    if any(
+        key in labels
+        for key in ("endpoint_id", "component", "exported_job", "exported_instance")
+    ):
+        raise RunError("Reserved endpoint label")
+    return {
+        "run_id": context.run_id,
+        "component": value["component"],
+        "instance": value["instance"],
+        "incarnation": incarnation,
+        "metrics_url": url,
+        "labels": {k: str(v) for k, v in labels.items()},
+    }

@@ -19,12 +19,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import re
 import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Event, Thread
 from urllib.parse import parse_qsl
 from typing import Any, Sequence
 
@@ -35,12 +36,13 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from omegaconf import DictConfig, OmegaConf
 from starlette.concurrency import run_in_threadpool
 
-from ..protocol import RunContext, RunError
+from ..protocol import RunContext, RunError, endpoint_description
 from ..utils.constants import MonitorEnv, MonitorPaths, MonitorServer, PrometheusScrape
 from ..utils.monitor_config_loader import load_server_config_file
 from ..utils.prometheus_utils import PrometheusTarget, PrometheusTargetStore
 from .network import format_host_port, local_addresses
 from .registry import RunRegistry
+from .collection import Collection
 
 logger = logging.getLogger(__name__)
 
@@ -98,19 +100,46 @@ def create_app(conf: DictConfig) -> FastAPI:
                     conf, "server.data_dir", default=MonitorPaths.STATE_ROOT / "data"
                 )
             )
-        )
+        ),
+        lease_ttl=float(OmegaConf.select(conf, "server.endpoint_ttl", default=30)),
     )
+
+    collection = Collection(registry)
+    stop_projection = Event()
+    store = PrometheusTargetStore.from_config(conf)
+
+    def project():
+        address = format_host_port(
+            local_addresses()["loopback"],
+            int(OmegaConf.select(conf, "server.port", default=18080)),
+        )
+        store.project_runs(registry.endpoints(), address, registry.ended_runs())
+
+    def projection_loop():
+        while not stop_projection.wait(5):
+            try:
+                project()
+            except (OSError, ValueError):
+                logger.exception("Run discovery projection failed")
 
     @asynccontextmanager
     async def lifespan(_app):
         try:
             await run_in_threadpool(refresh_views)
+            await run_in_threadpool(project)
+            thread = Thread(
+                target=projection_loop, name="insight-run-discovery", daemon=True
+            )
+            thread.start()
             yield
         finally:
+            stop_projection.set()
+            if "thread" in locals():
+                await run_in_threadpool(thread.join, 6)
+            await run_in_threadpool(collection.close)
             registry.close()
 
     app = FastAPI(title="RL-Insight server", version="0.1.0", lifespan=lifespan)
-    store = PrometheusTargetStore.from_config(conf)
     install_queries(app, registry, conf)
     refresh_views = install_views(app, registry, conf)
 
@@ -130,6 +159,7 @@ def create_app(conf: DictConfig) -> FastAPI:
             payload.get("experiment_name", "unnamed"),
             str(OmegaConf.select(conf, "server.public_url") or request.base_url),
             payload.get("config", {}),
+            payload.get("owner_token", ""),
         )
         background.add_task(refresh_views, str(request.base_url))
         return context.to_dict()
@@ -137,6 +167,52 @@ def create_app(conf: DictConfig) -> FastAPI:
     @app.get("/api/v1/runs/{run_id}")
     def get_run(run_id: str):
         return registry.snapshot(run_id)
+
+    @app.post("/api/v1/runs/{run_id}/endpoints")
+    def register_endpoint(run_id: str, payload: dict[str, Any] = Body(...)):
+        description = endpoint_description(registry.get(run_id), payload)
+        registry.assert_open(run_id)
+        collection.verify(description)
+        lease = registry.register_endpoint(description)
+        project()
+        return lease
+
+    @app.post("/api/v1/runs/{run_id}/endpoints/{lease_id}")
+    def renew_endpoint(run_id: str, lease_id: str):
+        return registry.renew_endpoint(run_id, lease_id)
+
+    @app.delete("/api/v1/runs/{run_id}/endpoints/{lease_id}")
+    def revoke_endpoint(run_id: str, lease_id: str):
+        registry.revoke_endpoint(run_id, lease_id)
+        project()
+        return {"status": "ok"}
+
+    @app.get("/api/v1/runs/{run_id}/metrics")
+    def collect_metrics(run_id: str, request: Request):
+        timeout = 9.0
+        supplied = request.headers.get("X-Prometheus-Scrape-Timeout-Seconds")
+        if supplied is not None:
+            try:
+                seconds = float(supplied)
+                if not math.isfinite(seconds) or seconds <= 0:
+                    raise ValueError
+                timeout = min(timeout, seconds - min(1.0, seconds * 0.2))
+            except ValueError as exc:
+                raise RunError("Invalid scrape timeout") from exc
+        code, body = collection.collect(run_id, timeout)
+        return Response(body, status_code=code, media_type="text/plain; version=0.0.4")
+
+    @app.post("/api/v1/runs/{run_id}/close")
+    def close_run(run_id: str, payload: dict[str, Any] = Body(...)):
+        state = "closing" if payload.get("prepare") is True else "ended"
+        registry.transition(
+            run_id,
+            payload.get("owner_token", ""),
+            state,
+            payload.get("final_collection_confirmed"),
+        )
+        project()
+        return {"status": state}
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -149,6 +225,7 @@ def create_app(conf: DictConfig) -> FastAPI:
         return {
             "status": "ok",
             "run_context_version": 1,
+            "endpoint_registration_version": 1,
             "otlp_port": (
                 int(OmegaConf.select(conf, "otel.otel_port"))
                 if bool(OmegaConf.select(conf, "tempo.enable", default=True))
@@ -216,6 +293,7 @@ def create_app(conf: DictConfig) -> FastAPI:
         if "run_context" in payload:
             supplied = RunContext.from_dict(payload["run_context"])
             context = registry.get(supplied.run_id)
+            registry.assert_open(context.run_id, allow_closing=False)
             if context != supplied:
                 raise RunError("RunContext conflicts with registered metadata", 409)
             targets = [
@@ -231,6 +309,23 @@ def create_app(conf: DictConfig) -> FastAPI:
                     )
                     for target in targets
                 ]
+        active = {
+            item["metrics_url"].split("://", 1)[1].split("/", 1)[0]: item
+            for item in registry.endpoints()
+        }
+        for target in targets:
+            if (
+                target.target in active
+                and payload.get("run_context", {}).get("run_id")
+                != active[target.target]["run_id"]
+            ):
+                raise RunError("Target already belongs to a proved publisher", 409)
+            if target.target in active:
+                registry.annotate_endpoint(
+                    active[target.target]["lease_id"],
+                    {"job": job_name, **target.labels},
+                )
+        targets = [target for target in targets if target.target not in active]
         try:
             result = store.register(job_name, targets)
         except ValueError as exc:
