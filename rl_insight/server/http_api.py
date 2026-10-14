@@ -20,18 +20,22 @@ import argparse
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Sequence
 
 import requests
 import uvicorn
-from fastapi import Body, FastAPI, HTTPException, status
+from fastapi import Body, FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from omegaconf import DictConfig, OmegaConf
 
-from ..utils.constants import MonitorEnv, MonitorServer, PrometheusScrape
+from ..protocol import RunError
+from ..utils.constants import MonitorEnv, MonitorPaths, MonitorServer, PrometheusScrape
 from ..utils.monitor_config_loader import load_server_config_file
 from ..utils.prometheus_utils import PrometheusTarget, PrometheusTargetStore
 from .network import local_addresses
+from .registry import RunRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +86,35 @@ def get_server_services() -> dict[str, Any]:
 
 def create_app(conf: DictConfig) -> FastAPI:
     """Create the RL-Insight server application."""
-    app = FastAPI(title="RL-Insight server", version="0.1.0")
+    registry = RunRegistry(Path(str(OmegaConf.select(conf, "server.data_dir", default=MonitorPaths.STATE_ROOT / "data"))))
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        try:
+            yield
+        finally:
+            registry.close()
+
+    app = FastAPI(title="RL-Insight server", version="0.1.0", lifespan=lifespan)
     store = PrometheusTargetStore.from_config(conf)
+
+    @app.exception_handler(RunError)
+    async def run_error(_request, exc):
+        return JSONResponse({"detail": str(exc)}, status_code=exc.status)
+
+    @app.post("/api/v1/runs")
+    def create_run(request: Request, payload: dict[str, Any] = Body(...)):
+        context = registry.create(
+            payload.get("request_id", ""), payload.get("project", "uncategorized"),
+            payload.get("experiment_name", "unnamed"),
+            str(OmegaConf.select(conf, "server.public_url") or request.base_url),
+            payload.get("config", {}),
+        )
+        return context.to_dict()
+
+    @app.get("/api/v1/runs/{run_id}")
+    def get_run(run_id: str):
+        return registry.snapshot(run_id)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -95,6 +126,7 @@ def create_app(conf: DictConfig) -> FastAPI:
         """Expose enabled component ports for trainer-side endpoint discovery."""
         return {
             "status": "ok",
+            "run_context_version": 1,
             "otlp_port": (
                 int(OmegaConf.select(conf, "otel.otel_port"))
                 if bool(OmegaConf.select(conf, "tempo.enable", default=True))
