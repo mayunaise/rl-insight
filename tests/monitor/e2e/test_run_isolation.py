@@ -312,6 +312,15 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         ).read_text()
     )
     assert dashboard["spec"]["layout"] == template["spec"]["layout"]
+    timeline = dashboard["spec"]["elements"]["panel-40"]["spec"]["vizConfig"]
+    assert timeline["spec"]["fieldConfig"]["overrides"] == [
+        {
+            "matcher": {"id": "byName", "options": "traceName"},
+            "properties": [
+                {"id": "displayName", "value": "${__field.labels.state_lane_id}"}
+            ],
+        }
+    ]
     assert len(dashboard["spec"]["elements"]) == len(template["spec"]["elements"])
     for name, element in dashboard["spec"]["elements"].items():
         assert (
