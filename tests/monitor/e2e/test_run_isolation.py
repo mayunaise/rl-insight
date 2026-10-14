@@ -318,7 +318,7 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     )
     span["attributes"] = attrs(second["run_id"])
     assert requests.get(root + "/tempo/api/search", timeout=3).status_code == 502
-    from rl_insight.server.run_views import run_dashboard
+    from rl_insight.server.runtime import run_dashboard
     from rl_insight.protocol import RunContext
 
     dashboard = run_dashboard(
