@@ -30,7 +30,7 @@ from fastapi import Body, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from omegaconf import DictConfig, OmegaConf
 
-from ..protocol import RunError
+from ..protocol import RunContext, RunError
 from ..utils.constants import MonitorEnv, MonitorPaths, MonitorServer, PrometheusScrape
 from ..utils.monitor_config_loader import load_server_config_file
 from ..utils.prometheus_utils import PrometheusTarget, PrometheusTargetStore
@@ -86,7 +86,15 @@ def get_server_services() -> dict[str, Any]:
 
 def create_app(conf: DictConfig) -> FastAPI:
     """Create the RL-Insight server application."""
-    registry = RunRegistry(Path(str(OmegaConf.select(conf, "server.data_dir", default=MonitorPaths.STATE_ROOT / "data"))))
+    registry = RunRegistry(
+        Path(
+            str(
+                OmegaConf.select(
+                    conf, "server.data_dir", default=MonitorPaths.STATE_ROOT / "data"
+                )
+            )
+        )
+    )
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -97,6 +105,11 @@ def create_app(conf: DictConfig) -> FastAPI:
 
     app = FastAPI(title="RL-Insight server", version="0.1.0", lifespan=lifespan)
     store = PrometheusTargetStore.from_config(conf)
+    from .queries import install_queries
+    from .run_views import install_views
+
+    install_queries(app, registry, conf)
+    install_views(app, registry, conf)
 
     @app.exception_handler(RunError)
     async def run_error(_request, exc):
@@ -105,7 +118,8 @@ def create_app(conf: DictConfig) -> FastAPI:
     @app.post("/api/v1/runs")
     def create_run(request: Request, payload: dict[str, Any] = Body(...)):
         context = registry.create(
-            payload.get("request_id", ""), payload.get("project", "uncategorized"),
+            payload.get("request_id", ""),
+            payload.get("project", "uncategorized"),
             payload.get("experiment_name", "unnamed"),
             str(OmegaConf.select(conf, "server.public_url") or request.base_url),
             payload.get("config", {}),
@@ -191,6 +205,24 @@ def create_app(conf: DictConfig) -> FastAPI:
             )
 
         job_name = str(payload.get("job_name") or PrometheusScrape.TRAINER_METRICS_JOB)
+        if "run_context" in payload:
+            supplied = RunContext.from_dict(payload["run_context"])
+            context = registry.get(supplied.run_id)
+            if context != supplied:
+                raise RunError("RunContext conflicts with registered metadata", 409)
+            targets = [
+                PrometheusTarget(target.target, context.labels(target.labels))
+                for target in targets
+            ]
+            if payload.get("identity_in_metrics") is True:
+                # Hub samples already have run_id; avoid duplicate exported_run_id labels.
+                targets = [
+                    PrometheusTarget(
+                        target.target,
+                        {k: v for k, v in target.labels.items() if k != "run_id"},
+                    )
+                    for target in targets
+                ]
         try:
             result = store.register(job_name, targets)
         except ValueError as exc:
