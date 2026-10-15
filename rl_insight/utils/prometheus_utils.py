@@ -53,30 +53,31 @@ _pending_probe: threading.Thread | None = None
 
 
 def _wait_for_context() -> None:
-    """One bounded probe for native-only workers whose logger starts later."""
+    """Retry pending native targets for the lifetime of their worker process."""
+    global _pending_probe
     from ..client.ray_monitor_client import current_job_context
 
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
+    delay = 0.1
+    while True:
         with _pending_lock:
             if not _pending_targets:
+                _pending_probe = None
                 return
         context = current_job_context()
         if context:
             flush_pending_targets(context)
-            return
-        time.sleep(0.1)
-    logger.warning(
-        "Native metric targets remain unbound: Run initialization was not observed"
-    )
+        time.sleep(delay)
+        delay = min(delay * 2, 2)
 
 
 def flush_pending_targets(context: RunContext | None) -> None:
     with _pending_lock:
         pending = list(_pending_targets)
-        _pending_targets.clear()
-    for addresses, job, labels in pending:
-        update_prometheus_config(addresses, job, labels, context=context)
+    for item in pending:
+        if _register_targets(*item, context):
+            with _pending_lock:
+                if item in _pending_targets:
+                    _pending_targets.remove(item)
 
 
 __all__ = [
@@ -533,12 +534,36 @@ def update_prometheus_config(
                             _pending_probe.start()
                     return
 
+    _register_targets(
+        server_addresses,
+        job_name,
+        labels,
+        context,
+        identity_in_metrics=identity_in_metrics,
+    )
+
+
+def _register_targets(
+    server_addresses: list[str],
+    job_name: str | None,
+    labels: list[Mapping[str, Any] | None] | None,
+    context: RunContext | None,
+    *,
+    identity_in_metrics: bool = False,
+) -> bool:
+    """Report success so deferred targets remain queued after a failed request."""
+    base_url = (
+        context.server_url
+        if context
+        else str(os.environ.get(MonitorEnv.SERVER_URL, "")).strip().rstrip("/")
+    )
+    if not base_url:
+        return False
     payload: dict[str, Any] = {
         "job_name": job_name or PrometheusScrape.TRAINER_METRICS_JOB,
         "targets": _build_target_payload(server_addresses, labels),
     }
     if context:
-        base_url = context.server_url
         payload["run_context"] = context.to_dict()
         payload["identity_in_metrics"] = identity_in_metrics
     url = f"{base_url}/api/v1/prometheus/targets"
@@ -549,10 +574,13 @@ def update_prometheus_config(
             f"[rl-insight] Registered {len(server_addresses)} Prometheus targets "
             f"with RL-Insight server (job_name={payload['job_name']})"
         )
+        return True
     except requests.RequestException as exc:
         logger.error(
             "[rl-insight] Failed to register Prometheus targets at %s: %s", url, exc
         )
+
+    return False
 
 
 def _build_target_payload(
