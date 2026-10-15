@@ -33,14 +33,15 @@ import pytest
 import requests
 import uvicorn
 from omegaconf import OmegaConf
+from fastapi.responses import JSONResponse
 
 from rl_insight.server.http_api import create_app
 
 
 @contextmanager
-def serve(app):
+def serve(app, port=0):
     sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
+    sock.bind(("127.0.0.1", port))
     base = f"http://127.0.0.1:{sock.getsockname()[1]}"
     server = uvicorn.Server(uvicorn.Config(app, log_level="error"))
     thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]})
@@ -59,7 +60,14 @@ def serve(app):
 
 @pytest.fixture
 def stack(tmp_path):
-    state = SimpleNamespace(calls=[], traces=[], results={}, fail_writes=False)
+    state = SimpleNamespace(
+        calls=[],
+        traces=[],
+        results={},
+        fail_writes=False,
+        reject_native_once=False,
+        native_rejections=0,
+    )
     dashboard_uid = "a4cabbce-92af-4a84-9399-4deba24ae6d1"
     dashboard_path = (
         "/apis/dashboard.grafana.app/v2/namespaces/default/dashboards/" + dashboard_uid
@@ -135,8 +143,25 @@ def stack(tmp_path):
             "grafana": {"port": backend.server_port},
         }
     )
+    app = create_app(conf)
+
+    @app.middleware("http")
+    async def reject_native_registration_once(request, call_next):
+        if (
+            state.reject_native_once
+            and request.url.path == "/api/v1/prometheus/targets"
+        ):
+            payload = await request.json()
+            if any(item["target"] == "127.0.0.1:9998" for item in payload["targets"]):
+                state.reject_native_once = False
+                state.native_rejections += 1
+                return JSONResponse(
+                    {"detail": "Temporary registration failure"}, status_code=503
+                )
+        return await call_next(request)
+
     try:
-        with serve(create_app(conf)) as url:
+        with serve(app) as url:
             yield SimpleNamespace(
                 url=url, conf=conf, data=tmp_path / "data", backend=state
             )
@@ -432,7 +457,8 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     assert "19998" in (stack.data / "targets/prometheus-targets.yml").read_text()
 
 
-def test_existing_ray_api_keeps_one_run_identity(stack):
+@pytest.mark.parametrize("context_delay", [0, 35], ids=["immediate", "late-context"])
+def test_existing_ray_api_keeps_one_run_identity(stack, context_delay):
     from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
         ExportTraceServiceRequest,
     )
@@ -453,7 +479,8 @@ def test_existing_ray_api_keeps_one_run_identity(stack):
     with socket.socket() as reserve:
         reserve.bind(("127.0.0.1", 0))
         port = reserve.getsockname()[1]
-    script = "import runpy,sys; runpy.run_path(sys.argv[1])['_ray_scenario'](sys.argv[2],int(sys.argv[3]))"
+    stack.backend.reject_native_once = bool(context_delay)
+    script = "import runpy,sys; runpy.run_path(sys.argv[1])['_ray_scenario'](sys.argv[2],int(sys.argv[3]),context_delay=float(sys.argv[4]))"
     child = subprocess.run(
         [
             sys.executable,
@@ -462,12 +489,14 @@ def test_existing_ray_api_keeps_one_run_identity(stack):
             str(Path(__file__).resolve()),
             stack.url,
             str(port),
+            str(context_delay),
         ],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=90,
     )
     assert child.returncode == 0, child.stdout + child.stderr
+    assert stack.backend.native_rejections == int(bool(context_delay))
     context = json.loads(
         next(
             line[8:]
@@ -501,26 +530,42 @@ def test_existing_ray_api_keeps_one_run_identity(stack):
         if variable["spec"]["name"] == "run_id"
     )
     assert [option["value"] for option in selector["options"]] == [context["run_id"]]
-    # The producer has finished; restart from the original provisioned template.
-    stack.backend.results[path] = template
-    with serve(create_app(stack.conf)) as restarted:
-        selector = next(
-            variable["spec"]
-            for variable in stack.backend.results[path]["spec"]["variables"]
-            if variable["spec"]["name"] == "run_id"
-        )
-        assert [option["value"] for option in selector["options"]] == [
-            context["run_id"]
-        ]
-        assert (
-            requests.get(
-                restarted + "/api/v1/runs/" + context["run_id"], timeout=3
-            ).status_code
-            == 200
-        )
+    # Restore the template, change ports, then inspect sources before any view request.
+    for public_url in ("", "https://monitor.example.invalid/insight"):
+        stack.backend.results[path] = template
+        stack.conf.server.public_url = public_url
+        with socket.socket() as reserve:
+            reserve.bind(("127.0.0.1", 0))
+            stack.conf.server.port = reserve.getsockname()[1]
+        with serve(create_app(stack.conf), port=stack.conf.server.port) as restarted:
+            for kind in ("prometheus", "tempo"):
+                source = stack.backend.results[
+                    "/api/datasources/uid/rli-" + context["run_id"] + "-" + kind[0]
+                ]
+                assert source["url"] == (
+                    (public_url or restarted)
+                    + "/api/v1/runs/"
+                    + context["run_id"]
+                    + "/"
+                    + kind
+                )
+            selector = next(
+                variable["spec"]
+                for variable in stack.backend.results[path]["spec"]["variables"]
+                if variable["spec"]["name"] == "run_id"
+            )
+            assert [option["value"] for option in selector["options"]] == [
+                context["run_id"]
+            ]
+            assert (
+                requests.get(
+                    restarted + "/api/v1/runs/" + context["run_id"], timeout=3
+                ).status_code
+                == 200
+            )
 
 
-def _ray_scenario(url, port, real_backends=False):
+def _ray_scenario(url, port, real_backends=False, context_delay=0):
     import ray
     import rl_insight as insight
     from rl_insight.client.ray_monitor_client import _current_job_actor_name
@@ -544,15 +589,26 @@ def _ray_scenario(url, port, real_backends=False):
             def ready(self):
                 return True
 
+            def registered(self):
+                from rl_insight.utils.prometheus_utils import _pending_targets
+
+                return not _pending_targets
+
         if not real_backends:
             exporter = NativeExporter.remote()
             assert ray.get(exporter.ready.remote())
             insight.update_prometheus_config(
                 ["127.0.0.1:9999"], job_name="native", labels=[{"replica": "0"}]
             )
+            time.sleep(context_delay)
         insight.init(project="demo", experiment_name="same", config=conf)
         context = insight.get_context()
         assert context is not None
+        if not real_backends:
+            deadline = time.monotonic() + 10
+            while not ray.get(exporter.registered.remote()):
+                assert time.monotonic() < deadline
+                time.sleep(0.1)
 
         @ray.remote(max_calls=1)
         def worker(config):

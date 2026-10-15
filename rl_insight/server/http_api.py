@@ -689,9 +689,16 @@ def install_views(app, registry, conf):
         runs = registry.list_runs()
         if runs and bool(OmegaConf.select(conf, "grafana.enable", default=True)):
             try:
-                prepare(
-                    runs[0].run_id, base_url or runs[0].server_url, DEFAULT_TEMPLATE
+                current_url = (
+                    OmegaConf.select(conf, "server.public_url")
+                    or base_url
+                    or "http://"
+                    + format_host_port(
+                        local_addresses()["loopback"],
+                        int(OmegaConf.select(conf, "server.port", default=18080)),
+                    )
                 )
+                prepare(runs[0].run_id, str(current_url), DEFAULT_TEMPLATE)
             except (RunError, OSError) as exc:
                 logger.warning(
                     "[rl-insight] Could not refresh the original dashboard: %s", exc

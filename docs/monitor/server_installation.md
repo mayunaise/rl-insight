@@ -306,8 +306,11 @@ backend credentials are included. Other clients can implement the optional
 
 Normal target registration through `update_prometheus_config` carries the Run
 identity. Registrations made before logger initialization are deferred until a
-context is available. Unbound legacy targets remain unclassified. No framework
-source patch or native exporter wrapper is required for this increment.
+context is available. A worker retries with backoff while targets remain pending,
+including initialization longer than 30 seconds and failed registration requests;
+a target leaves the queue only after successful registration. Unbound legacy
+targets remain unclassified. No framework source patch or native exporter wrapper
+is required for this increment.
 
 Under the existing `server.data_dir`, configuration and readable metadata are
 organized as:
@@ -357,7 +360,8 @@ and server startup refresh the options, including Runs with no remaining backend
 samples. Reopening the entry also refreshes them. A refresh failure is logged
 without preventing Run creation; the original dashboard must already be
 provisioned. Bound runtime files are updated so file provisioning retains the
-Run filter.
+Run filter. On restart, data-source URLs use `server.public_url` when set,
+otherwise the current server port, rather than the historical registration URL.
 
 `/api/v1/runs/<run_id>/view?template=<relative-json-path>` supports
 another deployed Grafana v2 template using the same data sources. Panel layout,
