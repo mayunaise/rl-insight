@@ -211,11 +211,13 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     assert {p.name for p in directories} == {first["run_id"], second["run_id"]}
     for directory in directories:
         assert directory.resolve().is_relative_to(stack.data)
-        context = json.loads((directory / "run.json").read_text())["context"]
+        context = json.loads((directory / "run.json").read_text(encoding="utf-8"))[
+            "context"
+        ]
         assert context["run_id"] == directory.name
         assert context["project"] == payload["project"]
         assert context["experiment_name"] == payload["experiment_name"]
-        assert "secret" not in (directory / "config.json").read_text()
+        assert "secret" not in (directory / "config.json").read_text(encoding="utf-8")
     first_directory = stack.data / "runs" / first["run_id"]
     (first_directory / "run.json").unlink()
     (first_directory / "config.json").unlink()
@@ -224,11 +226,14 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         assert restored.status_code == 200
         assert restored.json()["context"] == first
         assert (
-            json.loads((first_directory / "run.json").read_text())["context"] == first
+            json.loads((first_directory / "run.json").read_text(encoding="utf-8"))[
+                "context"
+            ]
+            == first
         )
-        assert json.loads((first_directory / "config.json").read_text()) == {
-            "server": {"namespace": "demo"}
-        }
+        assert json.loads(
+            (first_directory / "config.json").read_text(encoding="utf-8")
+        ) == {"server": {"namespace": "demo"}}
     run_id = first["run_id"]
     root = stack.url + "/api/v1/runs/" + run_id
     stack.backend.results["/api/v1/query"] = {
@@ -353,7 +358,7 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         (
             Path(__file__).parents[3]
             / "rl_insight/config/services/grafana/dashboards/verl/verl_tainer_v1_with_vllm_engine.json"
-        ).read_text()
+        ).read_text(encoding="utf-8")
     )
     assert dashboard["spec"]["layout"] == template["spec"]["layout"]
     assert dashboard["metadata"]["name"] == template["metadata"]["name"]
@@ -447,14 +452,18 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         monitor.init(config={"server": {"url": stack.url, "backend": "legacy"}})
         assert monitor.get_context() is None
         monitor.update_prometheus_config(["127.0.0.1:19999"])
-        assert "19999" in (stack.data / "targets/prometheus-targets.yml").read_text()
+        assert "19999" in (stack.data / "targets/prometheus-targets.yml").read_text(
+            encoding="utf-8"
+        )
     finally:
         monitor.finish()
     monkeypatch.delenv("RL_INSIGHT_SERVER_URL")
     monitor.update_prometheus_config(
         ["127.0.0.1:19998"], context=RunContext.from_dict(first)
     )
-    assert "19998" in (stack.data / "targets/prometheus-targets.yml").read_text()
+    assert "19998" in (stack.data / "targets/prometheus-targets.yml").read_text(
+        encoding="utf-8"
+    )
 
 
 @pytest.mark.parametrize("context_delay", [0, 35], ids=["immediate", "late-context"])
@@ -467,7 +476,9 @@ def test_existing_ray_api_keeps_one_run_identity(stack, context_delay):
     from rl_insight.server.runtime import DEFAULT_TEMPLATE
 
     template = json.loads(
-        (MonitorPaths.GRAFANA_DASHBOARDS_DIR / DEFAULT_TEMPLATE).read_text()
+        (MonitorPaths.GRAFANA_DASHBOARDS_DIR / DEFAULT_TEMPLATE).read_text(
+            encoding="utf-8"
+        )
     )
     selector = next(
         variable["spec"]
@@ -513,7 +524,9 @@ def test_existing_ray_api_keeps_one_run_identity(stack, context_delay):
     assert attrs["rl_insight.run_id"] == context["run_id"]
     assert attrs["service.name"] == "rl_insight_monitor"
     assert request.resource_spans[0].scope_spans[0].spans[0].name == "update_actor"
-    targets = (stack.data / "targets/prometheus-targets.yml").read_text()
+    targets = (stack.data / "targets/prometheus-targets.yml").read_text(
+        encoding="utf-8"
+    )
     assert (
         targets.count(context["run_id"]) == 2
         and "replica: '0'" in targets
