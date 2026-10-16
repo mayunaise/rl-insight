@@ -348,6 +348,7 @@ def expand_task_config(
         )
     if set(metrics) - {
         "pull",
+        "port",
         "remote_write",
         "scrape_interval",
         "scrape_timeout",
@@ -411,6 +412,10 @@ def expand_task_config(
         or not 1 <= conf.server.endpoint_ttl <= 3600
     ):
         raise ValueError("server.endpoint_ttl must be between 1 and 3600 seconds")
+    if "port" in metrics:
+        if type(metrics["port"]) is not int or not 0 <= metrics["port"] <= 65535:
+            raise ValueError("metrics.port must be an integer from 0 to 65535")
+        conf.server.metrics_port = metrics["port"]
     selected_url = server_url or settings.get("url")
     conf.server.url = _http_url(selected_url, "server_url") if selected_url else ""
     external = advanced or has_metrics or bool(traces)

@@ -644,10 +644,35 @@ trace-only job ignores native metric registration. Other runtimes can use the
 same generic service session from their existing driver initialization; they
 must supply a reachable head URL when configuring separate processes to connect.
 
-The default fixed collector port is 18080. Optional `server.port`,
-`server.namespace`, `server.endpoint_ttl` and `server.url` live inside the same
-monitoring section. `server.url` connects to an existing compatible service.
-Port 0 selects available ports; use a declared fixed port for K8s discovery.
+The API port defaults to 18080 (`server.port`). The metrics endpoint inherits
+that port unless `metrics.port` is set. For example, keep registration/discovery
+on 18080 and expose metrics separately on 18480:
+
+```yaml
+trainer:
+  logger: [console, rl_insight]
+  rl_insight:
+    server:
+      port: 18080
+    metrics:
+      pull: true
+      port: 18480
+```
+
+Prometheus scrapes `http://<head-address>:18480/metrics`; workers still register
+through `http://<head-address>:18080`. Both listeners share one collector and its
+lifecycle. Omitting `metrics.port` uses the API listener, without opening another
+port. An explicitly configured nonzero metrics port must be available; it will
+not silently move. Setting it to 0 selects a separate available port, reported
+by the API's `/api/v1/services` as `metrics_port`. Remote-write Agent scrapes this
+same metrics port internally. Trace destination ports belong in `traces.endpoint`
+and are unaffected.
+
+Optional `server.namespace`, `server.endpoint_ttl` and `server.url` live in the
+same monitoring section. `server.url` connects to an existing compatible service;
+a nonzero `metrics.port` must match that service's advertised metrics port.
+Use a declared fixed metrics port matching the platform's existing discovery
+contract for K8s scraping; port configuration does not install discovery rules.
 Pod networks can reuse 18080 across Pods; hostNetwork tasks need distinct ports.
 The platform still owns head Service selection, K8s discovery/relabel and network
 reachability. A remote exporter must advertise an address reachable from the head.

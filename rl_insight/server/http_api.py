@@ -24,7 +24,7 @@ import os
 import re
 import time
 from collections.abc import Sequence
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any
@@ -139,6 +139,9 @@ def create_task_collector(conf: DictConfig) -> FastAPI:
             "status": "ok",
             "endpoint_registration_version": 1,
             "task_metrics_path": "/metrics",
+            "metrics_port": int(
+                conf.server.get("metrics_port", conf.server.get("port", 18080))
+            ),
             "labels": dict(OmegaConf.select(conf, "labels") or {}),
             "metrics_transport": "remote_write"
             if OmegaConf.select(conf, "prometheus.remote_write")
@@ -893,7 +896,36 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     conf = load_server_config_file(args.config)
     port = int(OmegaConf.select(conf, "server.port", default=18080))
-    uvicorn.run(create_app(conf), host=local_addresses()["bind"], port=port)
+    metrics_port = int(OmegaConf.select(conf, "server.metrics_port", default=port))
+    config = uvicorn.Config(None, host=local_addresses()["bind"], port=port)
+    with ExitStack() as listeners:
+        api_socket = listeners.enter_context(config.bind_socket())
+        conf.server.port = api_socket.getsockname()[1]
+        sockets = [api_socket]
+        if metrics_port != port or (
+            metrics_port == 0 and "metrics_port" in conf.server
+        ):
+            metrics_config = uvicorn.Config(None, host=config.host, port=metrics_port)
+            metrics_socket = listeners.enter_context(metrics_config.bind_socket())
+            conf.server.metrics_port = metrics_socket.getsockname()[1]
+            sockets.append(metrics_socket)
+        app = create_app(conf)
+        if len(sockets) == 2:
+
+            @app.middleware("http")
+            async def metrics_only(request: Request, call_next):
+                if request.scope["server"][1] == conf.server.metrics_port and not (
+                    request.method in {"GET", "HEAD"}
+                    and (
+                        request.url.path in {"/metrics", "/healthz"}
+                        or re.fullmatch(r"/api/v1/runs/[^/]+/metrics", request.url.path)
+                    )
+                ):
+                    return Response(status_code=404)
+                return await call_next(request)
+
+        config.app = app
+        uvicorn.Server(config).run(sockets=sockets)
     return 0
 
 

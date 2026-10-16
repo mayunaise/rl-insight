@@ -52,13 +52,20 @@ def test_training_config_resolves_only_monitoring_fields(tmp_path, monkeypatch):
             {
                 "model": "${framework_only:unavailable}",
                 "rl_insight": {
-                    "metrics": {"pull": True},
+                    "metrics": {"pull": True, "port": 18480},
                     "labels": {"task_id": "${oc.env:TASK_ID}"},
                 },
             }
         ),
         runtime_dir=tmp_path,
     )
+    assert conf.server.port == 18080
+    assert conf.server.metrics_port == 18480
+    inherited = expand_task_config(
+        {"rl_insight": {"server": {"port": 18481}, "metrics": {"pull": True}}},
+        runtime_dir=tmp_path,
+    )
+    assert inherited.server.get("metrics_port", inherited.server.port) == 18481
     assert conf.push.sinks[0].labels.task_id == "platform-task"
     assert not any(conf[name].enable for name in ("prometheus", "tempo", "grafana"))
     assert "model" not in conf
@@ -144,8 +151,20 @@ try:
         assert ray.get(conflicting_worker.remote()), "worker changed job outputs without rejection"
     else:
         assert worker() is True
+    metrics_url=url
     if runtime!="ray-trace":
-        text=requests.get(url+"/metrics",timeout=10).text
+        from urllib.parse import urlsplit,urlunsplit
+        services=requests.get(url+"/api/v1/services",timeout=3).json()
+        port=services["metrics_port"]
+        expected=config.trainer.rl_insight.get("metrics",{}).get("port")
+        if expected is not None:
+            assert port==expected and port!=urlsplit(url).port,services
+        else: assert port==urlsplit(url).port,services
+        parsed=urlsplit(url)
+        metrics_url=urlunsplit(parsed._replace(netloc=parsed.hostname+":"+str(port)))
+        if expected is not None:
+            assert requests.get(metrics_url+"/api/v1/services",timeout=3).status_code==404
+        text=requests.get(metrics_url+"/metrics",timeout=10).text
         assert 'task_id="sdk-only"' in text,text
         assert 'task_id="spoof"' not in text,text
         from prometheus_client.parser import text_string_to_metric_families
@@ -164,18 +183,19 @@ try:
             deadline=time.monotonic()+10
             while "native_before_init" not in text:
                 assert time.monotonic()<deadline,"native endpoint registered before init was lost"
-                time.sleep(.1);text=requests.get(url+"/metrics",timeout=10).text
+                time.sleep(.1);text=requests.get(metrics_url+"/metrics",timeout=10).text
     print("SDK_URL "+url,flush=True)
     if runtime=="ray-abrupt": ray.shutdown()
     else: monitor.finish()
     session=requests.Session();session.trust_env=False
     deadline=time.monotonic()+20
-    while True:
-        try: response=session.get(url+"/healthz",timeout=1)
-        except requests.RequestException: break
-        if not response.ok: break
-        assert time.monotonic()<deadline,"owned collector survived job termination"
-        time.sleep(.2)
+    for endpoint in {url,metrics_url}:
+        while True:
+            try: response=session.get(endpoint+"/healthz",timeout=1)
+            except requests.RequestException: break
+            if not response.ok: break
+            assert time.monotonic()<deadline,"owned collector survived job termination"
+            time.sleep(.2)
 finally:
     monitor.finish();ray.shutdown()
 """
@@ -228,6 +248,12 @@ finally:
         ]
         del options["metrics"]
         del options["traces"]
+        OmegaConf.save(conf, config)
+    if runtime == "ray-abrupt":
+        conf = OmegaConf.load(config)
+        with socket.socket() as reserve:
+            reserve.bind(("127.0.0.1", 0))
+            conf.trainer.rl_insight.metrics.port = reserve.getsockname()[1]
         OmegaConf.save(conf, config)
     if runtime == "ray-trace":
         conf = OmegaConf.load(config)
@@ -339,6 +365,8 @@ finally:
         {"metrics": {"pull": True, "remote_write": [{"url": "http://receiver/write"}]}},
         {"traces": {"endpoint": "not-a-url"}},
         {"metrics": {"pull": True}, "labels": {"component": "reserved"}},
+        {"metrics": {"pull": True, "port": True}},
+        {"metrics": {"pull": True, "port": 65536}},
         {"metrics": {"pull": True}, "sinks": [{"driver": "custom:factory"}]},
         {"sinks": [{"driver": "custom:factory"}, {"driver": "custom:factory"}]},
         {
@@ -487,6 +515,7 @@ def test_task_collector_remote_writes_to_real_prometheus(tmp_path, monkeypatch, 
                 "server": {"port": 0, "endpoint_ttl": 5},
                 "labels": {"task_id": "platform-task", "platform": "test"},
                 "metrics": {
+                    "port": 0,
                     "binary_path": str(binary),
                     "scrape_interval": "1s",
                     "scrape_timeout": "1s",
@@ -595,6 +624,11 @@ def test_task_collector_remote_writes_to_real_prometheus(tmp_path, monkeypatch, 
         runtime = OmegaConf.load(tmp_path / "runtime/server.yaml")
         host = "[::1]" if ipv6 else "127.0.0.1"
         url = f"http://{host}:{runtime.server.port}"
+        assert runtime.server.metrics_port != runtime.server.port
+        scrape = OmegaConf.load(tmp_path / "runtime/prometheus.yml")
+        assert scrape.scrape_configs[0].static_configs[0].targets == [
+            f"{host}:{runtime.server.metrics_port}"
+        ]
         assert (
             requests.post(url + "/api/v1/runs", json={}, timeout=3).status_code == 404
         )

@@ -106,6 +106,7 @@ class LocalServiceRuntime:
         dependencies: DependencyManager | None = None,
     ):
         self.conf = conf
+        self._fixed_metrics_port = OmegaConf.select(conf, "server.metrics_port")
         self.install_root = install_root.resolve()
         self.dependencies = dependencies or DependencyManager(conf, self.install_root)
         self.state_file = _state_file_from_config(self.conf)
@@ -163,6 +164,11 @@ class LocalServiceRuntime:
     def _assign_ports(self) -> None:
         """Plan distinct ports, reserving them together until allocation finishes."""
         ports = {key: service for service, (key, _) in _HEALTH_ENDPOINTS.items()}
+        metrics_port = OmegaConf.select(self.conf, "server.metrics_port")
+        if metrics_port is not None and (
+            metrics_port == 0 or metrics_port != self.conf.server.port
+        ):
+            ports = {"server.metrics_port": "rl-insight-server", **ports}
         ports["otel.otel_port"] = "tempo"
         if OmegaConf.select(self.conf, "tempo.enable", default=True):
             tempo = yaml.safe_load(
@@ -207,6 +213,14 @@ class LocalServiceRuntime:
                             if exc.errno not in (errno.EADDRINUSE, errno.EACCES):
                                 raise RuntimeError(
                                     f"Cannot allocate {key}: {exc}"
+                                ) from exc
+                            if self._fixed_metrics_port and (
+                                key == "server.metrics_port"
+                                or key == "server.port"
+                                and port == self._fixed_metrics_port
+                            ):
+                                raise RuntimeError(
+                                    f"Configured metrics port {self._fixed_metrics_port} is unavailable"
                                 ) from exc
                             port = 0
                             continue
@@ -580,7 +594,10 @@ def _render_prometheus_config(conf: DictConfig, runtime_dir: Path) -> Path:
                     "static_configs": [
                         {
                             "targets": [
-                                format_host_port(_loopback_host(), conf.server.port)
+                                format_host_port(
+                                    _loopback_host(),
+                                    conf.server.get("metrics_port", conf.server.port),
+                                )
                             ]
                         }
                     ],

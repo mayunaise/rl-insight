@@ -204,6 +204,14 @@ class SDKServices:
                             raise ValueError(
                                 "Existing service conflicts with task outputs"
                             )
+                        metrics_port = services.get("metrics_port")
+                        requested_port = OmegaConf.select(
+                            self.conf, "server.metrics_port"
+                        )
+                        if requested_port and requested_port != metrics_port:
+                            raise ValueError(
+                                "Existing service conflicts with metrics.port"
+                            )
                         self.conf.server.url = candidate
                     else:
                         root.mkdir(parents=True, mode=0o700)
@@ -220,7 +228,12 @@ class SDKServices:
                         self.stack = self.manager.start(
                             detach=True,
                             attach_logs=False,
-                            auto_port=not self.external or self.conf.server.port == 0,
+                            auto_port=(
+                                not self.external
+                                or self.conf.server.port == 0
+                                or OmegaConf.select(self.conf, "server.metrics_port")
+                                == 0
+                            ),
                         )
                         self.conf.server.url = "http://" + format_host_port(
                             host, self.conf.server.port
