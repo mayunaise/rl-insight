@@ -27,13 +27,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
-from ..protocol import RunContext, proof_headers, endpoint_description
 
 import requests
 import yaml
 from omegaconf import DictConfig, OmegaConf
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
+from ..protocol import RunContext, endpoint_description, proof_headers
 from ..server.network import format_host_port, local_addresses
 from .constants import (
     MonitorBackend,
@@ -56,7 +56,7 @@ _pending_probe: threading.Thread | None = None
 def _wait_for_context() -> None:
     """Retry pending native targets for the lifetime of their worker process."""
     global _pending_probe
-    from ..client.ray_monitor_client import current_job_context
+    from ..client.ray_monitor_client import current_job_context, current_job_config
 
     delay = 0.1
     while True:
@@ -65,10 +65,30 @@ def _wait_for_context() -> None:
                 _pending_probe = None
                 return
         context = current_job_context()
-        if context:
+        conf = current_job_config() if context is None else None
+        if context or (conf is not None and conf.get("task_configuration", False)):
             flush_pending_targets(context)
         time.sleep(delay)
         delay = min(delay * 2, 2)
+
+
+def _defer_targets(addresses, job, labels):
+    global _pending_probe
+    item = (
+        list(addresses),
+        job,
+        [dict(x) if x else None for x in labels] if labels else None,
+    )
+    with _pending_lock:
+        if item not in _pending_targets:
+            if len(_pending_targets) >= 64:
+                raise ValueError("Too many targets waiting for SDK initialization")
+            _pending_targets.append(item)
+        if _pending_probe is None or not _pending_probe.is_alive():
+            _pending_probe = threading.Thread(
+                target=_wait_for_context, name="insight-context", daemon=True
+            )
+            _pending_probe.start()
 
 
 def flush_pending_targets(context: RunContext | None) -> None:
@@ -85,11 +105,11 @@ __all__ = [
     "MetricRegistry",
     "PrometheusTarget",
     "PrometheusTargetStore",
+    "metrics_asgi_app",
+    "metrics_wsgi_app",
+    "publish_metrics_endpoint",
     "start_metrics_http_server",
     "update_prometheus_config",
-    "metrics_wsgi_app",
-    "metrics_asgi_app",
-    "publish_metrics_endpoint",
 ]
 
 
@@ -120,7 +140,7 @@ class PrometheusTargetStore:
         self._lock = threading.Lock()
 
     @classmethod
-    def from_config(cls, conf: DictConfig) -> "PrometheusTargetStore":
+    def from_config(cls, conf: DictConfig) -> PrometheusTargetStore:
         runtime_dir = OmegaConf.select(conf, "server.runtime_dir")
         base = (
             Path(str(runtime_dir)).expanduser().resolve()
@@ -297,7 +317,7 @@ def _merge_labels(
     return out
 
 
-def metrics_wsgi_app(app, context: RunContext, incarnation: str):
+def metrics_wsgi_app(app, context: RunContext | None, incarnation: str):
     """Wrap a standard WSGI application with a stable exporter response identity."""
     headers = proof_headers(context, incarnation)
 
@@ -315,7 +335,7 @@ def metrics_wsgi_app(app, context: RunContext, incarnation: str):
     return wrapped
 
 
-def metrics_asgi_app(app, context: RunContext, incarnation: str):
+def metrics_asgi_app(app, context: RunContext | None, incarnation: str):
     """Wrap the public ASGI response boundary; no framework objects are inspected."""
     headers = [
         (key.lower().encode(), value.encode())
@@ -341,19 +361,28 @@ def metrics_asgi_app(app, context: RunContext, incarnation: str):
 class EndpointPublisher:
     """Own one endpoint lease and re-register it after server recovery."""
 
-    def __init__(self, context, description, *, alive=None):
-        self.context = context
-        self.description = endpoint_description(context, description)
+    def __init__(self, context, description, *, alive=None, retry_initial=False):
+        self.context = context if isinstance(context, RunContext) else None
+        self.description = endpoint_description(self.context, description)
         self._root = (
             context.server_url + "/api/v1/runs/" + context.run_id + "/endpoints"
+            if self.context is not None
+            else str(context).rstrip("/") + "/api/v1/endpoints"
         )
         self._alive = alive or (lambda: True)
         self._stop = threading.Event()
         self._session = requests.Session()
         self._session.trust_env = False
+        self._request_lock = threading.RLock()
         self._lease = None
+        self._interval = 1.0
         try:
             self._register()
+        except requests.RequestException:
+            if not retry_initial:
+                self._session.close()
+                raise
+            logger.warning("Endpoint registration failed; will retry")
         except Exception:
             self._session.close()
             raise
@@ -363,6 +392,10 @@ class EndpointPublisher:
         self._thread.start()
 
     def _register(self):
+        with self._request_lock:
+            self._register_locked()
+
+    def _register_locked(self):
         response = self._session.post(self._root, json=self.description, timeout=(2, 4))
         response.raise_for_status()
         lease = response.json()
@@ -370,17 +403,31 @@ class EndpointPublisher:
         self._interval = max(0.25, lease["ttl"] / 3)
         self.description["labels"] = lease["labels"]
 
+    def add_labels(self, labels):
+        """Update descriptive labels through the same serialized registration path."""
+        with self._request_lock:
+            self.description["labels"].update(labels)
+            try:
+                self._register_locked()
+            except requests.RequestException:
+                self._lease = None
+                logger.warning("Endpoint label publication failed; will retry")
+
     def _renew(self):
         while not self._stop.wait(self._interval) and self._alive():
             try:
-                response = self._session.post(
-                    self._root + "/" + self._lease, timeout=(2, 4)
-                )
-                if response.status_code == 409:
-                    self._register()
-                else:
-                    response.raise_for_status()
-                    self.description["labels"] = response.json()["labels"]
+                with self._request_lock:
+                    if self._lease is None:
+                        self._register_locked()
+                        continue
+                    response = self._session.post(
+                        self._root + "/" + self._lease, timeout=(2, 4)
+                    )
+                    if response.status_code == 409:
+                        self._register_locked()
+                    else:
+                        response.raise_for_status()
+                        self.description["labels"] = response.json()["labels"]
             except requests.RequestException as exc:
                 if getattr(exc.response, "status_code", None) == 409:
                     logger.warning("Endpoint publication stopped: %s", exc)
@@ -458,7 +505,9 @@ def start_metrics_http_server(
 class MetricRegistry:
     """Lazy registry of ``prometheus_client`` Counter/Gauge/Histogram objects keyed by metric name + label set."""
 
-    def __init__(self, namespace: str = "", subsystem: str = "") -> None:
+    def __init__(
+        self, namespace: str = "", subsystem: str = "", *, registry=None
+    ) -> None:
         """
         Args:
             namespace: Passed as Prometheus metric namespace (prefix segment).
@@ -466,6 +515,7 @@ class MetricRegistry:
         """
         self._namespace = namespace
         self._subsystem = subsystem
+        self._registry_options = {} if registry is None else {"registry": registry}
         self._counters: dict[tuple[str, tuple[str, ...]], object] = {}
         self._gauges: dict[tuple[str, tuple[str, ...]], object] = {}
         self._histograms: dict[tuple[str, tuple[str, ...]], object] = {}
@@ -482,6 +532,7 @@ class MetricRegistry:
                 labelnames=label_names,
                 namespace=self._namespace,
                 subsystem=self._subsystem,
+                **self._registry_options,
             )
         return self._counters[key]
 
@@ -497,6 +548,7 @@ class MetricRegistry:
                 labelnames=label_names,
                 namespace=self._namespace,
                 subsystem=self._subsystem,
+                **self._registry_options,
             )
         return self._gauges[key]
 
@@ -510,7 +562,7 @@ class MetricRegistry:
         """Return a cached or new ``Histogram`` for ``(name, label_names)`` with optional bucket boundaries."""
         key = (name, label_names)
         if key not in self._histograms:
-            kw = {}
+            kw: dict[str, Any] = {}
             if buckets is not None:
                 kw["buckets"] = buckets
             self._histograms[key] = Histogram(
@@ -520,6 +572,7 @@ class MetricRegistry:
                 namespace=self._namespace,
                 subsystem=self._subsystem,
                 **kw,
+                **self._registry_options,
             )
         return self._histograms[key]
 
@@ -610,7 +663,7 @@ def _bootstrap_push_registry():
             if backend != MonitorBackend.PUSH:
                 return None
             _api.init()
-        except Exception:  # noqa: BLE001 - monitoring must never break training
+        except Exception:
             logger.exception("[rl-insight] push backend in-process bootstrap failed")
             return None
         return get_active_registry()
@@ -638,7 +691,6 @@ def update_prometheus_config(
         labels: Optional per-target labels. When provided, its length must match
             ``server_addresses``.
     """
-    global _pending_probe
     if not server_addresses:
         logger.warning("[rl-insight] No server addresses available to register")
         return
@@ -655,16 +707,21 @@ def update_prometheus_config(
     if registry is None:
         registry = _bootstrap_push_registry()
     if registry is not None:
-        registry.set_targets(server_addresses, labels)
+        registry.set_targets(server_addresses, labels, job_name=job_name)
         logger.info(
             "[rl-insight] Registered %d push scrape targets in-process",
             len(server_addresses),
         )
         return
 
+    if context is None:
+        from ..client.ray_monitor_client import register_job_metrics
+
+        if register_job_metrics(server_addresses, job_name, labels):
+            return
     initialized = True
     if context is None:
-        from ..api import get_context, _client_initialized
+        from ..api import _client_initialized, get_context
 
         context = get_context()
         initialized = _client_initialized()
@@ -674,6 +731,11 @@ def update_prometheus_config(
         else str(os.environ.get(MonitorEnv.SERVER_URL, "")).strip().rstrip("/")
     )
     if not base_url:
+        import ray
+
+        if ray.is_initialized():
+            _defer_targets(server_addresses, job_name, labels)
+            return
         logger.error(
             "[rl-insight] RL-Insight server URL is required; "
             "set %s to register Prometheus targets",
@@ -690,28 +752,8 @@ def update_prometheus_config(
                 from ..client.ray_monitor_client import current_job_context
 
                 context = current_job_context()
-                item: tuple[
-                    list[str], str | None, list[Mapping[str, Any] | None] | None
-                ] = (
-                    list(server_addresses),
-                    job_name,
-                    [dict(x) if x else None for x in labels] if labels else None,
-                )
                 if context is None:
-                    with _pending_lock:
-                        if item not in _pending_targets:
-                            if len(_pending_targets) >= 64:
-                                raise ValueError(
-                                    "Too many targets waiting for Run initialization"
-                                )
-                            _pending_targets.append(item)
-                        if _pending_probe is None or not _pending_probe.is_alive():
-                            _pending_probe = threading.Thread(
-                                target=_wait_for_context,
-                                name="insight-context",
-                                daemon=True,
-                            )
-                            _pending_probe.start()
+                    _defer_targets(server_addresses, job_name, labels)
                     return
 
     _register_targets(
@@ -732,6 +774,15 @@ def _register_targets(
     identity_in_metrics: bool = False,
 ) -> bool:
     """Report success so deferred targets remain queued after a failed request."""
+    if context is None:
+        from ..client.ray_monitor_client import register_job_metrics
+
+        try:
+            if register_job_metrics(server_addresses, job_name, labels):
+                return True
+        except Exception:
+            logger.exception("[rl-insight] Deferred job target registration failed")
+            return False
     base_url = (
         context.server_url
         if context

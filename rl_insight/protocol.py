@@ -16,10 +16,11 @@
 
 from __future__ import annotations
 
-import re
 import ipaddress
+import re
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from typing import Any, Mapping
+from typing import Any
 from urllib.parse import urlsplit
 
 
@@ -33,6 +34,26 @@ def validate_id(value: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
         raise RunError("Invalid Run/request ID")
     return value
+
+
+def metric_labels(labels: Mapping[str, Any]) -> dict[str, str]:
+    """Validate reusable exporter labels before creating network resources."""
+    if not isinstance(labels, Mapping):
+        raise RunError("Endpoint labels must be an object")
+    for key, val in labels.items():
+        if (
+            not isinstance(key, str)
+            or not re.fullmatch(r"[a-zA-Z_][a-zA-Z_0-9]*", key)
+            or key.startswith("__")
+            or not isinstance(val, (str, int, float, bool))
+        ):
+            raise RunError("Invalid endpoint label")
+    if any(
+        key in labels
+        for key in ("endpoint_id", "component", "exported_job", "exported_instance")
+    ):
+        raise RunError("Reserved endpoint label")
+    return {k: str(v) for k, v in labels.items()}
 
 
 @dataclass(frozen=True)
@@ -97,13 +118,16 @@ class RunContext:
         return labels
 
 
-def proof_headers(context: RunContext, incarnation: str) -> dict[str, str]:
+def proof_headers(context: RunContext | None, incarnation: str) -> dict[str, str]:
     validate_id(incarnation)
-    return {"X-RLInsight-Run": context.run_id, "X-RLInsight-Incarnation": incarnation}
+    headers = {"X-RLInsight-Incarnation": incarnation}
+    if context is not None:
+        headers["X-RLInsight-Run"] = context.run_id
+    return headers
 
 
 def endpoint_description(
-    context: RunContext, value: Mapping[str, Any]
+    context: RunContext | None, value: Mapping[str, Any]
 ) -> dict[str, Any]:
     """Validate a publisher's facts, independent of any framework or runtime."""
     for key in ("component", "instance"):
@@ -115,7 +139,9 @@ def endpoint_description(
             or any(ord(c) < 32 for c in name)
         ):
             raise RunError("Invalid endpoint " + key)
-    incarnation = validate_id(value.get("incarnation", ""))
+    incarnation = value.get("incarnation")
+    if context is not None or incarnation is not None:
+        incarnation = validate_id(incarnation if isinstance(incarnation, str) else "")
     url = value.get("metrics_url")
     if not isinstance(url, str):
         raise RunError("Invalid metrics URL")
@@ -143,24 +169,12 @@ def endpoint_description(
     supplied = value.get("labels", {})
     if not isinstance(supplied, Mapping):
         raise RunError("Endpoint labels must be an object")
-    labels = context.labels(supplied)
-    for key, val in labels.items():
-        if (
-            not re.fullmatch(r"[a-zA-Z_][a-zA-Z_0-9]*", key)
-            or key.startswith("__")
-            or not isinstance(val, (str, int, float, bool))
-        ):
-            raise RunError("Invalid endpoint label")
-    if any(
-        key in labels
-        for key in ("endpoint_id", "component", "exported_job", "exported_instance")
-    ):
-        raise RunError("Reserved endpoint label")
+    labels = context.labels(supplied) if context is not None else dict(supplied)
     return {
-        "run_id": context.run_id,
+        **({"run_id": context.run_id} if context is not None else {}),
         "component": value["component"],
         "instance": value["instance"],
         "incarnation": incarnation,
         "metrics_url": url,
-        "labels": {k: str(v) for k, v in labels.items()},
+        "labels": metric_labels(labels),
     }

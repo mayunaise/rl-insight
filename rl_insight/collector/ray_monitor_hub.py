@@ -17,13 +17,14 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from uuid import uuid4
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import ray
 import requests
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from prometheus_client import Gauge
 
 from ..utils.constants import MonitorRayActor
@@ -38,6 +39,10 @@ from ..utils import (
     start_metrics_http_server,
     update_prometheus_config,
 )
+
+if TYPE_CHECKING:
+    from ..client.push.client import PushMonitorClient
+    from ..server.services import SDKServices
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -55,17 +60,60 @@ class MonitorHubActor(MonitorCollector):
     """
 
     def __init__(self, conf: DictConfig, owner_token: str = "") -> None:
+        self._services: SDKServices | None = None
+        self._push_client: PushMonitorClient | None = None
+        try:
+            self._initialize(conf, owner_token)
+        except BaseException:
+            if self._push_client is not None:
+                self._push_client.close()
+            if self._services is not None:
+                self._services.close(failed=True)
+            raise
+
+    def _initialize(self, conf: DictConfig, owner_token: str) -> None:
         """
         Args:
             conf: Merged monitor config with ``server`` and ``prometheus`` sections.
         """
+        if OmegaConf.select(conf, "task_options") is not None:
+            from ..server.services import SDKServices
+            from ..utils.monitor_config_loader import load_monitor_config
+
+            task_signature = conf.task_signature
+            self._services = SDKServices(conf.task_options)
+            sdk = self._services.sdk_config
+            conf = OmegaConf.merge(
+                load_monitor_config(),
+                sdk,
+                {"run_metadata": conf.get("run_metadata", {})},
+            )
+            if self._services.external:
+                from ..client.push.client import create_push_monitor_client
+
+                self._push_client = create_push_monitor_client(conf)
+                if self._push_client is None:
+                    raise RuntimeError(
+                        "No monitoring sink was created for the task outputs"
+                    )
+                conf.server.backend = "ray"  # Ray remains the job's SDK transport.
+                del conf["push"]  # Sink credentials stay with the Hub.
+            conf.task_signature = task_signature
         self._conf = conf
         self._owner_token = owner_token
         self._closing = False
         self._closed = False
         self._final_confirmed = None
 
+        self._context = None
+        self._events_applied = 0
+        self._node_ip = ray.util.get_node_ip_address()
+        self._metrics_port = 0
+        if self._push_client is not None:
+            return
         namespace = str(self._conf.server.namespace)
+        if self._services is not None:
+            os.environ["RL_INSIGHT_SERVER_URL"] = str(conf.server.url)
         services = get_server_services()
         self._context = None
         if services.get("run_context_version") == 1:
@@ -170,6 +218,10 @@ class MonitorHubActor(MonitorCollector):
         if getattr(self, "_closing", False):
             raise RunError("Run is closing; late events are rejected", 409)
         self._events_applied += 1
+        client = getattr(self, "_push_client", None)
+        if client is not None:
+            client.apply_event(event)
+            return
         context = getattr(self, "_context", None)
         if context:
             event = dict(event)
@@ -195,6 +247,12 @@ class MonitorHubActor(MonitorCollector):
         Returns:
             Dict with ``actor_name``, ``namespace`` (Ray placement namespace, not metric prefix), scrape URL, flags.
         """
+        if getattr(self, "_push_client", None) is not None:
+            return {
+                "metrics_endpoint": str(self._conf.server.url) + "/metrics",
+                "events_applied": self._events_applied,
+                "node_ip": self._node_ip,
+            }
         return {
             "actor_name": MonitorRayActor.NAME,
             "namespace": MonitorRayActor.NAMESPACE,
@@ -208,6 +266,19 @@ class MonitorHubActor(MonitorCollector):
             "otel_traces_enabled": self._trace_collector.enabled,
             "events_applied": self._events_applied,
         }
+
+    def get_monitor_config(self):
+        return OmegaConf.to_container(self._conf, resolve=False)
+
+    def register_native_metrics(self, addresses, job, labels):
+        if self._push_client is not None:
+            from ..client.push.poller import get_active_registry
+
+            registry = get_active_registry()
+            if registry is not None:
+                registry.set_targets(addresses, labels, job_name=job)
+            return  # Trace-only intentionally has no metric registry.
+        update_prometheus_config(addresses, job, labels, context=self._context)
 
     def get_context(self) -> dict[str, Any] | None:
         return self._context.to_dict() if self._context else None
@@ -247,9 +318,13 @@ class MonitorHubActor(MonitorCollector):
         try:
             self._owner_request(False)
         finally:
+            if getattr(self, "_push_client", None) is not None:
+                self._push_client.close()
+            if getattr(self, "_services", None) is not None:
+                self._services.close()
             self._closing = True
             self._closed = True
-            if self._metrics_server is not None:
+            if getattr(self, "_metrics_server", None) is not None:
                 try:
                     publisher = getattr(self._metrics_server, "publisher", None)
                     if publisher is not None:
@@ -260,6 +335,10 @@ class MonitorHubActor(MonitorCollector):
 
     def flush(self) -> None:
         """Confirm prior events reached OTLP and a real Prometheus scrape."""
+        client = getattr(self, "_push_client", None)
+        if client is not None:
+            client.flush()
+            return
         deadline = time.monotonic() + 30
         if not self._trace_collector.flush():
             raise TimeoutError("OTLP export did not finish within the flush budget")

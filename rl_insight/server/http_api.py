@@ -20,14 +20,15 @@ import argparse
 import json
 import logging
 import math
-import re
 import os
+import re
 import time
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from threading import Lock, Event, Thread
+from threading import Event, Lock, Thread
+from typing import Any
 from urllib.parse import parse_qsl
-from typing import Any, Sequence
 
 import requests
 import uvicorn
@@ -40,9 +41,10 @@ from ..protocol import RunContext, RunError, endpoint_description
 from ..utils.constants import MonitorEnv, MonitorPaths, MonitorServer, PrometheusScrape
 from ..utils.monitor_config_loader import load_server_config_file
 from ..utils.prometheus_utils import PrometheusTarget, PrometheusTargetStore
-from .network import format_host_port, local_addresses
-from .registry import RunRegistry
 from .collection import Collection
+from .dependencies import task_collector_enabled
+from .network import format_host_port, local_addresses
+from .registry import EndpointRegistry, RunRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -91,8 +93,87 @@ def get_server_services() -> dict[str, Any]:
     return {}
 
 
+def _scrape_timeout(request: Request) -> float:
+    supplied = request.headers.get("X-Prometheus-Scrape-Timeout-Seconds")
+    if supplied is None:
+        return 9.0
+    try:
+        seconds = float(supplied)
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError
+        return min(9.0, seconds - min(1.0, seconds * 0.2))
+    except ValueError as exc:
+        raise RunError("Invalid scrape timeout") from exc
+
+
+def create_task_collector(conf: DictConfig) -> FastAPI:
+    """One task, one pull endpoint; task identity belongs to the deployment."""
+    registry = EndpointRegistry(
+        float(OmegaConf.select(conf, "server.endpoint_ttl", default=30))
+    )
+    collection = Collection(
+        registry, labels=dict(OmegaConf.select(conf, "labels") or {})
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        try:
+            yield
+        finally:
+            await run_in_threadpool(collection.close)
+            registry.close()
+
+    app = FastAPI(title="RL-Insight task collector", lifespan=lifespan)
+
+    @app.exception_handler(RunError)
+    async def run_error(_request, exc):
+        return JSONResponse({"detail": str(exc)}, status_code=exc.status)
+
+    @app.get("/healthz")
+    def healthz():
+        return {"status": "ok"}
+
+    @app.get("/api/v1/services")
+    def services():
+        return {
+            "status": "ok",
+            "endpoint_registration_version": 1,
+            "task_metrics_path": "/metrics",
+            "labels": dict(OmegaConf.select(conf, "labels") or {}),
+            "metrics_transport": "remote_write"
+            if OmegaConf.select(conf, "prometheus.remote_write")
+            else "pull",
+        }
+
+    @app.post("/api/v1/endpoints")
+    def register(payload: dict[str, Any] = Body(...)):
+        description = endpoint_description(None, payload)
+        collection.verify(description)
+        return registry.register_endpoint(description)
+
+    @app.post("/api/v1/endpoints/{lease_id}")
+    def renew(lease_id: str):
+        return registry.renew_endpoint(None, lease_id)
+
+    @app.delete("/api/v1/endpoints/{lease_id}")
+    def retire(lease_id: str):
+        item = registry.endpoint(lease_id)
+        snapshot = collection.verify(item)
+        registry.retire_endpoint(lease_id, snapshot)
+        return {"status": "draining", "ttl": item["ttl"]}
+
+    @app.get("/metrics")
+    def metrics(request: Request):
+        code, body = collection.collect(timeout=_scrape_timeout(request))
+        return Response(body, status_code=code, media_type="text/plain; version=0.0.4")
+
+    return app
+
+
 def create_app(conf: DictConfig) -> FastAPI:
     """Create the RL-Insight server application."""
+    if task_collector_enabled(conf):
+        return create_task_collector(conf)
     registry = RunRegistry(
         Path(
             str(
@@ -189,17 +270,7 @@ def create_app(conf: DictConfig) -> FastAPI:
 
     @app.get("/api/v1/runs/{run_id}/metrics")
     def collect_metrics(run_id: str, request: Request):
-        timeout = 9.0
-        supplied = request.headers.get("X-Prometheus-Scrape-Timeout-Seconds")
-        if supplied is not None:
-            try:
-                seconds = float(supplied)
-                if not math.isfinite(seconds) or seconds <= 0:
-                    raise ValueError
-                timeout = min(timeout, seconds - min(1.0, seconds * 0.2))
-            except ValueError as exc:
-                raise RunError("Invalid scrape timeout") from exc
-        code, body = collection.collect(run_id, timeout)
+        code, body = collection.collect(run_id, _scrape_timeout(request))
         return Response(body, status_code=code, media_type="text/plain; version=0.0.4")
 
     @app.post("/api/v1/runs/{run_id}/close")

@@ -30,7 +30,7 @@ from typing import Any, Callable, Generator, Mapping
 from omegaconf import DictConfig, OmegaConf
 
 from .client import create_monitor_client
-from .protocol import RunContext, RunError
+from .protocol import RunContext, RunError, metric_labels
 from .utils.monitor_config_loader import load_monitor_config
 from .utils import MonitorBackend, MonitorEventKind
 
@@ -69,7 +69,9 @@ class _MonitorState:
     namespace: str = ""
     process_id: str = field(default_factory=lambda: str(os.getpid()))
     labels: dict[str, Any] = field(default_factory=dict)
+    fixed_labels: dict[str, str] = field(default_factory=dict)
     context: RunContext | None = None
+    services: Any | None = None
 
 
 _STATE = _MonitorState()
@@ -102,51 +104,107 @@ def init(
         return
 
     monitor_conf = load_monitor_config(config)
-    backend = str(OmegaConf.select(monitor_conf, "server.backend") or "").strip()
-    # Only the Ray backend talks to the external RL-Insight server; direct-emit
-    # backends (e.g. push) intentionally run without a server URL.
-    if backend == MonitorBackend.RAY and not str(monitor_conf.server.url).strip():
-        logger.error(
-            "[rl-insight] RL-Insight server URL is required; set RL_INSIGHT_SERVER_URL "
-            "or server.url in init config."
-        )
+    if monitor_conf.get("enabled") is False:
         return
-    OmegaConf.update(
-        monitor_conf,
-        "run_metadata",
-        {
-            "project": project or "uncategorized",
-            "experiment_name": experiment_name or "unnamed",
-        },
-        force_add=True,
-    )
-    client = create_monitor_client(monitor_conf)
-    context = getattr(client, "get_context", lambda: None)() if client else None
-    if context and (
-        (project and project != context.project)
-        or (experiment_name and experiment_name != context.experiment_name)
-    ):
-        raise RunError("Experiment metadata conflicts with the existing Run")
-    labels = {
-        key: value
-        for key, value in {
-            "project": project,
-            "experiment_name": experiment_name,
-        }.items()
-        if value is not None
-    }
-    _STATE = _MonitorState(
-        enabled=client is not None,
-        client=client,
-        conf=monitor_conf,
-        namespace=str(monitor_conf.server.namespace),
-        labels=labels,
-        context=context,
-    )
-    if client:
-        from .utils.prometheus_utils import flush_pending_targets
+    services = None
+    client = None
+    try:
+        if monitor_conf.get("task_options") is not None:
+            try:
+                import ray
 
-        flush_pending_targets(context)
+                use_ray = ray.is_initialized()
+            except ImportError:
+                use_ray = False
+            if not use_ray:
+                if not any(
+                    key in monitor_conf.task_options
+                    for key in ("metrics", "traces", "sinks")
+                ):
+                    raise RuntimeError(
+                        "Bundled SDK monitoring requires an initialized Ray runtime"
+                    )
+                from .server.services import SDKServices
+
+                services = SDKServices(monitor_conf.task_options)
+                monitor_conf = load_monitor_config(services.sdk_config)
+        elif not config and not str(monitor_conf.server.url).strip():
+            try:
+                from .client.ray_monitor_client import current_job_config
+
+                monitor_conf = current_job_config() or monitor_conf
+            except ImportError:
+                pass
+        backend = str(OmegaConf.select(monitor_conf, "server.backend") or "").strip()
+        if (
+            backend == MonitorBackend.RAY
+            and not str(monitor_conf.server.url).strip()
+            and monitor_conf.get("task_options") is None
+            and not monitor_conf.get("task_configuration", False)
+        ):
+            logger.error(
+                "[rl-insight] RL-Insight server URL is required; set RL_INSIGHT_SERVER_URL or server.url in init config."
+            )
+            return
+        metric_labels(dict(OmegaConf.select(monitor_conf, "labels") or {}))
+        OmegaConf.update(
+            monitor_conf,
+            "run_metadata",
+            {
+                "project": project or "uncategorized",
+                "experiment_name": experiment_name or "unnamed",
+            },
+            force_add=True,
+        )
+        client = create_monitor_client(monitor_conf)
+        if services is not None and client is None:
+            raise RuntimeError(
+                "No monitoring client was created for the configured outputs"
+            )
+        monitor_conf = getattr(client, "conf", monitor_conf)
+        fixed_labels = metric_labels(
+            dict(OmegaConf.select(monitor_conf, "labels") or {})
+        )
+        context = getattr(client, "get_context", lambda: None)() if client else None
+        if context and (
+            (project and project != context.project)
+            or (experiment_name and experiment_name != context.experiment_name)
+        ):
+            raise RunError("Experiment metadata conflicts with the existing Run")
+        labels = {
+            key: value
+            for key, value in {
+                "project": project,
+                "experiment_name": experiment_name,
+            }.items()
+            if value is not None
+        }
+        _STATE = _MonitorState(
+            enabled=client is not None,
+            client=client,
+            conf=monitor_conf,
+            namespace=str(monitor_conf.server.namespace),
+            labels=labels,
+            fixed_labels=fixed_labels,
+            context=context,
+            services=services,
+        )
+        if client:
+            from .utils.prometheus_utils import flush_pending_targets
+
+            flush_pending_targets(context)
+    except BaseException:
+        if client is not None and hasattr(client, "close"):
+            try:
+                client.close()
+            except Exception:
+                logger.debug(
+                    "Client cleanup after initialization failure failed", exc_info=True
+                )
+        if services is not None:
+            services.close(failed=True)
+        _STATE = _MonitorState()
+        raise
 
 
 def get_context() -> RunContext | None:
@@ -174,6 +232,11 @@ def finish() -> None:
                 client.close()
             except Exception:  # noqa: BLE001 - shutdown must never raise
                 logger.debug("[rl-insight] client.close() failed", exc_info=True)
+        if _STATE.services is not None:
+            try:
+                _STATE.services.close()
+            except Exception:
+                logger.exception("[rl-insight] SDK service cleanup failed")
         _STATE = _MonitorState()
         _LANES.clear()
 
@@ -509,9 +572,9 @@ def _emit(
         "documentation": documentation,
         "value": value,
         "labels": (
-            _STATE.context.labels({**_STATE.labels, **labels})
+            _STATE.context.labels({**_STATE.labels, **labels, **_STATE.fixed_labels})
             if _STATE.context
-            else {**_STATE.labels, **labels}
+            else {**_STATE.labels, **labels, **_STATE.fixed_labels}
         ),
     }
     _STATE.client.apply_event(event)
@@ -540,6 +603,7 @@ def _emit_trace_span(
         **_STATE.labels,
     }
     merged_attributes.update(attributes)
+    merged_attributes.update(_STATE.fixed_labels)
     if _STATE.context:
         _STATE.context.labels(merged_attributes)  # Validate reserved identity aliases.
         merged_attributes["rl_insight.run_id"] = _STATE.context.run_id

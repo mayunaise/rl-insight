@@ -50,6 +50,8 @@ from .catalog import DEFAULT_STATE_ROOT, STATE_FILE
 from .dependencies import (
     DependencyManager,
     MissingDependencyError,
+    prometheus_agent_enabled,
+    service_enabled,
 )
 from .network import format_host_port, local_addresses
 
@@ -59,6 +61,11 @@ _HEALTH_ENDPOINTS = {
     "tempo": ("tempo.query_port", "/ready"),
     "grafana": ("grafana.port", "/api/health"),
 }
+
+
+def _loopback_host() -> str:
+    address = local_addresses()
+    return "::1" if address["family"] == "ipv6" else address["loopback"]
 
 
 class PortConflictError(RuntimeError):
@@ -119,7 +126,7 @@ class LocalServiceRuntime:
         prometheus_config = Path(
             str(OmegaConf.select(self.conf, "prometheus.config_file"))
         )
-        if bool(OmegaConf.select(self.conf, "prometheus.enable", default=True)):
+        if service_enabled(self.conf, "prometheus"):
             prometheus_config = _render_prometheus_config(self.conf, runtime_dir)
         tempo_config = Path(str(OmegaConf.select(self.conf, "tempo.config_file")))
         grafana_config = Path(str(OmegaConf.select(self.conf, "grafana.config_file")))
@@ -175,7 +182,7 @@ class LocalServiceRuntime:
         with ExitStack() as reservations:
             for key, service in ports.items():
                 section = "server" if service == "rl-insight-server" else service
-                if not OmegaConf.select(self.conf, f"{section}.enable", default=True):
+                if not service_enabled(self.conf, section):
                     continue
                 port = int(OmegaConf.select(self.conf, key))
                 if not 0 <= port <= 65535:
@@ -212,7 +219,7 @@ class LocalServiceRuntime:
     def _wait_ready(self, service: StartedService, offset: int) -> None:
         """Check readiness and classify only this attempt's startup errors."""
         key, path = _HEALTH_ENDPOINTS[service.name]
-        host = "::1" if local_addresses()["family"] == "ipv6" else "127.0.0.1"
+        host = _loopback_host()
         url = (
             "http://" + format_host_port(host, OmegaConf.select(self.conf, key)) + path
         )
@@ -272,7 +279,12 @@ class LocalServiceRuntime:
             grafana_binary=grafana_binary,
             tempo_version=tempo_status.current_version if tempo_status else "",
         )
-        log_dir = (self.install_root / "logs").resolve()
+        log_dir = Path(
+            str(
+                OmegaConf.select(self.conf, "server.log_dir")
+                or self.install_root / "logs"
+            )
+        ).resolve()
         log_dir.mkdir(parents=True, exist_ok=True)
 
         started: list[StartedService] = []
@@ -282,7 +294,12 @@ class LocalServiceRuntime:
                 if binary is None:
                     raise MissingDependencyError([status_by_name[name]])
                 command = _service_command(
-                    name, binary, self.conf, runtime_files, self.install_root
+                    name,
+                    binary,
+                    self.conf,
+                    runtime_files,
+                    self.install_root,
+                    version=status_by_name[name].current_version,
                 )
                 log_file = log_dir / f"{name}.log"
                 offset = log_file.stat().st_size if log_file.exists() else 0
@@ -433,7 +450,7 @@ def _runtime_dir_from_config(conf: DictConfig) -> Path:
 
 def _write_runtime_config(conf: DictConfig, runtime_dir: Path) -> Path:
     target = runtime_dir / "server.yaml"
-    OmegaConf.save(config=conf, f=str(target))
+    _write_yaml_atomically(target, OmegaConf.to_container(conf, resolve=False))
     return target
 
 
@@ -524,15 +541,66 @@ def _service_data_root(conf: DictConfig, _install_root: Path) -> Path:
 
 def _render_prometheus_config(conf: DictConfig, runtime_dir: Path) -> Path:
     target = runtime_dir / "prometheus.yml"
+    remote_write = OmegaConf.select(conf, "prometheus.remote_write")
+    if remote_write:
+        remote_write = OmegaConf.to_container(remote_write, resolve=True)
+        if not isinstance(remote_write, list) or any(
+            not isinstance(item, dict) or not item.get("url") for item in remote_write
+        ):
+            raise ValueError(
+                "prometheus.remote_write must be a list of destinations with url"
+            )
+    if prometheus_agent_enabled(conf):
+        if not _server_enabled(conf) or any(
+            service_enabled(conf, name) for name in ("tempo", "grafana")
+        ):
+            raise ValueError(
+                "Task forwarding requires the collector and disabled Tempo/Grafana"
+            )
+        data = {
+            "global": {
+                "scrape_interval": OmegaConf.select(
+                    conf, "prometheus.scrape_interval", default="10s"
+                ),
+                "scrape_timeout": OmegaConf.select(
+                    conf, "prometheus.scrape_timeout", default="10s"
+                ),
+                "external_labels": OmegaConf.to_container(
+                    OmegaConf.select(
+                        conf, "prometheus.external_labels", default=OmegaConf.create({})
+                    ),
+                    resolve=True,
+                ),
+            },
+            "scrape_configs": [
+                {
+                    "job_name": "rl-insight-task",
+                    "honor_labels": True,
+                    "metrics_path": "/metrics",
+                    "static_configs": [
+                        {
+                            "targets": [
+                                format_host_port(_loopback_host(), conf.server.port)
+                            ]
+                        }
+                    ],
+                }
+            ],
+            "remote_write": remote_write,
+        }
+        _write_yaml_atomically(target, data)
+        return target
     targets_file = prometheus_targets_file_from_config(conf)
     legacy_targets_file = (runtime_dir / PrometheusScrape.TARGETS_FILE_NAME).resolve()
     source = Path(str(OmegaConf.select(conf, "prometheus.config_file")))
     data = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    if remote_write:
+        data["remote_write"] = remote_write
     scrape_configs = data.get("scrape_configs") or []
     if not isinstance(scrape_configs, list):
         raise ValueError("Prometheus scrape_configs must be a list")
 
-    with _prometheus_targets_lock(targets_file):
+    with runtime_lock(targets_file):
         if not targets_file.exists():
             migrated_targets = (
                 _read_file_sd_targets(legacy_targets_file)
@@ -719,7 +787,13 @@ def _write_yaml_atomically(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        tmp_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        with os.fdopen(
+            os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
+            "w",
+            encoding="utf-8",
+        ) as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            yaml.safe_dump(data, stream, sort_keys=False)
         os.replace(tmp_path, path)
     except BaseException:
         try:
@@ -730,7 +804,8 @@ def _write_yaml_atomically(path: Path, data: Any) -> None:
 
 
 @contextmanager
-def _prometheus_targets_lock(path: Path):
+def runtime_lock(path: Path):
+    """Serialize config projection and task-local service lifecycle operations."""
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_file = path.with_name(f".{path.name}.lock")
     with lock_file.open("a+", encoding="utf-8") as handle:
@@ -1245,12 +1320,32 @@ def _service_command(
     conf: DictConfig,
     runtime_files: RuntimeFiles,
     install_root: Path,
+    *,
+    version: str = "",
 ) -> list[str]:
     if name == "prometheus":
         data_dir = _service_specific_data_dir(
             conf, "prometheus", _service_data_root(conf, install_root)
         )
+        if prometheus_agent_enabled(conf) and not any(
+            OmegaConf.select(conf, key)
+            for key in ("prometheus.data_dir", "server.data_dir")
+        ):
+            data_dir = _runtime_dir_from_config(conf) / "prometheus"
         data_dir.mkdir(parents=True, exist_ok=True)
+        if prometheus_agent_enabled(conf):
+            return [
+                str(binary),
+                f"--config.file={runtime_files.prometheus_config}",
+                "--agent"
+                if int(version.split(".")[0]) >= 3
+                else "--enable-feature=agent",
+                "--web.listen-address="
+                + format_host_port(_loopback_host(), conf.prometheus.prometheus_port),
+                "--web.enable-lifecycle",
+                f"--storage.agent.path={(data_dir / 'agent').resolve()}",
+                "--storage.remote.flush-deadline=5s",
+            ]
         command = [
             str(binary),
             f"--config.file={runtime_files.prometheus_config}",

@@ -512,6 +512,378 @@ Original Grafana layouts, Run filtering, queries and trace collection are reused
 no dashboard copies or new UI modules are added.
 
 
+## Choosing bundled backends or platform services
+
+### Configure monitoring in the training task
+
+Keep the original training command. The existing framework logger passes its
+monitoring configuration to `rl_insight.init(config=...)`; the SDK expands its
+bundled template and prepares services automatically. No training command wrapper,
+second monitor YAML, or generated configuration file needs to be passed by users.
+An uninstrumented framework still needs its ordinary SDK integration.
+
+For example, verl already passes `trainer.rl_insight` through its logger:
+
+```yaml
+trainer:
+  logger: [console, rl_insight]
+  rl_insight:
+    enabled: true
+```
+
+This uses the existing Ray transport and bundled Prometheus, Tempo and Grafana.
+Install their binaries once in the task image with `rl-insight server install`.
+An initialized Ray runtime is required for the bundled SDK transport; the external
+outputs below also support an ordinary process without Ray initialization.
+
+For a platform that pulls metrics and accepts OTLP/HTTP traces:
+
+```yaml
+trainer:
+  logger: [console, rl_insight]
+  rl_insight:
+    metrics:
+      pull: true
+    traces:
+      endpoint: ${oc.env:OTEL_EXPORTER_OTLP_TRACES_ENDPOINT}
+      headers:
+        X-Scope-OrgID: ${oc.env:PLATFORM_TENANT_ID}
+    labels:
+      task_id: ${oc.env:PLATFORM_TASK_ID}
+```
+
+For metrics push, replace only `metrics` with native remote-write destinations:
+
+```yaml
+trainer:
+  logger: [console, rl_insight]
+  rl_insight:
+    metrics:
+      remote_write:
+        - url: ${oc.env:PROMETHEUS_REMOTE_WRITE_URL}
+          headers:
+            X-Scope-OrgID: ${oc.env:PLATFORM_TENANT_ID}
+    traces:
+      endpoint: ${oc.env:OTEL_EXPORTER_OTLP_TRACES_ENDPOINT}
+      headers:
+        X-Scope-OrgID: ${oc.env:PLATFORM_TENANT_ID}
+    labels:
+      task_id: ${oc.env:PLATFORM_TASK_ID}
+```
+
+The platform supplies its existing environment values; users do not create
+`RL_INSIGHT_CONFIG` or manually export monitoring connection variables. Existing
+framework enablement and runtime environment propagation remain in that
+framework's training configuration. Optional `metrics.binary_path`,
+`metrics.data_dir`, `metrics.scrape_interval` and `metrics.scrape_timeout` reuse
+native Prometheus configuration. Keep Agent WAL isolated by task, tenant and
+destination. Remote write requires an installed Prometheus Agent binary.
+
+`enabled: false` disables this SDK configuration. With no external outputs,
+`enabled: true` selects the bundled stack. Declaring external outputs enables
+only those signals: trace-only starts no server, and `metrics.pull` and nonempty
+`metrics.remote_write` are mutually exclusive. Use `enabled: true` for an otherwise
+empty configuration fragment so existing logger calls with no configuration keep
+their original behavior. Explicit `rl_insight` envelopes are also accepted by the SDK.
+`labels` supplies fixed metric labels and trace attributes, independent of the
+Tempo tenant header; the SDK never invents a platform task ID.
+
+For advanced sink options, use `sinks` as the complete output list in the same
+training configuration. Choose either `sinks` or the simplified `metrics`/`traces`
+fields; mixing them is rejected before services start.
+
+```yaml
+trainer:
+  logger: [console, rl_insight]
+  rl_insight:
+    labels:
+      task_id: ${oc.env:PLATFORM_TASK_ID}
+    sinks:
+      - name: metrics
+        driver: rl_insight.client.push.sinks.prometheus:create_sink
+        streams: [metric]
+        metric_mapping:
+          - {source: loss, name: training_loss, op: store}
+      - name: traces
+        driver: rl_insight.client.push.sinks.otlp:create_sink
+        streams: [trace]
+        endpoint: ${oc.env:OTEL_EXPORTER_OTLP_TRACES_ENDPOINT}
+        headers:
+          X-Scope-OrgID: ${oc.env:PLATFORM_TENANT_ID}
+        service_name: training
+        strip_name_prefix: trace.
+```
+
+Sink-specific fields are passed to the existing driver factory without a new
+plugin protocol. Custom drivers use the same `package.module:factory` syntax and
+must be installed in the process running the sinks (the Ray head Hub for Ray
+jobs). Factories continue to validate their own options and use the existing
+sink-loading failure behavior.
+
+Shared `labels` apply to every sink; per-sink labels can add fields but cannot
+change shared identity or supply a Run ID. Names must be unique (the driver path
+is the default name); identical sink configurations are rejected even with
+different names. At most one built-in Prometheus sink is allowed. Built-in OTLP
+sinks cannot subscribe overlapping streams to the same endpoint. Custom factories
+remain responsible for checking destinations hidden in driver-specific options.
+
+For the built-in Prometheus sink, the SDK supplies `server_url`, starts/reuses the
+task collector and preserves raw native exporter metrics. Configure a shared
+collector URL through `server.url`, rather than overriding it inside the sink.
+`metric_mapping` filters SDK scalar events only; unmapped scalar events are
+omitted, while raw native metrics are retained. An OTLP/custom-only output list
+starts no collector or bundled storage services. Automatic native Agent remote
+write remains available through the simplified `metrics.remote_write` interface;
+`sinks` does not add a second Agent configuration interface.
+
+For Ray jobs the existing job-scoped Hub owns startup and is placed on the Ray
+head. Workers join it and obtain resolved configuration automatically; they do
+not start services or receive Tempo/remote-write credentials. Native endpoints
+registered before SDK initialization wait for that job's configuration. A
+trace-only job ignores native metric registration. Other runtimes can use the
+same generic service session from their existing driver initialization; they
+must supply a reachable head URL when configuring separate processes to connect.
+
+The default fixed collector port is 18080. Optional `server.port`,
+`server.namespace`, `server.endpoint_ttl` and `server.url` live inside the same
+monitoring section. `server.url` connects to an existing compatible service.
+Port 0 selects available ports; use a declared fixed port for K8s discovery.
+Pod networks can reuse 18080 across Pods; hostNetwork tasks need distinct ports.
+The platform still owns head Service selection, K8s discovery/relabel and network
+reachability. A remote exporter must advertise an address reachable from the head.
+
+`finish()` flushes the owner and retains final task metrics for an endpoint TTL
+(default 45 seconds), then stops SDK-owned collector/Agent processes. A small
+owner watchdog also reclaims these processes if their owner is killed, without
+replacing framework signal handlers. Abrupt termination cannot guarantee final
+unflushed samples or traces. Existing shared services are preserved. A full
+bundled stack remains available for historical dashboards after the Ray job exits;
+the Hub worker retains these service processes. A fresh bundled instance uses
+Grafana bootstrap credentials for its Run view client. Existing services retain
+their deployment settings. Its
+service URL and private runtime configuration path are logged for administration.
+Generated runtime YAML uses 0600 permissions and does not print credentials.
+Conflicting legacy `RL_INSIGHT_CONFIG`, backend or server URL settings fail before
+starting services. Existing low-level configurations remain supported separately.
+
+### Existing explicit service configuration
+
+Training instrumentation uses the same `init`, metric, trace and `finish` APIs.
+Deployment configuration determines who operates collection, storage and queries.
+The following describes the two supported configurations, rather than introducing
+a new `managed/platform` setting.
+
+| Concern | RL-Insight backends | External platform services |
+| --- | --- | --- |
+| Server lifetime | Deploy a shared full stack before training; independent tasks reuse it. | Start one task-local collector on the head node, before workers; retain it through shutdown grace. |
+| Services | RL-Insight starts/configures its Prometheus, Tempo and Grafana. | Disable all three bundled backends. Configuring remote_write additionally starts a head-only Prometheus Agent for forwarding. |
+| Worker configuration | Existing Ray backend and shared `server.url`. | Existing push backend with Prometheus and OTLP sinks; distribute its YAML and environment to every worker. |
+| Task identity | RL-Insight creates a RunContext and unique `run_id`. | Platform owns identity; collector creates no RunContext or Run ID. |
+| Metrics | Local Prometheus discovers and scrapes each Run through the server. | Platform pulls the head `/metrics`, or a head-only Agent forwards that same entry via remote_write. |
+| Traces | Existing Hub path exports to the stack's Tempo. | Each SDK trace sink exports to the configured platform OTLP endpoint or platform OTel Collector. |
+| Queries and UI | Original Grafana dashboards with Run ID selection and Run-scoped queries. | Platform query/UI and task filters; this collector provisions no dashboard or data source. |
+| Data retention | Stack storage plus per-Run metadata directories. | Platform retention; task-local endpoint leases and final snapshots are in memory. |
+| Final delivery | Existing SDK flush marker can confirm the local Prometheus scrape. | `finish` flushes traces and preserves a bounded metrics snapshot; external metrics persistence is not acknowledged. |
+
+For bundled backends, start the shared stack as described above, provide
+`RL_INSIGHT_SERVER_URL` (or `server.url`), and keep the default Ray client.
+Multiple tasks may share that server and are distinguished by their Run IDs.
+The server may be hosted separately from the training nodes.
+
+For a platform deployment, its job template supplies the collector startup,
+`RL_INSIGHT_CONFIG`, reachable head URL, OTLP endpoint and optional task tags.
+The training user continues calling the same SDK APIs and does not need to
+configure Prometheus discovery or choose sink drivers in training code. An
+existing Ray cluster still requires the template to propagate configuration
+to its workers. Changing an HTTP URL alone cannot select between the two
+pipelines: both services use HTTP and expose different capabilities. This first
+path uses explicit existing client/sink configuration; it does not guess from
+URL spelling or silently fall back to a full stack.
+
+The `push` backend name describes dispatching SDK events into sinks. The
+Prometheus sink **exposes** metrics for pulling; it does not send metrics to a
+Prometheus query URL. Only the trace sink needs the platform's ingest URL.
+Neither configuration automatically instruments a framework that has no SDK
+calls or endpoint registration. Existing instrumentation can keep its API calls;
+new producers use those same generic APIs without RL-Insight framework adapters.
+
+## Platform Prometheus pull / remote write and OTLP traces
+
+For a platform that owns task identity and already provides Prometheus and Tempo,
+start **one collector on the training head node per task**. Workers run SDK sinks;
+they do not start additional collectors. Disable the bundled backends using the
+existing service flags. With all three disabled, the HTTP server exposes a fixed
+`/metrics` entry and task-local endpoint leases, with no Run catalog or query UI.
+
+Head-node configuration (`collector.yaml`):
+
+```yaml
+server:
+  port: 18080
+  runtime_dir: ${oc.env:RL_INSIGHT_TASK_DIR}/runtime
+  state_file: ${oc.env:RL_INSIGHT_TASK_DIR}/state.json
+  endpoint_ttl: 45
+prometheus:
+  enable: false
+tempo:
+  enable: false
+grafana:
+  enable: false
+```
+
+```bash
+# RL_INSIGHT_TASK_DIR is an isolated writable directory supplied by the deployment.
+rl-insight server start --config collector.yaml --detach
+```
+
+Publish the head node's reachable URL to every worker, for example
+`RL_INSIGHT_SERVER_URL=http://<training-head>:18080`. Mount the following SDK YAML
+in every worker and set `RL_INSIGHT_CONFIG` to its path. Do not use a worker's
+loopback address as the shared collector URL.
+
+```yaml
+server:
+  backend: push
+  url: ${oc.env:RL_INSIGHT_SERVER_URL}
+push:
+  # Match the existing trainer dashboard metric names.
+  metric_prefix: rl_insight_monitor_
+  sinks:
+    - name: prometheus
+      driver: rl_insight.client.push.sinks.prometheus:create_sink
+      streams: [metric]
+      server_url: ${server.url}
+      # Optional: explicitly advertise the worker Pod IP if automatic routing
+      # chooses an address the head node cannot reach.
+      # advertise_host: ${oc.env:POD_IP}
+      tags_from_env:
+        - tag: task_id
+          env: PLATFORM_TASK_ID
+    - name: tempo
+      driver: rl_insight.client.push.sinks.otlp:create_sink
+      streams: [trace]
+      endpoint: ${oc.env:OTEL_EXPORTER_OTLP_TRACES_ENDPOINT}
+      tags_from_env:
+        - tag: task_id
+          env: PLATFORM_TASK_ID
+```
+
+Keep existing `rl_insight.init`, metric and trace API calls. The Prometheus sink
+uses a private registry and dynamic HTTP port per process. Counter events
+increment, gauges set the current value, and histograms record observations.
+Metric names normalize non-Prometheus characters to underscores; timer values
+retain the sink interface's microsecond unit. Set names/mappings deliberately
+when using an existing dashboard.
+
+Existing `update_prometheus_config` calls register native vLLM/TQ or other
+exporters with the same task collector. Raw metric families, including native
+histogram buckets, are forwarded without PR181's rollout translation. Do not
+combine this sink with `push.rollout.metrics`; that ambiguous configuration
+logs a warning and disables monitoring rather than double collecting data.
+Only one raw-target collector may be configured per process.
+
+The platform must discover and scrape **only the head collector** at
+`http://<head>:18080/metrics`, and add its authoritative task label through the
+platform's existing Kubernetes discovery/relabel configuration. A scrape target
+belongs to one task; the collector generates no task or Run ID. Optional
+`tags_from_env` on the Prometheus sink applies to SDK and registered native
+metrics too, as enabled in the example. Omitting it adds no task label. Supply
+the same task identity as the Pod label; when relabel also sets `task_id`, the
+platform's label conflict policy applies (`honor_labels: false` gives target
+labels precedence and may rename the exporter label to `exported_task_id`).
+These labels are transparent metadata, not authentication. For
+Tempo, use the platform Collector's identity enrichment or the trace sink's
+`tags_from_env`; Prometheus relabel does not enrich traces. The trace sink accepts
+`headers` for deployment-provided OTLP authentication.
+
+Worker-to-head registration and head-to-worker dynamic metrics ports must be
+reachable. The registration API assumes a task-isolated network and is not a
+multi-tenant authorization boundary. SDK exporters carry an incarnation proof;
+URL-only native exporters cannot prove ownership after port reuse without
+explicit response wrapping. Endpoint renewal re-registers live exporters after
+collector restart, without creating a task identity. Native registration network
+failures are logged and retried without failing the training caller. Start the
+head collector before SDK initialization so its SDK sink can register initially.
+
+On graceful worker close, the collector captures a bounded final snapshot and
+serves it for one endpoint TTL, even after the worker HTTP server exits. Keep the
+head collector alive for this grace period; choose TTL at least as long as the
+platform's scrape interval plus scrape timeout. This is **not** an acknowledgment
+that the external Prometheus persisted the final value. Collector restart loses
+in-memory final snapshots, and abrupt worker exit has no final-snapshot guarantee.
+No backend storage, platform dashboard provisioning or durable replay is added.
+
+Inspect `rl_insight_proxy_endpoint_up` and `rl_insight_proxy_failures` in addition
+to Prometheus target `up`: partial endpoint failures may still return HTTP 200.
+
+### Choosing pull or push
+
+The SDK's `server.backend: push` selects event dispatch to sinks. It does not
+select the Prometheus wire protocol. Keep the same PrometheusSink and endpoint
+registration for both transports:
+
+| Configuration | Head processes | Platform integration |
+| --- | --- | --- |
+| No `prometheus.remote_write` (default) | Task collector | K8s discovery pulls the fixed `/metrics`. No local Prometheus binary is needed. |
+| Nonempty `prometheus.remote_write`, bundled backends disabled | Task collector + Prometheus Agent | Agent scrapes `/metrics` locally and pushes to the configured ingest URL. K8s scrape discovery is unnecessary for this path. |
+
+For remote write, add the following fields to the same YAML used by the head
+CLI. All SDK sink fields stay unchanged. Native Prometheus remote_write options,
+including headers, authentication, TLS and queue_config, are passed through:
+
+```yaml
+prometheus:
+  enable: false
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    task_id: ${oc.env:PLATFORM_TASK_ID}
+  remote_write:
+    - url: ${oc.env:PROMETHEUS_REMOTE_WRITE_URL}
+      headers:
+        X-Scope-OrgID: ${oc.env:PLATFORM_TENANT_ID}
+```
+
+The URL must be a complete remote-write ingest URL (for a Prometheus receiver,
+the usual path is `/api/v1/write`), not its query API or a Pushgateway URL.
+Remote write does not inherit K8s target relabeling. SDK `tags_from_env` labels
+remain available; `external_labels` fills missing labels, including on proxy
+health metrics. Both must use the same platform identity. Existing sample labels
+take precedence over external_labels. Tenant headers are separate from task_id.
+Do not also scrape the same task into the same destination unless deliberate
+duplicate collection is required; the pull entry remains available for diagnosis.
+
+The existing install command installs only the Agent dependency with this
+configuration; Tempo and Grafana stay disabled:
+
+```bash
+rl-insight server install --config monitor.yaml
+rl-insight server start --config monitor.yaml --detach
+```
+
+Configure `prometheus.binary_path` when the binary is already in the image.
+Agent mode requires Prometheus >=2.32; 2.x uses `--enable-feature=agent`, and
+3.x uses `--agent`, chosen from the actual installed binary version. The Agent's
+HTTP interface is bound to the matching IPv4/IPv6 loopback. Its default WAL is
+`<server.runtime_dir>/prometheus/agent`, so task-specific runtime directories
+also isolate the queues. An explicit `prometheus.data_dir` (or `server.data_dir`)
+overrides that base. It does not enable local TSDB queries,
+alerting rules or dashboards. Set `prometheus.data_dir` to a task-specific
+persistent volume if recovery must survive Pod replacement; keep the destination
+and tenant unchanged when reusing that WAL.
+
+The native Agent handles batching, Snappy/protobuf, retries and WAL replay.
+The process runtime allows five seconds for its remote flush within the existing
+eight-second termination budget. Samples already in the WAL may be retried on
+restart while that directory is retained; samples never scraped are not buffered.
+Retain the head through the final-snapshot grace period before stopping it.
+An unavailable receiver, exhausted disk or deleted ephemeral Pod volume cannot
+guarantee delivery. Inspect the Agent's `prometheus_remote_storage_*` metrics and
+logs in addition to collector health.
+
+An enabled full Prometheus backend can also use `prometheus.remote_write`; that
+configuration retains its existing TSDB and Run behavior rather than Agent mode.
+
 ## Next Step
 
 Continue with [Quick Start](./quick_start.md) to start the stack, instrument training code, and open Grafana.

@@ -28,7 +28,12 @@ from ..utils.constants import MonitorEnv
 from ..utils.monitor_config_loader import load_server_config_file
 from ..utils.prometheus_utils import PrometheusTarget, PrometheusTargetStore
 from .catalog import DEFAULT_STATE_ROOT
-from .dependencies import MissingDependencyError, ServiceStatus
+from .dependencies import (
+    MissingDependencyError,
+    ServiceStatus,
+    service_enabled,
+    task_collector_enabled,
+)
 from .display import (
     active_state_rows,
     dependency_rows,
@@ -273,7 +278,9 @@ class ServerCommands:
             return False
 
         backend = str(conf.server.get("backend", "local"))
-        if backend != "local":
+        if backend != "local" and not (
+            backend == "push" and task_collector_enabled(conf)
+        ):
             print(
                 f"Server backend {backend!r} is external; nothing to {action}. "
                 "Manage the observability stack with your external deployment."
@@ -291,7 +298,7 @@ class ServerConfigValidator:
         if bool(OmegaConf.select(conf, "server.enable", default=True)):
             self._require_int(conf, "server.port", "RL-Insight server port")
 
-        if bool(OmegaConf.select(conf, "prometheus.enable", default=True)):
+        if service_enabled(conf, "prometheus"):
             self._require_int(
                 conf, "prometheus.prometheus_port", "Prometheus HTTP port"
             )

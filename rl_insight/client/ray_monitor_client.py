@@ -21,7 +21,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 import ray
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from ..collector.ray_monitor_hub import MonitorHubActor
 from ..protocol import RunContext
@@ -55,6 +55,28 @@ def current_job_context() -> RunContext | None:
         return RunContext.from_dict(value) if value else None
     except (ValueError, ray.exceptions.RayError):
         return None
+
+
+def current_job_config() -> DictConfig | None:
+    """Read an initialized job configuration without creating a Hub or services."""
+    if not ray.is_initialized():
+        return None
+    try:
+        hub = ray.get_actor(
+            _current_job_actor_name(), namespace=MonitorRayActor.NAMESPACE
+        )
+        return OmegaConf.create(ray.get(hub.get_monitor_config.remote(), timeout=90))
+    except (ValueError, ray.exceptions.RayError):
+        return None
+
+
+def register_job_metrics(addresses, job, labels) -> bool:
+    conf = current_job_config()
+    if conf is None or not conf.get("task_configuration", False):
+        return False
+    hub = ray.get_actor(_current_job_actor_name(), namespace=MonitorRayActor.NAMESPACE)
+    ray.get(hub.register_native_metrics.remote(addresses, job, labels), timeout=15)
+    return True
 
 
 def get_or_create_monitor_hub(conf: DictConfig) -> Any:
@@ -92,11 +114,29 @@ def get_or_create_monitor_hub(conf: DictConfig) -> Any:
         "name": actor_name,
         "namespace": namespace,
     }
+    if conf.get("task_options") is not None:
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        head = next(
+            node
+            for node in ray.nodes()
+            if node["Alive"] and node["Resources"].get("node:__internal_head__")
+        )
+        actor_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+            head["NodeID"], soft=False
+        )
+    env_vars = {}
+    options = conf.get("task_options")
+    if options is not None and not any(
+        key in options for key in ("metrics", "traces", "sinks")
+    ):
+        # The full history backend outlives this job's Hub and its Ray worker.
+        env_vars["RAY_kill_child_processes_on_worker_exit"] = "false"
     server_url = str(conf.server.url).strip()
     if server_url:
-        actor_options["runtime_env"] = {
-            "env_vars": {MonitorEnv.SERVER_URL: server_url},
-        }
+        env_vars[MonitorEnv.SERVER_URL] = server_url
+    if env_vars:
+        actor_options["runtime_env"] = {"env_vars": env_vars}
 
     try:
         actor_cls = cast(Any, MonitorHubActor)
@@ -127,16 +167,27 @@ def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
         return None
 
     handle = get_or_create_monitor_hub(conf)
+    resolved = OmegaConf.create(ray.get(handle.get_monitor_config.remote(), timeout=90))
+    if conf.get("task_options") is not None and conf.get(
+        "task_signature"
+    ) != resolved.get("task_signature"):
+        raise ValueError(
+            "Worker monitoring configuration conflicts with the existing job"
+        )
     value = ray.get(handle.get_context.remote(), timeout=15)
-    return MonitorRayClient(
+    client = MonitorRayClient(
         handle,
         RunContext.from_dict(value) if value else None,
         _owned_hubs.get(_current_job_actor_name()),
     )
+    client.conf = resolved
+    return client
 
 
 class MonitorRayClient(MonitorClient):
     """Ray facade: ``apply_event`` submits work to the hub without blocking on completion."""
+
+    conf: DictConfig
 
     def __init__(
         self,
@@ -167,7 +218,10 @@ class MonitorRayClient(MonitorClient):
     def close(self) -> None:
         if self._owner_token:
             try:
-                ray.get(self._actor.end_run.remote(self._owner_token), timeout=15)
+                ray.get(
+                    self._actor.end_run.remote(self._owner_token),
+                    timeout=30 + float(self.conf.get("endpoint_ttl", 0)),
+                )
             finally:
                 _owned_hubs.pop(_current_job_actor_name(), None)
                 self._owner_token = None

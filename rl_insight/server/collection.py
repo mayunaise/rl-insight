@@ -18,27 +18,28 @@ from __future__ import annotations
 
 import http.client
 import ipaddress
-import ssl
 import logging
 import socket
+import ssl
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from prometheus_client import CollectorRegistry, Gauge, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
-from ..protocol import RunError, proof_headers
+from ..protocol import RunError, metric_labels, proof_headers
 
 logger = logging.getLogger(__name__)
 
 
 class Collection:
-    def __init__(self, registry, timeout=9.0):
+    def __init__(self, registry, timeout=9.0, *, labels=None):
         self.registry = registry
         self.timeout = timeout
+        self._labels = metric_labels(labels or {})
         self._pool = ThreadPoolExecutor(
             max_workers=16, thread_name_prefix="insight-scrape"
         )
@@ -51,6 +52,8 @@ class Collection:
         self._pool.shutdown(wait=True, cancel_futures=True)
 
     def _read(self, item, deadline):
+        if "snapshot" in item:
+            return item["snapshot"]
         address = urlsplit(item["metrics_url"])
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -98,10 +101,14 @@ class Collection:
                 },
             )
             response = connection.getresponse()
-            context = self.registry.get(item["run_id"])
+            context = self.registry.get_context(item.get("run_id"))
+            expected = (
+                proof_headers(context, item["incarnation"])
+                if item.get("incarnation")
+                else {}
+            )
             if response.status != 200 or any(
-                response.getheader(key) != value
-                for key, value in proof_headers(context, item["incarnation"]).items()
+                response.getheader(key) != value for key, value in expected.items()
             ):
                 raise RunError(
                     "Exporter response identity does not match its publisher", 409
@@ -135,19 +142,19 @@ class Collection:
             self._capacity.release()
 
     def verify(self, description):
-        if not self._acquire(description["run_id"]):
+        if not self._acquire(description.get("run_id")):
             raise RunError("Collection capacity exhausted", 503)
         try:
-            self._read(description, time.monotonic() + min(3, self.timeout))
+            return self._read(description, time.monotonic() + min(3, self.timeout))
         except RunError:
             raise
         except (OSError, ValueError, http.client.HTTPException) as exc:
             raise RunError("Exporter response could not be verified", 502) from exc
         finally:
-            self._release(description["run_id"])
+            self._release(description.get("run_id"))
 
     def _submit(self, item, deadline):
-        if not self._acquire(item["run_id"]):
+        if not self._acquire(item.get("run_id")):
             return None
 
         def fetch():
@@ -158,7 +165,7 @@ class Collection:
                 families = []
                 seen = set()
                 count = 0
-                context = self.registry.get(item["run_id"])
+                context = self.registry.get_context(item.get("run_id"))
                 for family in text_string_to_metric_families(text):
                     families.append(family)
                     count += len(family.samples)
@@ -171,8 +178,9 @@ class Collection:
                     for sample in family.samples:
                         if time.monotonic() >= deadline:
                             raise TimeoutError("Endpoint parsing deadline exceeded")
-                        labels = {**item["labels"], **sample.labels}
-                        labels = context.labels(labels)
+                        labels = {**item["labels"], **sample.labels, **self._labels}
+                        if context is not None:
+                            labels = context.labels(labels)
                         for key, value in {
                             "component": item["component"],
                             "endpoint_id": item["endpoint_id"],
@@ -194,16 +202,16 @@ class Collection:
                         sample.labels.update(labels)
                 return families, len(text.encode())
             finally:
-                self._release(item["run_id"])
+                self._release(item.get("run_id"))
 
         try:
             return self._pool.submit(fetch)
         except Exception:
-            self._release(item["run_id"])
+            self._release(item.get("run_id"))
             raise
 
-    def collect(self, run_id, timeout=None):
-        self.registry.get(run_id)
+    def collect(self, run_id=None, timeout=None):
+        self.registry.get_context(run_id)
         with self._lock:
             lock = self._run_locks.setdefault(run_id, threading.Lock())
             if not lock.acquire(blocking=False):
@@ -309,24 +317,29 @@ class Collection:
         status = Gauge(
             "rl_insight_proxy_endpoint_up",
             "Endpoint collected successfully",
-            ["run_id", "endpoint_id", "component"],
+            (["run_id"] if run_id is not None else []) + ["endpoint_id", "component"],
             registry=metrics,
         )
         for item in items:
-            status.labels(run_id, item["endpoint_id"], item["component"]).set(
-                item["lease_id"] in successful
-            )
+            status.labels(
+                *([run_id] if run_id is not None else []),
+                item["endpoint_id"],
+                item["component"],
+            ).set(item["lease_id"] in successful)
         for name, value in {
             "endpoints": len(items),
             "failures": len(items) - len(successful),
             "empty": not items,
         }.items():
-            Gauge(
+            gauge = Gauge(
                 "rl_insight_proxy_" + name,
-                "Run collection " + name,
-                ["run_id"],
+                "Collection " + name,
+                ["run_id"] if run_id is not None else [],
                 registry=metrics,
-            ).labels(run_id).set(value)
+            )
+            if run_id is not None:
+                gauge = gauge.labels(run_id)
+            gauge.set(value)
         body = generate_latest(
             SimpleNamespace(collect=lambda: merged.values())
         ) + generate_latest(metrics)

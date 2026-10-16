@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import atexit
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
@@ -28,7 +28,7 @@ from ..base import MonitorClient
 from .driver import build_sink
 from .poller import PrometheusPoller, set_active_registry
 from .sinks.base import PushSink
-from .tags import collect_env_tags
+from .tags import collect_sink_tags
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -59,6 +59,7 @@ class _BoundSink:
     rollout_prefix: str
     tags: dict[str, str]
     metric_rules: dict[str, _MetricRule] | None = None
+    labels: dict[str, str] = field(default_factory=dict)
     alive: bool = True
 
 
@@ -137,7 +138,7 @@ class PushMonitorClient(MonitorClient):
                 method = rule.method or default_method
                 out_value = value * rule.scale
                 tags = {**bound.tags, **event_tags, **rule.tags}
-            self._safe(bound, method, suffix, out_value, tags)
+            self._safe(bound, method, suffix, out_value, {**tags, **bound.labels})
 
     def _route_trace(self, event: dict[str, Any]) -> None:
         start_ns = int(event.get("start_time_ns", 0))
@@ -150,7 +151,7 @@ class PushMonitorClient(MonitorClient):
         for bound in list(self._bound):
             if not bound.alive or STREAM_TRACE not in bound.streams:
                 continue
-            attributes = {**bound.tags, **event_attrs}
+            attributes = {**bound.tags, **event_attrs, **bound.labels}
             self._safe(bound, "emit_span", suffix, start_ns, end_ns, attributes)
 
     def emit_rollout(
@@ -166,7 +167,7 @@ class PushMonitorClient(MonitorClient):
             if not bound.alive or STREAM_ROLLOUT not in bound.streams:
                 continue
             suffix = f"{bound.rollout_prefix}{name}"
-            merged = {**bound.tags, **dict(tags or {})}
+            merged = {**bound.tags, **dict(tags or {}), **bound.labels}
             self._safe(bound, method, suffix, float(value), merged)
 
     def _safe(self, bound: _BoundSink, method: str, *args: Any) -> None:
@@ -181,6 +182,12 @@ class PushMonitorClient(MonitorClient):
                 )
                 bound.alive = False
                 self._bound = [b for b in self._bound if b.alive]
+                try:
+                    bound.sink.close()
+                except Exception:
+                    logger.debug(
+                        "[rl-insight] failed sink cleanup failed", exc_info=True
+                    )
 
     def close(self) -> None:
         """Stop polling and flush sinks; idempotent."""
@@ -193,7 +200,7 @@ class PushMonitorClient(MonitorClient):
         for bound in self._bound:
             try:
                 bound.sink.close()
-            except Exception:  # noqa: BLE001 - best-effort shutdown
+            except Exception:
                 logger.debug("[rl-insight] sink close failed", exc_info=True)
         try:
             atexit.unregister(self.close)
@@ -274,7 +281,11 @@ def _bind_sink(sink: PushSink, sink_conf: Any) -> _BoundSink | None:
             rollout_prefix=_select_or(
                 sink_conf, "rollout_name_prefix", DEFAULT_ROLLOUT_PREFIX
             ),
-            tags=collect_env_tags(OmegaConf.select(sink_conf, "tags_from_env")),
+            tags=collect_sink_tags(sink_conf),
+            labels={
+                str(k): str(v)
+                for k, v in dict(OmegaConf.select(sink_conf, "labels") or {}).items()
+            },
             metric_rules=_metric_mapping(sink_conf),
         )
     except Exception as exc:  # noqa: BLE001 - bad config disables one sink only
@@ -332,6 +343,13 @@ def create_push_monitor_client(conf: DictConfig) -> PushMonitorClient | None:
         binding = _bind_sink(sink, sink_conf)
         if binding is not None:
             bound.append(binding)
+        else:
+            try:
+                sink.close()
+            except Exception:
+                logger.warning(
+                    "[rl-insight] failed to close rejected sink", exc_info=True
+                )
 
     if not bound:
         logger.warning("[rl-insight] push backend has no usable sinks; disabled.")
@@ -343,7 +361,20 @@ def create_push_monitor_client(conf: DictConfig) -> PushMonitorClient | None:
     rules = OmegaConf.select(push_conf, "rollout.metrics")
     interval = _parse_interval(push_conf)
     poller: PrometheusPoller | None = None
-    if rules and any(STREAM_ROLLOUT in b.streams for b in bound):
+    target_registries = [
+        b.sink.target_registry for b in bound if hasattr(b.sink, "target_registry")
+    ]
+    if target_registries and (rules or len(target_registries) > 1):
+        for binding in bound:
+            binding.sink.close()
+        logger.warning(
+            "[rl-insight] raw Prometheus export requires one collector and no "
+            "rollout translation rules; monitoring disabled."
+        )
+        return None
+    if target_registries:
+        set_active_registry(target_registries[0])
+    elif rules and any(STREAM_ROLLOUT in b.streams for b in bound):
         poller = PrometheusPoller(
             rules=rules,
             interval_seconds=interval,

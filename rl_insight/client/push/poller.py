@@ -50,22 +50,28 @@ class Target:
 class TargetRegistry:
     """Process-local, de-duplicated set of rollout scrape targets."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_update: Callable[[Target], None] | None = None) -> None:
         self._targets: dict[str, dict[str, str]] = {}
         self._lock = threading.Lock()
+        self._on_update = on_update
 
     def set_targets(
         self,
         addresses: Sequence[str],
         labels: Sequence[Mapping[str, Any] | None] | None = None,
+        *,
+        job_name: str | None = None,
     ) -> None:
         """Register/replace targets keyed by address; later calls upsert."""
         per_target = list(labels) if labels is not None else [None] * len(addresses)
-        with self._lock:
-            for address, target_labels in zip(addresses, per_target):
-                self._targets[str(address)] = {
-                    str(k): str(v) for k, v in (target_labels or {}).items()
-                }
+        for address, target_labels in zip(addresses, per_target):
+            values = {str(k): str(v) for k, v in (target_labels or {}).items()}
+            if self._on_update is not None:
+                if job_name:
+                    values.setdefault("job", job_name)
+                self._on_update(Target(str(address), values))
+            with self._lock:
+                self._targets[str(address)] = values
 
     def snapshot(self) -> list[Target]:
         with self._lock:
