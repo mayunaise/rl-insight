@@ -282,9 +282,5 @@ server:
 With the Ray backend and a Run-capable server, use **Experiment** in any built-in
 Grafana dashboard to select an execution. Labels such as
 `gsm8k_20261019_143025_a1b2c3d4` include the experiment name, UTC creation time and
-short ID. Keep the original experiment name in training config.
-
-Selection switches both metrics and traces. Finished executions remain
-selectable after server restarts; historical data follows backend retention.
-
-Call `rl_insight.finish()` before stopping Ray to flush final SDK samples.
+short ID. Keep the original experiment name in training config; selection
+switches both metrics and traces.
