@@ -63,9 +63,6 @@ _EXPORTS = {
     "trace_span": ".api",
     "trace_state": ".api",
     "update_prometheus_config": ".utils",
-    "metrics_wsgi_app": ".utils.prometheus_utils",
-    "metrics_asgi_app": ".utils.prometheus_utils",
-    "publish_metrics_endpoint": ".utils.prometheus_utils",
 }
 
 __all__ = list(_EXPORTS) + ["__version__"]

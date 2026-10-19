@@ -25,7 +25,6 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +34,7 @@ from uuid import uuid4
 import pytest
 import requests
 import uvicorn
+import yaml
 from fastapi.responses import JSONResponse
 from omegaconf import OmegaConf
 
@@ -146,7 +146,20 @@ def stack(tmp_path):
                 result = []
                 if match:
                     response = requests.get(
-                        state.api_url + "/api/v1/runs/" + match[1] + "/metrics",
+                        next(
+                            g["targets"][0]
+                            for g in yaml.safe_load(
+                                (
+                                    Path(conf.server.data_dir)
+                                    / "targets/prometheus-targets.yml"
+                                ).read_text()
+                            )
+                            if g["labels"].get(
+                                "__rl_insight_run_id", g["labels"].get("run_id")
+                            )
+                            == match[1]
+                            and g["labels"].get("rl_insight_job") == "trainer_metrics"
+                        ).join(["http://", "/metrics"]),
                         timeout=5,
                     )
                     if response.status_code == 200:
@@ -227,9 +240,23 @@ def stack(tmp_path):
     try:
         with serve(app) as url:
             state.api_url = url
-            yield SimpleNamespace(
-                url=url, conf=conf, data=tmp_path / "data", backend=state
-            )
+            try:
+                yield SimpleNamespace(
+                    url=url, conf=conf, data=tmp_path / "data", backend=state
+                )
+            finally:
+                # SDK renewal threads must not leak into later tests/mocked transports.
+                import rl_insight.utils.prometheus_utils as tools
+
+                for path in (tmp_path / "data/runs").glob("*/run.json"):
+                    from rl_insight.protocol import RunContext
+
+                    tools._forget_targets(
+                        RunContext.from_dict(json.loads(path.read_text())["context"])
+                    )
+                publication_thread = tools._publication_thread
+                if publication_thread is not None:
+                    publication_thread.join(16)
     finally:
         backend.shutdown()
         thread.join(10)
@@ -792,7 +819,11 @@ def test_existing_ray_api_keeps_one_run_identity(stack, tmp_path, context_delay)
                 encoding="utf-8"
             )
             assert (
-                targets.count(context["run_id"]) == 2
+                sum(
+                    g["labels"].get("run_id") == context["run_id"]
+                    for g in yaml.safe_load(targets)
+                )
+                == 2
                 and "replica: '0'" in targets
                 and "replica: '1'" in targets
             )
@@ -1082,228 +1113,78 @@ def test_sequential_runs_on_managed_backends():
         )
 
 
-def test_concurrent_run_endpoints_are_leased_and_collected_independently(stack):
-    from rl_insight.protocol import RunContext, proof_headers
-    from prometheus_client.parser import text_string_to_metric_families
+def test_direct_targets_have_run_ownership_and_independent_lifecycle(stack):
+    import yaml
 
     owners = [uuid4().hex, uuid4().hex]
-    contexts = []
-    for token in owners:
-        response = requests.post(
+    contexts = [
+        requests.post(
             stack.url + "/api/v1/runs",
             json={
                 "request_id": uuid4().hex,
-                "project": "shared",
+                "project": "same",
                 "experiment_name": "same",
-                "owner_token": token,
+                "owner_token": owner,
             },
             timeout=3,
-        )
-        response.raise_for_status()
-        contexts.append(RunContext.from_dict(response.json()))
-
-    @contextmanager
-    def exporter(context):
-        state = SimpleNamespace(
-            incarnation=uuid4().hex,
-            value=3,
-            delay=0,
-            documentation="Completed requests",
-        )
-
-        class Metrics(BaseHTTPRequestHandler):
-            def log_message(self, *_):
-                pass
-
-            def do_GET(self):
-                time.sleep(state.delay)
-                body = (
-                    f"# HELP requests {state.documentation}\n# TYPE requests counter\n"
-                    f'requests_total{{replica="0"}} {state.value}\n'
-                    "# HELP latency Latency\n# TYPE latency histogram\n"
-                    'latency_bucket{le="1"} 2\nlatency_bucket{le="+Inf"} 3\n'
-                    "latency_sum 1.5\nlatency_count 3\n"
-                ).encode()
-                self.send_response(200)
-                for name, value in proof_headers(context, state.incarnation).items():
-                    self.send_header(name, value)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                try:
-                    self.wfile.write(body)
-                except BrokenPipeError:
-                    pass
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Metrics)
-        thread = threading.Thread(target=server.serve_forever)
-        thread.start()
-        try:
-            state.url = f"http://127.0.0.1:{server.server_port}/metrics"
-            yield state
-        finally:
-            server.shutdown()
-            thread.join(5)
-            server.server_close()
-
-    with exporter(contexts[0]) as first, exporter(contexts[1]) as second:
-        leases = []
-        for context, source in zip(contexts, (first, second)):
-            payload = {
-                "component": "generic",
-                "instance": "same-slot",
-                "incarnation": source.incarnation,
-                "metrics_url": source.url,
-                "labels": {"job": "native"},
-            }
-            root = stack.url + "/api/v1/runs/" + context.run_id
-            response = requests.post(root + "/endpoints", json=payload, timeout=3)
-            assert response.status_code == 200, response.text
-            leases.append(response.json()["lease_id"])
-            assert (
-                requests.post(root + "/endpoints", json=payload, timeout=3).json()[
-                    "lease_id"
-                ]
-                == leases[-1]
-            )
-            samples = [
-                sample
-                for family in text_string_to_metric_families(
-                    requests.get(root + "/metrics", timeout=3).text
-                )
-                for sample in family.samples
-            ]
-            counter = next(
-                sample for sample in samples if sample.name == "requests_total"
-            )
-            assert counter.value == 3 and counter.labels["run_id"] == context.run_id
-            assert (
-                counter.labels["job"] == "native" and counter.labels["replica"] == "0"
-            )
-            assert (
-                next(sample for sample in samples if sample.name == "latency_sum").value
-                == 1.5
-            )
-
-        root_a = stack.url + "/api/v1/runs/" + contexts[0].run_id
-        root_b = stack.url + "/api/v1/runs/" + contexts[1].run_id
-        with exporter(contexts[1]) as extra:
-            payload = {
-                "component": "generic",
-                "instance": "extra",
-                "incarnation": extra.incarnation,
-                "metrics_url": extra.url,
-                "labels": {"job": "native"},
-            }
-            lease = requests.post(
-                root_b + "/endpoints", json=payload, timeout=3
-            ).json()["lease_id"]
-            extra.documentation = "Conflicting help"
-            assert requests.get(root_b + "/metrics", timeout=3).status_code == 503
-            assert requests.get(root_a + "/metrics", timeout=3).status_code == 200
-            extra.documentation = "Completed requests"
-            extra.incarnation = uuid4().hex
-            response = requests.get(root_b + "/metrics", timeout=3)
-            assert response.status_code == 200 and "requests_total{" in response.text
-            failed = next(
-                sample
-                for family in text_string_to_metric_families(response.text)
-                for sample in family.samples
-                if sample.name == "rl_insight_proxy_failures"
-            )
-            assert failed.value == 1
-            requests.delete(
-                root_b + "/endpoints/" + lease, timeout=3
-            ).raise_for_status()
-        annotated = requests.post(
-            stack.url + "/api/v1/prometheus/targets",
-            json={
-                "run_context": contexts[1].to_dict(),
-                "job_name": "native",
-                "targets": [
-                    {
-                        "target": second.url.split("://")[1].split("/")[0],
-                        "labels": {"worker": "worker-0"},
-                    }
-                ],
-            },
-            timeout=3,
-        )
-        assert annotated.status_code == 200, annotated.text
-        assert 'worker="worker-0"' in requests.get(root_b + "/metrics", timeout=3).text
-        assert (
-            second.url.split("://")[1].split("/")[0]
-            not in (stack.data / "targets/prometheus-targets.yml").read_text()
-        )
-        old = leases[0]
-        assert (
-            requests.delete(root_a + "/endpoints/" + old, timeout=3).status_code == 200
-        )
-        payload = {
-            "component": "generic",
-            "instance": "same-slot",
-            "incarnation": first.incarnation,
-            "metrics_url": first.url,
-            "labels": {"job": "native"},
+        ).json()
+        for owner in owners
+    ]
+    root = stack.url + "/api/v1/prometheus/targets"
+    payloads = [
+        {
+            "run_context": context,
+            "publisher_id": uuid4().hex,
+            "job_name": "native",
+            "targets": [{"target": f"worker-{i}:9000"}],
         }
-        leases[0] = requests.post(
-            root_a + "/endpoints", json=payload, timeout=3
-        ).json()["lease_id"]
-        assert leases[0] != old
-        assert requests.post(root_a + "/endpoints/" + old, timeout=3).status_code == 409
-        assert (
-            requests.delete(root_a + "/endpoints/" + old, timeout=3).status_code == 200
-        )
-        assert requests.get(root_a + "/metrics", timeout=3).status_code == 200
-        invalid_url = dict(payload, metrics_url="http://localhost:9000/metrics")
-        assert (
-            requests.post(
-                root_a + "/endpoints", json=invalid_url, timeout=3
-            ).status_code
-            == 400
-        )
-        first.delay = 1
-        with ThreadPoolExecutor(max_workers=16) as executor:
-            attempts = [
-                executor.submit(
-                    requests.post, root_a + "/endpoints", json=payload, timeout=3
-                )
-                for _ in range(16)
-            ]
-            time.sleep(0.15)
-            assert requests.get(root_b + "/metrics", timeout=1).status_code == 200
-            assert 503 in {attempt.result().status_code for attempt in attempts}
-        first.delay = 2
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            slow = executor.submit(
-                requests.get,
-                root_a + "/metrics",
-                headers={"X-Prometheus-Scrape-Timeout-Seconds": "0.5"},
-                timeout=3,
-            )
-            time.sleep(0.05)
-            assert requests.get(root_b + "/metrics", timeout=1).status_code == 200
-            assert slow.result().status_code == 503
-        first.delay = 0
-        first.incarnation = uuid4().hex
-        assert requests.get(root_a + "/metrics", timeout=3).status_code == 503
-        assert requests.get(root_b + "/metrics", timeout=3).status_code == 200
-        assert (
-            requests.post(
-                root_b + "/close", json={"owner_token": owners[0]}, timeout=3
-            ).status_code
-            == 409
-        )
-        assert (
-            requests.post(
-                root_a + "/close", json={"owner_token": owners[0]}, timeout=3
-            ).status_code
-            == 200
-        )
-        assert (
-            requests.post(root_a + "/endpoints/" + leases[0], timeout=3).status_code
-            == 409
-        )
-        assert requests.get(root_b + "/metrics", timeout=3).status_code == 200
+        for i, context in enumerate(contexts)
+    ]
+    # No exporter needs to be reachable by the server; only Prometheus scrapes it.
+    for payload in payloads:
+        response = requests.post(root, json=payload, timeout=3)
+        assert response.status_code == 200, response.text
+        assert response.json()["ttl"] > 0
+    groups = yaml.safe_load((stack.data / "targets/prometheus-targets.yml").read_text())
+    assert {g["targets"][0] for g in groups} == {"worker-0:9000", "worker-1:9000"}
+    assert {g["labels"]["run_id"] for g in groups} == {c["run_id"] for c in contexts}
+    assert not any("__metrics_path__" in g["labels"] for g in groups)
+    assert (
+        requests.get(
+            stack.url + "/api/v1/runs/" + contexts[0]["run_id"] + "/metrics", timeout=3
+        ).status_code
+        == 404
+    )
+    stolen = dict(payloads[1], targets=payloads[0]["targets"])
+    assert requests.post(root, json=stolen, timeout=3).status_code == 409
+    assert (
+        requests.post(
+            root, json=dict(payloads[0], publisher_id=uuid4().hex), timeout=3
+        ).status_code
+        == 409
+    )
+    closing = stack.url + "/api/v1/runs/" + contexts[0]["run_id"] + "/close"
+    assert (
+        requests.post(closing, json={"owner_token": owners[1]}, timeout=3).status_code
+        == 409
+    )
+    requests.post(
+        closing, json={"owner_token": owners[0], "prepare": True}, timeout=3
+    ).raise_for_status()
+    assert requests.post(root, json=payloads[0], timeout=3).status_code == 200
+    assert (
+        requests.post(
+            root, json=dict(payloads[0], targets=[{"target": "late:9000"}]), timeout=3
+        ).status_code
+        == 409
+    )
+    requests.post(
+        closing, json={"owner_token": owners[0]}, timeout=3
+    ).raise_for_status()
+    assert requests.post(root, json=payloads[0], timeout=3).status_code == 409
+    assert requests.post(root, json=payloads[1], timeout=3).status_code == 200
+    groups = yaml.safe_load((stack.data / "targets/prometheus-targets.yml").read_text())
+    assert [g["targets"] for g in groups] == [["worker-1:9000"]]
 
 
 def test_two_ray_jobs_keep_monitoring_when_one_finishes(stack, tmp_path):
@@ -1354,7 +1235,17 @@ def test_two_ray_jobs_keep_monitoring_when_one_finishes(stack, tmp_path):
         assert contexts[0]["run_id"] != contexts[1]["run_id"]
         for context in contexts:
             root = stack.url + "/api/v1/runs/" + context["run_id"]
-            response = requests.get(root + "/metrics", timeout=5)
+            import yaml
+
+            groups = yaml.safe_load(
+                (stack.data / "targets/prometheus-targets.yml").read_text()
+            )
+            address = next(
+                g["targets"][0]
+                for g in groups
+                if g["labels"].get("__rl_insight_run_id") == context["run_id"]
+            )
+            response = requests.get("http://" + address + "/metrics", timeout=5)
             assert response.status_code == 200, response.text
             assert 'run_id="' + context["run_id"] + '"' in response.text
             assert "rl_insight_monitor_loss" in response.text
@@ -1371,12 +1262,23 @@ def test_two_ray_jobs_keep_monitoring_when_one_finishes(stack, tmp_path):
         root_b = stack.url + "/api/v1/runs/" + contexts[1]["run_id"]
         assert (
             "rl_insight_monitor_loss"
-            in requests.get(root_b + "/metrics", timeout=5).text
+            in requests.get(
+                "http://"
+                + next(
+                    g["targets"][0]
+                    for g in yaml.safe_load(
+                        (stack.data / "targets/prometheus-targets.yml").read_text()
+                    )
+                    if g["labels"].get("__rl_insight_run_id") == contexts[1]["run_id"]
+                )
+                + "/metrics",
+                timeout=5,
+            ).text
         )
         assert requests.get(root_b, timeout=3).json()["status"] == "registered"
         releases[1].touch()
         assert children[1][0].wait(30) == 0, children[1][1].read_text()
-        discovery = (stack.data / "targets/run-targets.yml").read_text()
+        discovery = (stack.data / "targets/prometheus-targets.yml").read_text()
         assert (
             contexts[0]["run_id"] not in discovery
             and contexts[1]["run_id"] not in discovery
@@ -1393,170 +1295,97 @@ def test_two_ray_jobs_keep_monitoring_when_one_finishes(stack, tmp_path):
         ray.shutdown()
 
 
-@pytest.mark.parametrize("tls", [False, True])
-def test_generic_publishers_recover_same_run_and_expire_without_renewal(
-    stack, tmp_path, monkeypatch, tls
-):
-    import rl_insight as monitor
-    from fastapi import FastAPI
-    from fastapi.responses import Response
-    from prometheus_client import CollectorRegistry, Gauge, make_wsgi_app
-    from urllib.parse import urlsplit
-    from wsgiref.simple_server import make_server
-
-    tls_context = None
-    if tls:
-        import shutil
-        import ssl
-
-        openssl = shutil.which("openssl")
-        if openssl is None:
-            pytest.skip("TLS integration requires the system openssl executable")
-        config_path = tmp_path / "certificate.cnf"
-        config_path.write_text(
-            "[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=extensions\n[dn]\nCN=127.0.0.1\n[extensions]\nsubjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:TRUE\n"
-        )
-        key = tmp_path / "key.pem"
-        certificate = tmp_path / "certificate.pem"
-        subprocess.run(
-            [
-                openssl,
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-nodes",
-                "-days",
-                "1",
-                "-config",
-                str(config_path),
-                "-keyout",
-                str(key),
-                "-out",
-                str(certificate),
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-        )
-        monkeypatch.setenv("SSL_CERT_FILE", str(certificate))
-        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        tls_context.load_cert_chain(certificate, key)
+def test_direct_sdk_republishes_after_restart_and_expires(stack, tmp_path, monkeypatch):
+    import yaml
+    from rl_insight.protocol import RunContext
+    from rl_insight.utils.prometheus_utils import (
+        _register_targets,
+        _forget_targets,
+    )
 
     conf = OmegaConf.create(OmegaConf.to_container(stack.conf, resolve=True))
-    conf.server.data_dir = str(tmp_path / "recovery-data")
-    conf.server.runtime_dir = str(tmp_path / "recovery-runtime")
+    conf.server.data_dir = str(tmp_path / "recovery")
     conf.server.endpoint_ttl = 1
     conf.grafana.enable = False
-    service = serve(create_app(conf))
-    url = service.__enter__()
-    source = None
-    publisher = None
-    source_thread = None
-    try:
-        response = requests.post(
-            url + "/api/v1/runs", json={"request_id": uuid4().hex}, timeout=3
+    target_file = Path(conf.server.data_dir) / "targets/prometheus-targets.yml"
+    with serve(create_app(conf)) as url:
+        context = RunContext.from_dict(
+            requests.post(
+                url + "/api/v1/runs", json={"request_id": uuid4().hex}, timeout=3
+            ).json()
         )
-        context = monitor.RunContext.from_dict(response.json())
-        root = url + "/api/v1/runs/" + context.run_id
-        metrics = CollectorRegistry()
-        gauge = Gauge("native_value", "Native value", registry=metrics)
-        gauge.set(1)
-        incarnation = uuid4().hex
-        source = make_server(
-            "127.0.0.1",
-            0,
-            monitor.metrics_wsgi_app(make_wsgi_app(metrics), context, incarnation),
-        )
-        if tls_context is not None:
-            source.socket = tls_context.wrap_socket(source.socket, server_side=True)
-        source_thread = threading.Thread(target=source.serve_forever)
-        source_thread.start()
-        source_url = (
-            f"{'https' if tls else 'http'}://127.0.0.1:{source.server_port}/metrics"
-        )
-        description = {
-            "component": "native",
-            "instance": "wsgi",
-            "incarnation": incarnation,
-            "metrics_url": source_url,
-        }
-        publisher = monitor.publish_metrics_endpoint(
-            context,
-            source_url,
-            component="native",
-            instance="wsgi",
-            incarnation=incarnation,
-            alive=source_thread.is_alive,
-        )
-        old_lease = requests.post(
-            root + "/endpoints", json=description, timeout=3
-        ).json()["lease_id"]
-        before = requests.get(root + "/metrics", timeout=3).text
-        assert "native_value{" in before and "} 1.0" in before
-        service.__exit__(None, None, None)
-        service = None
-        gauge.set(2)
-        service = serve(create_app(conf), urlsplit(url).port)
-        assert service.__enter__() == url
-        assert (
-            requests.post(root + "/endpoints/" + old_lease, timeout=3).status_code
-            == 409
-        )
-        deadline = time.monotonic() + 6
-        while True:
-            response = requests.get(root + "/metrics", timeout=3)
-            if "native_value{" in response.text and "} 2.0" in response.text:
-                break
-            assert time.monotonic() < deadline, response.text
-            time.sleep(0.05)
-        assert (
-            requests.get(root, timeout=3).json()["context"]["run_id"] == context.run_id
-        )
-        native = FastAPI()
-
-        @native.get("/metrics")
-        def metrics_response():
-            return Response(
-                "# HELP native_asgi_requests Requests\n# TYPE native_asgi_requests counter\nnative_asgi_requests_total 4\n",
-                media_type="text/plain",
-            )
-
-        asgi_incarnation = uuid4().hex
-        with serve(
-            monitor.metrics_asgi_app(native, context, asgi_incarnation)
-        ) as asgi_url:
-            asgi_publisher = monitor.publish_metrics_endpoint(
-                context,
-                asgi_url + "/metrics",
-                component="native",
-                instance="asgi",
-                incarnation=asgi_incarnation,
-            )
-            try:
-                assert (
-                    "native_asgi_requests_total{"
-                    in requests.get(root + "/metrics", timeout=3).text
-                )
-            finally:
-                asgi_publisher.close()
-        publisher.close()
-        publisher = None
-        lease = requests.post(root + "/endpoints", json=description, timeout=3).json()[
-            "lease_id"
-        ]
-        deadline = time.monotonic() + 3
-        while "native_value{" in requests.get(root + "/metrics", timeout=3).text:
+        assert _register_targets(["native.example:9000"], "native", None, context)
+        assert "native.example:9000" in target_file.read_text()
+    with serve(create_app(conf), port=urlsplit(url).port):
+        deadline = time.monotonic() + 8
+        while "native.example:9000" not in target_file.read_text():
             assert time.monotonic() < deadline
             time.sleep(0.05)
-        assert requests.post(root + "/endpoints/" + lease, timeout=3).status_code == 409
-    finally:
-        if publisher is not None:
-            publisher.close()
-        if source is not None:
-            source.shutdown()
-            source.server_close()
-            source_thread.join(5)
-        if service is not None:
-            service.__exit__(None, None, None)
+        assert (
+            requests.get(url + "/api/v1/runs/" + context.run_id, timeout=3).json()[
+                "context"
+            ]
+            == context.to_dict()
+        )
+        # A restarted publisher first conflicts, then acquires the address after TTL.
+        import rl_insight.utils.prometheus_utils as tools
+
+        _forget_targets(context)
+        replacement = uuid4().hex
+        monkeypatch.setattr(tools, "_publisher_id", replacement)
+        assert not _register_targets(["native.example:9000"], "native", None, context)
+        deadline = time.monotonic() + 8
+        while not any(
+            g["labels"].get("__rl_insight_publisher") == replacement
+            for g in yaml.safe_load(target_file.read_text()) or []
+        ):
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        _forget_targets(context)
+        deadline = time.monotonic() + 8
+        while yaml.safe_load(target_file.read_text()):
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+
+
+def test_closing_run_restores_only_existing_targets_after_server_restart(
+    stack, tmp_path
+):
+    conf = OmegaConf.create(OmegaConf.to_container(stack.conf, resolve=True))
+    conf.server.data_dir = str(tmp_path / "closing")
+    conf.grafana.enable = False
+    owner = uuid4().hex
+    with serve(create_app(conf)) as url:
+        context = requests.post(
+            url + "/api/v1/runs",
+            json={"request_id": uuid4().hex, "owner_token": owner},
+            timeout=3,
+        ).json()
+        payload = {
+            "run_context": context,
+            "publisher_id": uuid4().hex,
+            "targets": ["closing.example:9000"],
+        }
+        requests.post(
+            url + "/api/v1/prometheus/targets", json=payload, timeout=3
+        ).raise_for_status()
+        close = url + "/api/v1/runs/" + context["run_id"] + "/close"
+        requests.post(
+            close, json={"owner_token": owner, "prepare": True}, timeout=3
+        ).raise_for_status()
+    with serve(create_app(conf), port=urlsplit(url).port):
+        assert (
+            requests.post(
+                url + "/api/v1/prometheus/targets", json=payload, timeout=3
+            ).status_code
+            == 200
+        )
+        assert (
+            requests.post(
+                url + "/api/v1/prometheus/targets",
+                json=dict(payload, targets=["new.example:9000"]),
+                timeout=3,
+            ).status_code
+            == 409
+        )
+        requests.post(close, json={"owner_token": owner}, timeout=3).raise_for_status()

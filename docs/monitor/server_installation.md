@@ -288,101 +288,77 @@ metrics in the selected time range; changing Project or the range refreshes the 
 
 ## Concurrent Run Monitoring
 
-Start one shared server stack with the existing commands. Use one server process
-per stack; the ephemeral endpoint leases are not a distributed registry. Independent training
-jobs use the same `server.url` and existing API. The default Hub metrics port
-is now `0`: the operating system allocates a port when the HTTP server binds.
-Workers connect to their own job's Hub and obtain the same RunContext. Explicit
-fixed ports remain supported and fail clearly on conflicts. To retain the PR201
-Hub port, explicitly set `prometheus.metrics_report_port: 9092`. Static scrape
-targets and network policies must otherwise accommodate dynamic Hub ports.
-Restart the shared stack to install its new Run scrape job before upgrading jobs.
+Independent training jobs can share the same server, Prometheus, Tempo and Grafana.
+Use the existing API and server URL. Each Ray job has its own Hub and RunContext;
+the default Hub port is `0`, so the OS allocates a free port. Explicit fixed ports
+remain supported; set `prometheus.metrics_report_port: 9092` to retain the old
+port, or give concurrent jobs different fixed ports.
 
 ```python
 import ray
 import rl_insight
 
-config = {"server": {"url": "http://<server-host>:18080"}}
 ray.init(address="auto")
-rl_insight.init(project="demo", experiment_name="same-name", config=config)
-# Pass the same config to workers; an existing Ray cluster does not automatically
-# inherit environment variables from a newly connected driver.
+rl_insight.init(
+    project="demo", experiment_name="same-name",
+    config={"server": {"url": "http://<server-host>:18080"}},
+)
 rl_insight.metric_gauge("loss", 0.25)
 rl_insight.finish()
 ```
 
-The Hub creator owns Run shutdown. A worker's finish flushes its submissions
-and clears its local client, without ending other workers or the shared Hub.
-Creator finish fences late events, flushes OTLP and waits for the final SDK scrape
-marker before closing its Run. The existing 30/35-second flush budgets remain;
-endpoint and HTTP cleanup are separately bounded. `run.json` records closing /
-ended status and `final_collection_confirmed`. A failed flush still permits
-cleanup; it does not claim final data delivery.
+Pass the same configuration/environment to workers. Connecting a driver to an
+existing Ray cluster does not propagate its environment automatically. Existing
+framework integrations can keep their `update_prometheus_config` calls; no
+framework-specific adapter or exporter wrapper is required.
 
-Leased endpoints are registered using `/api/v1/runs/<run_id>/endpoints`.
-Prometheus scrapes `/api/v1/runs/<run_id>/metrics` through the same server port.
-The existing file_sd mechanism discovers one target per active Run; managed
-endpoints are removed from direct target groups to prevent duplicate sampling.
-The Run scrape job uses `honor_labels` to preserve endpoint job/instance labels.
-Legacy targets for a normally closed Run are also removed. Targets in manually
-configured static jobs remain the deployment owner's responsibility.
+### Direct collection and target lifetime
 
-Strict endpoints publish literal IPv4/IPv6 addresses; server-side collection
-does not perform DNS resolution. The server connection URL can still use a
-hostname.
+Prometheus scrapes the actual Hub/native exporter addresses. The server manages
+registration through the existing `/api/v1/prometheus/targets` route and writes
+the existing file_sd file. It does not fetch or aggregate exporter metrics.
+**Prometheus must be able to reach each exporter address and dynamic port**, even
+when the server is on another machine. Trace OTLP and Run-scoped dashboard queries
+follow the PR201 paths unchanged.
 
-The server verifies the actual response Run/incarnation and the current lease;
-TTL alone is not proof of endpoint identity. Default TTL is 30 seconds, renewed
-at one-third TTL. `server.endpoint_ttl` can set 1–3600 seconds. On server restart
-active leases are discarded; publishers re-register the same Run and endpoint,
-without creating a new Run. Ended Runs cannot be reactivated. Hub/job failure
-replay and multiple sequential Runs inside one Ray job are outside this version.
+With RunContext, the new SDK automatically includes a process-level publisher ID
+and renews registrations using one background thread per process. Default TTL is
+30 seconds, renewed every TTL/3; `server.endpoint_ttl` accepts 1–3600 seconds.
+The server removes expired targets within an additional 5 seconds; Prometheus
+then observes its usual file_sd refresh. A process that dies stops renewing.
+An exporter stopped inside a still-running publisher process is reported through
+Prometheus `up=0`; endpoint health is not inferred by the server.
 
-Standard WSGI/ASGI applications can reuse the public response wrappers and
-publisher, without server changes or framework-specific adapters:
+One address cannot belong to different active Runs or publishers. Target metadata
+retains Run ownership even when samples already contain run_id. Internal discovery
+labels do not appear in stored metrics. No new component/endpoint labels or metric
+names are added. Original scrape profiles, including native metric options, remain
+in effect.
 
-```python
-from uuid import uuid4
-import rl_insight
+The Hub creator owns Run shutdown. Worker `finish()` only flushes; creator finish
+first closes admission, waits for the existing final SDK scrape/OTLP flush, then
+ends this Run and removes only its targets. Existing targets can renew while
+closing. Call creator finish after workers have finished. Run metadata records
+ended status and final collection confirmation; failed flush never claims delivery.
+Historical metrics/traces remain queryable. This does not guarantee a final scrape
+of native exporters that exit independently.
 
-context = rl_insight.get_context()  # Obtain in an initialized job.
-incarnation = uuid4().hex
-app = rl_insight.metrics_asgi_app(app, context, incarnation)
-# Start the wrapped app using your existing HTTP runtime, then use its actual
-# bound address (not a port guessed before binding).
-publisher = rl_insight.publish_metrics_endpoint(
-    context, actual_metrics_url,
-    component="native", instance="replica-0", incarnation=incarnation,
-    labels={"job": "native", "replica": "0"},
-)
-# Keep the publisher for the endpoint's lifetime and close it before shutdown.
-publisher.close()
-```
+Use one server process per stack. Run metadata survives restart, but renewable
+target state is ephemeral: on restart the server clears stale discovery entries,
+and live SDK processes re-register the same Run. A short collection gap is possible.
+There is no distributed registry or HA guarantee.
 
-`metrics_wsgi_app` supports the same identity contract for a WSGI application.
-Wrapping and publication are explicit; this version does not globally patch
-HTTP libraries or auto-discover all vLLM/TQ applications. Existing address-only
-`update_prometheus_config` calls keep their direct collection behavior. They do
-not acquire proof/lease guarantees merely by supplying a URL; publisher handles
-must own renewal. An already proved address cannot also enter direct collection.
-Compatibility registration can add nonconflicting description labels to an
-already proved endpoint without creating another publisher or extending its
-lease. Publishers absorb those labels on renewal for subsequent re-registration.
-The independent push backend and its poller/sinks are unchanged.
+### Compatibility and limits
 
-Each Run has at most four concurrent endpoint reads (including registration
-verification), with a shared sixteen-slot
-pool; endpoints per Run are limited to 64. Responses are bounded to 4 MiB per
-endpoint and 16 MiB per aggregate. Collection respects the
-[X-Prometheus-Scrape-Timeout-Seconds header](https://github.com/prometheus/prometheus/blob/main/scrape/scrape.go)
-with response margin, capped at nine seconds. HTTP reads have a socket deadline;
-one slow endpoint cannot create an unlimited queue or consume the entire pool.
-Supported exposition is Prometheus text 0.0.4; OpenMetrics/exemplars are not
-claimed as losslessly forwarded.
+Old clients without a publisher ID retain persistent target registration; they
+do not gain automatic expiry. Run-less/manual registrations remain persistent.
+New SDKs talking to a PR201 server retain direct scraping, but cannot gain renewal
+or owner-close guarantees that server does not support. Upgrade the shared server
+first. The separate push backend is unchanged; platform mode and external
+forwarding are outside this feature.
 
-Partial failures return successful samples plus `rl_insight_proxy_endpoint_up`,
-`rl_insight_proxy_endpoints`, `rl_insight_proxy_failures` and
-`rl_insight_proxy_empty`. All-endpoint failure returns 503. An empty Run returns
-an explicit empty marker. Proxy target up does not mean every exporter is healthy.
-Original Grafana layouts, execution filtering, queries and trace collection are reused;
-no dashboard copies or new UI modules are added.
+Direct scraping does not verify response ownership on every scrape. Registration
+ownership and TTL reduce stale target lifetime but do not eliminate address reuse
+inside that window. Run isolation is not tenant authentication. Concurrency and
+scrape budgets are controlled by Prometheus; this version adds no server-side
+metric parsing pool or throughput limit.

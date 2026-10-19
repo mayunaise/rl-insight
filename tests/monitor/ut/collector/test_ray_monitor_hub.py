@@ -34,6 +34,7 @@ HubImplementation = cast(
 @pytest.fixture
 def hub() -> Any:
     instance = HubImplementation.__new__(HubImplementation)
+    instance._context = None
     instance._registry = MagicMock()
     instance._trace_collector = MagicMock(enabled=True)
     instance._events_applied = 0
@@ -172,7 +173,6 @@ def test_end_run_releases_local_endpoint_even_when_server_is_unavailable(hub):
     with pytest.raises(RuntimeError, match="server offline"):
         hub.end_run("owner")
     assert hub._closed and hub._closing
-    hub._metrics_server.publisher.close.assert_called_once()
     hub._metrics_server.shutdown.assert_called_once()
     hub._metrics_server.server_close.assert_called_once()
     with pytest.raises(ValueError, match="closing"):

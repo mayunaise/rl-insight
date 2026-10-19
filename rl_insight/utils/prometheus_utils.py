@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
-from ..protocol import RunContext, proof_headers, endpoint_description
+from ..protocol import RunContext, RunError
 
 import requests
 import yaml
@@ -87,9 +87,6 @@ __all__ = [
     "PrometheusTargetStore",
     "start_metrics_http_server",
     "update_prometheus_config",
-    "metrics_wsgi_app",
-    "metrics_asgi_app",
-    "publish_metrics_endpoint",
 ]
 
 
@@ -246,32 +243,36 @@ class PrometheusTargetStore:
                 target_map[(stored_job, str(target))] = dict(labels)
         return target_map
 
-    def project_runs(self, endpoints, server_address, ended_runs=()):
-        """Project active Runs and remove their managed direct targets under one lock."""
-        from urllib.parse import urlsplit
-
+    def check_ownership(self, targets, run_id):
         with self._lock, self._file_lock():
-            direct = self._read_targets()
-            addresses = {urlsplit(item["metrics_url"]).netloc for item in endpoints}
+            addresses = {t.target for t in targets}
+            for (_, address), labels in self._read_targets().items():
+                owner = labels.get("__rl_insight_run_id", labels.get("run_id"))
+                if address in addresses and owner != run_id:
+                    raise RunError(
+                        "Target address already has different Run ownership", 409
+                    )
+
+    def project_runs(self, targets, ended_runs=()):
+        """Keep legacy registrations and project renewable targets into existing file_sd."""
+        with self._lock, self._file_lock():
             direct = {
                 key: labels
-                for key, labels in direct.items()
-                if key[1] not in addresses and labels.get("run_id") not in ended_runs
+                for key, labels in self._read_targets().items()
+                if "__rl_insight_publisher" not in labels
+                and labels.get("__rl_insight_run_id", labels.get("run_id"))
+                not in ended_runs
             }
-            self._write_targets(direct)
-            runs = sorted({item["run_id"] for item in endpoints})
-            path = self.targets_file.with_name("run-targets.yml")
-            payload = [
+            direct.update(
                 {
-                    "targets": [server_address],
-                    "labels": {
-                        "run_id": run_id,
-                        "__metrics_path__": "/api/v1/runs/" + run_id + "/metrics",
-                    },
+                    (item["job_name"], item["target"]): {
+                        **item["labels"],
+                        "__rl_insight_publisher": item["publisher_id"],
+                    }
+                    for item in targets
                 }
-                for run_id in runs
-            ]
-            self._write_discovery(path, yaml.safe_dump(payload))
+            )
+            self._write_targets(direct)
 
     def reload(self) -> bool:
         url = (
@@ -306,162 +307,9 @@ def _merge_labels(
     return out
 
 
-def metrics_wsgi_app(app, context: RunContext, incarnation: str):
-    """Wrap a standard WSGI application with a stable exporter response identity."""
-    headers = proof_headers(context, incarnation)
-
-    def wrapped(environ, start_response):
-        def respond(status, supplied, exc_info=None):
-            clean = [
-                (k, v)
-                for k, v in supplied
-                if k.lower() not in {key.lower() for key in headers}
-            ]
-            return start_response(status, clean + list(headers.items()), exc_info)
-
-        return app(environ, respond)
-
-    return wrapped
-
-
-def metrics_asgi_app(app, context: RunContext, incarnation: str):
-    """Wrap the public ASGI response boundary; no framework objects are inspected."""
-    headers = [
-        (key.lower().encode(), value.encode())
-        for key, value in proof_headers(context, incarnation).items()
-    ]
-
-    async def wrapped(scope, receive, send):
-        async def respond(message):
-            if message["type"] == "http.response.start":
-                message = dict(message)
-                message["headers"] = [
-                    (k, v)
-                    for k, v in message.get("headers", [])
-                    if k.lower() not in {key for key, _ in headers}
-                ] + headers
-            await send(message)
-
-        await app(scope, receive, respond)
-
-    return wrapped
-
-
-class EndpointPublisher:
-    """Own one endpoint lease and re-register it after server recovery."""
-
-    def __init__(self, context, description, *, alive=None):
-        self.context = context
-        self.description = endpoint_description(context, description)
-        self._root = (
-            context.server_url + "/api/v1/runs/" + context.run_id + "/endpoints"
-        )
-        self._alive = alive or (lambda: True)
-        self._stop = threading.Event()
-        self._session = requests.Session()
-        self._session.trust_env = False
-        self._lease = None
-        try:
-            self._register()
-        except Exception:
-            self._session.close()
-            raise
-        self._thread = threading.Thread(
-            target=self._renew, name="insight-endpoint", daemon=True
-        )
-        self._thread.start()
-
-    def _register(self):
-        response = self._session.post(self._root, json=self.description, timeout=(2, 4))
-        response.raise_for_status()
-        lease = response.json()
-        self._lease = lease["lease_id"]
-        self._interval = max(0.25, lease["ttl"] / 3)
-        self.description["labels"] = lease["labels"]
-
-    def _renew(self):
-        while not self._stop.wait(self._interval) and self._alive():
-            try:
-                response = self._session.post(
-                    self._root + "/" + self._lease, timeout=(2, 4)
-                )
-                if response.status_code == 409:
-                    self._register()
-                else:
-                    response.raise_for_status()
-                    self.description["labels"] = response.json()["labels"]
-            except requests.RequestException as exc:
-                if getattr(exc.response, "status_code", None) == 409:
-                    logger.warning("Endpoint publication stopped: %s", exc)
-                    break
-                logger.warning("Endpoint renewal failed; will retry: %s", exc)
-
-    def close(self):
-        self._stop.set()
-        self._thread.join(7)
-        if self._thread.is_alive():
-            logger.warning("Endpoint renewal did not stop within its budget")
-            return
-        try:
-            if self._lease:
-                response = self._session.delete(
-                    self._root + "/" + self._lease, timeout=(2, 3)
-                )
-                response.raise_for_status()
-        except requests.RequestException:
-            logger.warning("Endpoint revocation failed; lease will expire")
-        finally:
-            self._session.close()
-
-
-def publish_metrics_endpoint(
-    context: RunContext,
-    metrics_url: str,
-    *,
-    component: str,
-    instance: str,
-    incarnation: str,
-    labels=None,
-    alive=None,
-):
-    """Publish a bound, proof-wrapped endpoint; retain the handle until shutdown."""
-    return EndpointPublisher(
-        context,
-        {
-            "metrics_url": metrics_url,
-            "component": component,
-            "instance": instance,
-            "incarnation": incarnation,
-            "labels": labels or {},
-        },
-        alive=alive,
-    )
-
-
-def start_metrics_http_server(
-    port: int, addr: str = "", *, context: RunContext | None = None
-):
+def start_metrics_http_server(port: int, addr: str = ""):
     """Bind once and return the actual HTTP server/thread; port 0 allocates a port."""
-    addr = addr.strip("[]") if addr else addr
-    server, thread = start_http_server(port, addr=addr)
-    if context:
-        incarnation = uuid4().hex
-        server.set_app(metrics_wsgi_app(server.get_app(), context, incarnation))
-        try:
-            server.publisher = publish_metrics_endpoint(
-                context,
-                "http://" + format_host_port(addr, server.server_port) + "/metrics",
-                component="hub",
-                instance="hub",
-                incarnation=incarnation,
-                labels={"job": PrometheusScrape.TRAINER_METRICS_JOB},
-                alive=thread.is_alive,
-            )
-        except Exception:
-            server.shutdown()
-            server.server_close()
-            raise
-    return server, thread
+    return start_http_server(port, addr=addr.strip("[]") if addr else addr)
 
 
 class MetricRegistry:
@@ -732,6 +580,85 @@ def update_prometheus_config(
     )
 
 
+_publisher_id = uuid4().hex
+_target_publications: dict[tuple[str, str, str, str], tuple[dict[str, Any], float]] = {}
+_publication_lock = threading.Lock()
+_publication_thread: threading.Thread | None = None
+
+
+def _forget_targets(context: RunContext | None) -> None:
+    if context is not None:
+        with _publication_lock:
+            for key in list(_target_publications):
+                if key[:2] == (context.server_url, context.run_id):
+                    del _target_publications[key]
+
+
+def _post_targets(base_url, payload):
+    response = requests.post(
+        base_url + "/api/v1/prometheus/targets", json=payload, timeout=10
+    )
+    response.raise_for_status()
+    result = response.json()
+    ttl = result.get("ttl") if isinstance(result, dict) else None
+    return (
+        max(0.25, float(ttl) / 3)
+        if isinstance(ttl, (int, float)) and 1 <= ttl <= 3600
+        else None
+    )
+
+
+def _registration_retry(base_url, payload, error):
+    code = getattr(error.response, "status_code", None)
+    if code == 409:
+        try:
+            response = requests.get(
+                base_url + "/api/v1/runs/" + payload["run_context"]["run_id"], timeout=5
+            )
+            if response.status_code == 404 or (
+                response.status_code == 200 and response.json().get("status") == "ended"
+            ):
+                return None
+        except requests.RequestException:
+            pass
+    elif code is not None and 400 <= code < 500 and code not in {408, 429}:
+        return None
+    return 1.0
+
+
+def _renew_targets():
+    """One process-level renewal loop; no exporter-specific integration is needed."""
+    global _publication_thread
+    while True:
+        with _publication_lock:
+            if not _target_publications:
+                _publication_thread = None
+                return
+            ready = [
+                (key, value)
+                for key, value in _target_publications.items()
+                if value[1] <= time.monotonic()
+            ]
+        for key, (payload, _) in ready:
+            delay = 1.0
+            try:
+                delay = _post_targets(key[0], payload)
+            except requests.RequestException as exc:
+                delay = _registration_retry(key[0], payload, exc)
+                logger.warning("Target renewal failed: %s", exc)
+            with _publication_lock:
+                if (
+                    key not in _target_publications
+                    or _target_publications[key][0] is not payload
+                ):
+                    continue
+                if delay is None:
+                    _target_publications.pop(key, None)
+                else:
+                    _target_publications[key] = (payload, time.monotonic() + delay)
+        time.sleep(0.1)
+
+
 def _register_targets(
     server_addresses: list[str],
     job_name: str | None,
@@ -740,7 +667,7 @@ def _register_targets(
     *,
     identity_in_metrics: bool = False,
 ) -> bool:
-    """Report success so deferred targets remain queued after a failed request."""
+    global _publication_thread
     base_url = (
         context.server_url
         if context
@@ -753,23 +680,33 @@ def _register_targets(
         "targets": _build_target_payload(server_addresses, labels),
     }
     if context:
-        payload["run_context"] = context.to_dict()
-        payload["identity_in_metrics"] = identity_in_metrics
-    url = f"{base_url}/api/v1/prometheus/targets"
+        payload.update(
+            run_context=context.to_dict(),
+            identity_in_metrics=identity_in_metrics,
+            publisher_id=_publisher_id,
+        )
+    success, delay = True, None
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        response.raise_for_status()
-        print(
-            f"[rl-insight] Registered {len(server_addresses)} Prometheus targets "
-            f"with RL-Insight server (job_name={payload['job_name']})"
-        )
-        return True
+        delay = _post_targets(base_url, payload)
     except requests.RequestException as exc:
-        logger.error(
-            "[rl-insight] Failed to register Prometheus targets at %s: %s", url, exc
-        )
-
-    return False
+        success = False
+        delay = _registration_retry(base_url, payload, exc) if context else None
+        logger.warning("Target registration failed: %s", exc)
+    if context and delay is not None:
+        with _publication_lock:
+            for target in payload["targets"]:
+                key = (base_url, context.run_id, payload["job_name"], target["target"])
+                # Publish each target independently so later updates replace its labels.
+                _target_publications[key] = (
+                    {**payload, "targets": [target]},
+                    time.monotonic() + delay,
+                )
+            if _publication_thread is None or not _publication_thread.is_alive():
+                _publication_thread = threading.Thread(
+                    target=_renew_targets, name="insight-targets", daemon=True
+                )
+                _publication_thread.start()
+    return success
 
 
 def _build_target_payload(

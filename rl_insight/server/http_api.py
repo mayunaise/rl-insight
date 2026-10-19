@@ -19,16 +19,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import os
 import re
 import time
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Event, Lock, RLock, Thread
 from typing import Any
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlsplit
 
 import requests
 import uvicorn
@@ -37,13 +36,12 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from omegaconf import DictConfig, OmegaConf
 from starlette.concurrency import run_in_threadpool
 
-from ..protocol import RunContext, RunError, endpoint_description
+from ..protocol import RunContext, RunError
 from ..utils.constants import MonitorEnv, MonitorPaths, MonitorServer, PrometheusScrape
 from ..utils.monitor_config_loader import load_server_config_file
 from ..utils.prometheus_utils import PrometheusTarget, PrometheusTargetStore
 from .network import format_host_port, local_addresses
 from .registry import RunRegistry
-from .collection import Collection
 
 logger = logging.getLogger(__name__)
 
@@ -105,16 +103,13 @@ def create_app(conf: DictConfig) -> FastAPI:
         lease_ttl=float(OmegaConf.select(conf, "server.endpoint_ttl", default=30)),
     )
 
-    collection = Collection(registry)
+    discovery_lock = RLock()
     stop_projection = Event()
     store = PrometheusTargetStore.from_config(conf)
 
     def project():
-        address = format_host_port(
-            local_addresses()["loopback"],
-            int(OmegaConf.select(conf, "server.port", default=18080)),
-        )
-        store.project_runs(registry.endpoints(), address, registry.ended_runs())
+        with discovery_lock:
+            store.project_runs(registry.targets(), registry.ended_runs())
 
     def projection_loop():
         while not stop_projection.wait(5):
@@ -137,7 +132,6 @@ def create_app(conf: DictConfig) -> FastAPI:
             stop_projection.set()
             if "thread" in locals():
                 await run_in_threadpool(thread.join, 6)
-            await run_in_threadpool(collection.close)
             registry.close()
 
     app = FastAPI(title="RL-Insight server", version="0.1.0", lifespan=lifespan)
@@ -169,50 +163,17 @@ def create_app(conf: DictConfig) -> FastAPI:
     def get_run(run_id: str):
         return registry.snapshot(run_id)
 
-    @app.post("/api/v1/runs/{run_id}/endpoints")
-    def register_endpoint(run_id: str, payload: dict[str, Any] = Body(...)):
-        description = endpoint_description(registry.get(run_id), payload)
-        registry.assert_open(run_id)
-        collection.verify(description)
-        lease = registry.register_endpoint(description)
-        project()
-        return lease
-
-    @app.post("/api/v1/runs/{run_id}/endpoints/{lease_id}")
-    def renew_endpoint(run_id: str, lease_id: str):
-        return registry.renew_endpoint(run_id, lease_id)
-
-    @app.delete("/api/v1/runs/{run_id}/endpoints/{lease_id}")
-    def revoke_endpoint(run_id: str, lease_id: str):
-        registry.revoke_endpoint(run_id, lease_id)
-        project()
-        return {"status": "ok"}
-
-    @app.get("/api/v1/runs/{run_id}/metrics")
-    def collect_metrics(run_id: str, request: Request):
-        timeout = 9.0
-        supplied = request.headers.get("X-Prometheus-Scrape-Timeout-Seconds")
-        if supplied is not None:
-            try:
-                seconds = float(supplied)
-                if not math.isfinite(seconds) or seconds <= 0:
-                    raise ValueError
-                timeout = min(timeout, seconds - min(1.0, seconds * 0.2))
-            except ValueError as exc:
-                raise RunError("Invalid scrape timeout") from exc
-        code, body = collection.collect(run_id, timeout)
-        return Response(body, status_code=code, media_type="text/plain; version=0.0.4")
-
     @app.post("/api/v1/runs/{run_id}/close")
     def close_run(run_id: str, payload: dict[str, Any] = Body(...)):
         state = "closing" if payload.get("prepare") is True else "ended"
-        registry.transition(
-            run_id,
-            payload.get("owner_token", ""),
-            state,
-            payload.get("final_collection_confirmed"),
-        )
-        project()
+        with discovery_lock:
+            registry.transition(
+                run_id,
+                payload.get("owner_token", ""),
+                state,
+                payload.get("final_collection_confirmed"),
+            )
+            project()
         return {"status": state}
 
     @app.get("/healthz")
@@ -226,7 +187,7 @@ def create_app(conf: DictConfig) -> FastAPI:
         return {
             "status": "ok",
             "run_context_version": 1,
-            "endpoint_registration_version": 1,
+            "target_registration_version": 1,
             "otlp_port": (
                 int(OmegaConf.select(conf, "otel.otel_port"))
                 if bool(OmegaConf.select(conf, "tempo.enable", default=True))
@@ -290,11 +251,31 @@ def create_app(conf: DictConfig) -> FastAPI:
                 detail="each target must be either a string or an object",
             )
 
+        for target in targets:
+            try:
+                address = urlsplit("//" + target.target)
+                if (
+                    not address.hostname
+                    or address.port is None
+                    or not 1 <= address.port <= 65535
+                    or address.path
+                    or address.query
+                    or address.fragment
+                    or address.username
+                    or address.password
+                    or any(c.isspace() for c in target.target)
+                ):
+                    raise ValueError
+            except ValueError as exc:
+                raise RunError("Target must be host:port or [ipv6]:port") from exc
+            if any(key.startswith("__rl_insight_") for key in target.labels):
+                raise RunError("Reserved target ownership label")
+
         job_name = str(payload.get("job_name") or PrometheusScrape.TRAINER_METRICS_JOB)
+        context = None
         if "run_context" in payload:
             supplied = RunContext.from_dict(payload["run_context"])
             context = registry.get(supplied.run_id)
-            registry.assert_open(context.run_id, allow_closing=False)
             if context != supplied:
                 raise RunError("RunContext conflicts with registered metadata", 409)
             targets = [
@@ -310,30 +291,35 @@ def create_app(conf: DictConfig) -> FastAPI:
                     )
                     for target in targets
                 ]
-        active = {
-            item["metrics_url"].split("://", 1)[1].split("/", 1)[0]: item
-            for item in registry.endpoints()
-        }
-        for target in targets:
-            if (
-                target.target in active
-                and payload.get("run_context", {}).get("run_id")
-                != active[target.target]["run_id"]
-            ):
-                raise RunError("Target already belongs to a proved publisher", 409)
-            if target.target in active:
-                registry.annotate_endpoint(
-                    active[target.target]["lease_id"],
-                    {"job": job_name, **target.labels},
-                )
-        targets = [target for target in targets if target.target not in active]
-        try:
-            result = store.register(job_name, targets)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=str(exc),
-            ) from exc
+        with discovery_lock:
+            if context:
+                registry.assert_open(context.run_id)
+                # Internal labels retain ownership when Hub samples already carry run_id.
+                targets = [
+                    PrometheusTarget(
+                        t.target, {**t.labels, "__rl_insight_run_id": context.run_id}
+                    )
+                    for t in targets
+                ]
+            publisher_id = payload.get("publisher_id")
+            try:
+                project()  # Remove expired ownership before admitting a reused address.
+                store.check_ownership(targets, context.run_id if context else None)
+                if publisher_id:
+                    if context is None:
+                        raise RunError("Publisher registration requires RunContext")
+                    ttl = registry.register_targets(
+                        context, publisher_id, job_name, targets
+                    )
+                    project()
+                    return {"status": "ok", "ttl": ttl}
+                if context:
+                    registry.assert_open(context.run_id, allow_closing=False)
+                result = store.register(job_name, targets)
+            except RunError:
+                raise
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         reloaded = False
         try:

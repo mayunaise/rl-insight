@@ -572,20 +572,6 @@ def _render_prometheus_config(conf: DictConfig, runtime_dir: Path) -> Path:
         )
     )
     scrape_configs.extend(managed_jobs)
-    scrape_configs.append(
-        {
-            "job_name": _available_prometheus_job_name(
-                scrape_configs, base="rl-insight-runs"
-            ),
-            "honor_labels": True,
-            "file_sd_configs": [
-                {
-                    "files": [str(targets_file.with_name("run-targets.yml"))],
-                    "refresh_interval": PrometheusScrape.TARGETS_REFRESH_INTERVAL,
-                }
-            ],
-        }
-    )
     data["scrape_configs"] = scrape_configs
     _write_yaml_atomically(target, data)
     return target
@@ -678,12 +664,6 @@ def _is_managed_prometheus_job(item: Any, targets_file: Path) -> bool:
     if not isinstance(item, dict):
         return False
     name = str(item.get("job_name") or "")
-    if name.startswith("rl-insight-runs") and item.get("honor_labels") is True:
-        return any(
-            isinstance(config, dict)
-            and config.get("files") == [str(targets_file.with_name("run-targets.yml"))]
-            for config in item.get("file_sd_configs", [])
-        )
     if not name.startswith(PrometheusScrape.DYNAMIC_CONFIG_JOB):
         return False
     file_sd_configs = item.get("file_sd_configs") or []
@@ -700,14 +680,13 @@ def _is_managed_prometheus_job(item: Any, targets_file: Path) -> bool:
     )
 
 
-def _available_prometheus_job_name(
-    scrape_configs: list[Any], *, base: str = PrometheusScrape.DYNAMIC_CONFIG_JOB
-) -> str:
+def _available_prometheus_job_name(scrape_configs: list[Any]) -> str:
     used_names = {
         str(item.get("job_name"))
         for item in scrape_configs
         if isinstance(item, dict) and item.get("job_name") is not None
     }
+    base = PrometheusScrape.DYNAMIC_CONFIG_JOB
     if base not in used_names:
         return base
     suffix = 1

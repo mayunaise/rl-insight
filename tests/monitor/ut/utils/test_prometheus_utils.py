@@ -282,13 +282,9 @@ def test_discovery_projection_retries_windows_sharing_and_skips_unchanged_files(
 
     monkeypatch.setattr(prometheus_module.os, "replace", busy_once)
     monkeypatch.setattr(prometheus_module.time, "sleep", lambda _: None)
-    store.project_runs([], "127.0.0.1:18080")
+    store.project_runs([])
     assert yaml.safe_load(targets.read_text(encoding="utf-8")) == []
-    assert (
-        yaml.safe_load(targets.with_name("run-targets.yml").read_text(encoding="utf-8"))
-        == []
-    )
-    assert list(attempts.values()) == [2, 2]
-    store.project_runs([], "127.0.0.1:18080")
-    assert list(attempts.values()) == [2, 2]
+    assert list(attempts.values()) == [2]
+    store.project_runs([])
+    assert list(attempts.values()) == [2]
     assert not list(tmp_path.glob("*.tmp"))

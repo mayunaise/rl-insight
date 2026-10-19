@@ -90,17 +90,7 @@ def test_render_prometheus_config_should_reference_and_preserve_file_sd_targets(
                 },
                 {"regex": "rl_insight_job", "action": "labeldrop"},
             ],
-        },
-        {
-            "job_name": "rl-insight-runs",
-            "honor_labels": True,
-            "file_sd_configs": [
-                {
-                    "files": [str(targets_file.with_name("run-targets.yml"))],
-                    "refresh_interval": "5s",
-                }
-            ],
-        },
+        }
     ]
 
 
@@ -234,37 +224,12 @@ def test_render_prometheus_config_should_migrate_only_runtime_added_targets(
     ]
 
 
-@pytest.mark.parametrize(
-    "job_name,expected",
-    [
-        (
-            "rl-insight-dynamic",
-            [
-                "rl-insight-dynamic",
-                "rl-insight-dynamic-1",
-                "rl-insight-dynamic-2",
-                "rl-insight-runs",
-            ],
-        ),
-        (
-            "rl-insight-runs",
-            [
-                "rl-insight-runs",
-                "rl-insight-dynamic",
-                "rl-insight-dynamic-1",
-                "rl-insight-runs-1",
-            ],
-        ),
-    ],
-)
 def test_render_prometheus_config_should_preserve_colliding_custom_job(
     tmp_path,
-    job_name,
-    expected,
 ) -> None:
     source = tmp_path / "source-prometheus.yml"
     custom_job = {
-        "job_name": job_name,
+        "job_name": "rl-insight-dynamic",
         "static_configs": [{"targets": ["custom:9090"]}],
     }
     source.write_text(
@@ -279,7 +244,11 @@ def test_render_prometheus_config_should_preserve_colliding_custom_job(
 
     jobs = yaml.safe_load(rendered_path.read_text(encoding="utf-8"))["scrape_configs"]
     assert jobs[0] == custom_job
-    assert [job["job_name"] for job in jobs] == expected
+    assert [job["job_name"] for job in jobs] == [
+        "rl-insight-dynamic",
+        "rl-insight-dynamic-1",
+        "rl-insight-dynamic-2",
+    ]
 
 
 def test_render_prometheus_config_should_migrate_targets_from_colliding_job(

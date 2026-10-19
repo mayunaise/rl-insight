@@ -30,6 +30,7 @@ from ..utils.constants import MonitorRayActor
 from .base import MonitorCollector
 from ..server.http_api import get_server_services
 from ..protocol import RunContext, RunError
+from ..utils.prometheus_utils import _forget_targets
 from ..server.network import format_host_port, service_url_from_server_url
 from ..utils import (
     MetricRegistry,
@@ -128,30 +129,23 @@ class MonitorHubActor(MonitorCollector):
         }
 
         self._managed_endpoints = (
-            services.get("endpoint_registration_version") == 1
+            services.get("target_registration_version") == 1
             and self._context is not None
         )
-        self._metrics_server = None
-        if self._managed_endpoints:
-            self._metrics_server, _ = start_metrics_http_server(
-                self._metrics_port, addr=self._node_ip, context=self._context
-            )
+        bound = start_metrics_http_server(self._metrics_port, addr=self._node_ip)
+        self._metrics_server = bound[0] if isinstance(bound, tuple) else None
+        if self._metrics_server is not None:
             self._metrics_port = self._metrics_server.server_port
+        if self._context:
+            update_prometheus_config(
+                [format_host_port(self._node_ip, self._metrics_port)],
+                context=self._context,
+                identity_in_metrics=True,
+            )
         else:
-            bound = start_metrics_http_server(self._metrics_port, addr=self._node_ip)
-            if isinstance(bound, tuple):
-                self._metrics_server = bound[0]
-                self._metrics_port = self._metrics_server.server_port
-            if self._context:
-                update_prometheus_config(
-                    [format_host_port(self._node_ip, self._metrics_port)],
-                    context=self._context,
-                    identity_in_metrics=True,
-                )
-            else:
-                update_prometheus_config(
-                    [format_host_port(self._node_ip, self._metrics_port)]
-                )
+            update_prometheus_config(
+                [format_host_port(self._node_ip, self._metrics_port)]
+            )
         logger.info(
             "[rl-insight] MonitorHubActor HTTP bind %s:%s, "
             "Prometheus scrape target %s:%s",
@@ -249,14 +243,10 @@ class MonitorHubActor(MonitorCollector):
         finally:
             self._closing = True
             self._closed = True
+            _forget_targets(self._context)
             if self._metrics_server is not None:
-                try:
-                    publisher = getattr(self._metrics_server, "publisher", None)
-                    if publisher is not None:
-                        publisher.close()
-                finally:
-                    self._metrics_server.shutdown()
-                    self._metrics_server.server_close()
+                self._metrics_server.shutdown()
+                self._metrics_server.server_close()
 
     def flush(self) -> None:
         """Confirm prior events reached OTLP and a real Prometheus scrape."""
