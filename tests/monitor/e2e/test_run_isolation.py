@@ -17,24 +17,25 @@
 from __future__ import annotations
 
 import json
-import re
 import os
+import re
 import socket
 import subprocess
 import sys
-from pathlib import Path
 import threading
 import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 import pytest
 import requests
 import uvicorn
-from omegaconf import OmegaConf
 from fastapi.responses import JSONResponse
+from omegaconf import OmegaConf
 
 from rl_insight.server.http_api import create_app
 
@@ -68,6 +69,7 @@ def stack(tmp_path):
         fail_writes=False,
         reject_native_once=False,
         native_rejections=0,
+        series=None,
     )
     from rl_insight.utils.constants import MonitorPaths
 
@@ -97,6 +99,38 @@ def stack(tmp_path):
             state.calls.append((self.path, b""))
             path = self.path.split("?")[0]
             body = json.dumps(state.results.get(path, {})).encode()
+            if state.series is not None and path in {
+                "/api/v1/label/run_id/values",
+                "/api/v1/query",
+            }:
+                fields = parse_qs(urlsplit(self.path).query)
+                matcher = fields.get("match[]", fields.get("query"))[0]
+                pattern = json.loads(
+                    re.search(r'__name__=~("(?:[^"\\]|\\.)*")', matcher)[1]
+                )
+                observed = [
+                    row for row in state.series if re.fullmatch(pattern, row["name"])
+                ]
+                if path.endswith("/query"):
+                    end = float(fields["time"][0])
+                    start = end - int(re.search(r"\[(\d+)s\]", matcher)[1])
+                    data = {
+                        "resultType": "vector",
+                        "result": [
+                            {"metric": {"run_id": rid}, "value": [end, "1"]}
+                            for rid in sorted(
+                                {
+                                    row["run_id"]
+                                    for row in observed
+                                    if start < row["time"] <= end
+                                }
+                            )
+                        ],
+                    }
+                else:
+                    # Prometheus metadata can include out-of-window series.
+                    data = sorted({row["run_id"] for row in observed})
+                body = json.dumps({"status": "success", "data": data}).encode()
             if path == "/api/v1/query" and "rl_insight_sdk_flush_sequence" in self.path:
                 body = json.dumps(
                     {
@@ -180,6 +214,108 @@ def stack(tmp_path):
         backend.server_close()
 
 
+def test_dashboard_candidates_follow_observed_metrics(stack):
+    runs = [
+        requests.post(
+            stack.url + "/api/v1/runs",
+            json={
+                "request_id": uuid4().hex,
+                "project": project,
+                "experiment_name": 'same+name.\\"',
+            },
+            timeout=3,
+        ).json()
+        for project in ("project+1", "other", "project+1")
+    ]
+    catalog = stack.url + "/api/v1/catalog/prometheus/api/v1/label/"
+    params = {
+        "match[]": '{__name__=~"vllm:.*",project=~".*"}',
+        "start": 100,
+        "end": 300,
+    }
+    stack.backend.series = []
+    response = requests.get(catalog + "execution/values", params=params, timeout=3)
+    assert response.status_code == 200, response.text
+    assert response.json()["data"] == []  # Registered is not the same as observed.
+    stack.backend.series = [
+        {"run_id": runs[0]["run_id"], "name": "vllm:num_requests_running", "time": 150},
+        {"run_id": runs[1]["run_id"], "name": "vllm:num_requests_running", "time": 250},
+        {"run_id": runs[2]["run_id"], "name": "sglang:gen_throughput", "time": 200},
+        {"run_id": uuid4().hex, "name": "vllm:num_requests_running", "time": 200},
+    ]
+
+    def values(label="execution", **changes):
+        reply = requests.get(
+            catalog + label + "/values", params={**params, **changes}, timeout=3
+        )
+        assert reply.status_code == 200, reply.text
+        return reply.json()["data"]
+
+    choices = values()
+    assert {item.split("|", 1)[0] for item in choices} == {
+        r["run_id"] for r in runs[:2]
+    }
+    assert all(
+        re.search(r'\|same\+name\.\\"_\d{8}_\d{6}_[0-9a-f]{8}$', item)
+        for item in choices
+    )
+    assert values("project") == ["other", "project+1"]
+    assert [item.split("|", 1)[0] for item in values(end=200)] == [runs[0]["run_id"]]
+    assert [
+        item.split("|", 1)[0]
+        for item in values(
+            **{
+                "match[]": '{__name__=~"vllm:.*",project=~"project\\\\+1"}',
+            }
+        )
+    ] == [runs[0]["run_id"]]
+    assert [
+        item.split("|", 1)[0]
+        for item in values(
+            **{
+                "match[]": '{__name__=~"sglang[:_].*",project=~".*"}',
+            }
+        )
+    ] == [runs[2]["run_id"]]
+    assert values(**{"match[]": '{__name__=~"vllm_omni:.*",project=~".*"}'}) == []
+    for pattern, selected, expected in (
+        ("vllm:.*", runs[0]["run_id"], [runs[0]["run_id"]]),
+        ("vllm_omni:.*", runs[0]["run_id"], []),
+        ("vllm:.*", "", []),
+    ):
+        assert (
+            values(
+                "run_id",
+                **{
+                    "match[]": '{__name__=~"'
+                    + pattern
+                    + '",run_id="'
+                    + selected
+                    + '"}',
+                },
+            )
+            == expected
+        )
+    assert (
+        requests.get(
+            catalog + "execution/values",
+            params={
+                "match[]": '{__name__=~".*",project=~"(a+)+"}',
+            },
+            timeout=3,
+        ).status_code
+        == 422
+    )
+    empty = stack.url + "/api/v1/catalog/"
+    assert (
+        requests.get(empty + "prometheus/api/v1/query", timeout=3).json()["data"][
+            "result"
+        ]
+        == []
+    )
+    assert requests.get(empty + "tempo/api/search", timeout=3).json()["traces"] == []
+
+
 def test_run_directories_and_scoped_queries(stack, monkeypatch):
     payload = {
         "request_id": uuid4().hex,
@@ -255,9 +391,17 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         timeout=3,
     )
     assert response.status_code == 200, response.text
-    from urllib.parse import parse_qs, urlsplit
 
-    sent = parse_qs(urlsplit(stack.backend.calls[-1][0]).query)["query"][0]
+    def forwarded(path):
+        # Catalog provisioning runs in the background and may interleave calls.
+        url = next(
+            url
+            for url, _ in reversed(stack.backend.calls)
+            if urlsplit(url).path == path
+        )
+        return parse_qs(urlsplit(url).query)
+
+    sent = forwarded("/api/v1/query")["query"][0]
     assert sent.count('run_id="' + run_id + '"') == 2
     for expression, selectors in (
         ("sum(or)", 1),
@@ -274,7 +418,7 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
             ).status_code
             == 200
         )
-        sent = parse_qs(urlsplit(stack.backend.calls[-1][0]).query)["query"][0]
+        sent = forwarded("/api/v1/query")["query"][0]
         assert sent.count('run_id="' + run_id + '"') == selectors
     wrong = 'loss{run_id="' + second["run_id"] + '"}'
     assert (
@@ -286,7 +430,7 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     assert (
         requests.get(root + "/prometheus/api/v1/labels", timeout=3).status_code == 200
     )
-    assert "match[]" in parse_qs(urlsplit(stack.backend.calls[-1][0]).query)
+    assert "match[]" in forwarded("/api/v1/labels")
     assert (
         requests.get(
             root + "/prometheus/api/v1/admin/tsdb/delete_series", timeout=3
@@ -340,12 +484,9 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     assert searched.json()["traces"][0]["spanSets"][0]["spans"][0]["attributes"] == [
         {"key": "state_lane_id", "value": {"stringValue": "rank_0"}}
     ]
-    assert (
-        "resource.rl_insight.run_id"
-        in parse_qs(urlsplit(stack.backend.calls[-1][0]).query)["q"][0]
-    )
-    assert parse_qs(urlsplit(stack.backend.calls[-1][0]).query)["spss"] == ["1000"]
-    selected = parse_qs(urlsplit(stack.backend.calls[-1][0]).query)["q"][0]
+    assert "resource.rl_insight.run_id" in forwarded("/api/search")["q"][0]
+    assert forwarded("/api/search")["spss"] == ["1000"]
+    selected = forwarded("/api/search")["q"][0]
     assert selected.endswith(
         " | select(resource.rl_insight.run_id, name, span.state_lane_id)"
     )
@@ -362,7 +503,7 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         timeout=3,
     )
     assert projected.status_code == 200, projected.text
-    selected = parse_qs(urlsplit(stack.backend.calls[-1][0]).query)["q"][0]
+    selected = forwarded("/api/search")["q"][0]
     assert "resource.rl_insight.run_id = " in selected
     assert selected.endswith(
         " | select(resource.rl_insight.run_id, name, span.state_lane_id, span.turn, span.content)"
@@ -378,18 +519,25 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
             ).status_code
             == 422
         )
+    trace_calls = sum(
+        urlsplit(url).path == "/api/search" for url, _ in stack.backend.calls
+    )
     assert (
         requests.get(
             root + "/tempo/api/search",
             params={"q": "{true} | select(" + "span.field," * 7000 + "span.last)"},
             timeout=3,
         ).status_code
-        == 413
+        in {400, 413, 414}  # HTTP parsers may reject the URI before the app does.
+    )
+    assert (
+        sum(urlsplit(url).path == "/api/search" for url, _ in stack.backend.calls)
+        == trace_calls
     )
     span["attributes"] = attrs(second["run_id"])
     assert requests.get(root + "/tempo/api/search", timeout=3).status_code == 502
-    from rl_insight.server.runtime import run_dashboard
     from rl_insight.protocol import RunContext
+    from rl_insight.server.runtime import run_dashboard
 
     template = json.loads(
         (
@@ -398,14 +546,8 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         ).read_text(encoding="utf-8")
     )
     dashboard = run_dashboard(
-        RunContext.from_dict(first),
-        {"prometheus": "run-p", "tempo": "run-t"},
         Path(__file__).parents[3]
-        / "rl_insight/config/services/grafana/dashboards/verl/verl_tainer_v1_with_vllm_engine.json",
-        [
-            requests.get(stack.url + "/api/v1/runs/" + item["run_id"], timeout=3).json()
-            for item in (first, second)
-        ],
+        / "rl_insight/config/services/grafana/dashboards/verl/verl_tainer_v1_with_vllm_engine.json"
     )
     assert dashboard["spec"]["layout"] == template["spec"]["layout"]
     assert dashboard["metadata"]["name"] == template["metadata"]["name"]
@@ -440,12 +582,15 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         key = "experiment" if "experiment" in variables_all else "experiment_name"
         selection = variables_all[key]["spec"]
         assert selection["label"] == "Experiment"
-        assert {option["value"] for option in selection["options"]} == {
-            first["run_id"],
-            second["run_id"],
-        }
-        assert len({option["text"] for option in selection["options"]}) == 2
-        assert "run_id" not in variables_all
+        assert variables_all[key]["kind"] == "QueryVariable"
+        assert selection["options"] == []
+        assert selection["refresh"] == "onTimeRangeChanged"
+        assert (
+            original["metadata"]["annotations"]["rl-insight/metrics-selector"][:-1]
+            in selection["definition"]
+        )
+        assert variables_all["run_id"]["spec"]["hide"] == "hideVariable"
+        assert variables_all["run_id"]["spec"]["skipUrlSync"] is True
         assert (
             bound["spec"]["layout"] == original["spec"]["layout"] or key == "experiment"
         )
@@ -458,15 +603,16 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
                     "tempo",
                     "prometheus",
                 }:
-                    assert (
-                        value["datasource"]["name"]
-                        == "${" + key + "." + value["group"] + "}"
-                    )
+                    assert value["datasource"]["name"] in {
+                        "rli-${run_id}-" + value["group"][0],
+                        "rli-catalog",
+                    }
                     expression = value["spec"].get(
                         "expr", value["spec"].get("query", "")
                     )
-                    assert "$" + key not in expression
-                    assert "${" + key + "}" not in expression
+                    if value["datasource"]["name"] != "rli-catalog":
+                        assert "$" + key not in expression
+                        assert "${" + key + "}" not in expression
                 for item in value.values():
                     queries(item)
             elif isinstance(value, list):
@@ -498,32 +644,27 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     )
     variables = {v["spec"]["name"]: v for v in posted["spec"]["variables"]}
     assert len(variables) == len(posted["spec"]["variables"])
-    assert "run_id" not in variables
+    assert variables["run_id"]["spec"]["hide"] == "hideVariable"
     selector = variables["experiment_name"]["spec"]
     assert selector["label"] == "Experiment"
-    assert selector["current"]["value"] == run_id
+    assert selector["current"]["value"] == ""
     assert selector["multi"] is False and selector["includeAll"] is False
-    choices = json.loads(selector["query"])
-    assert {item["value"] for item in choices} == {first["run_id"], second["run_id"]}
-    for item in choices:
-        assert item["text"].startswith(payload["experiment_name"] + "_")
-        assert re.search(r"_\d{8}_\d{6}_[0-9a-f]{8}$", item["text"])
-        assert item["experiment_name"] == payload["experiment_name"]
-        pattern = json.loads('"' + item["experiment_pattern"] + '"')
-        assert re.fullmatch(pattern, payload["experiment_name"])
-        assert item["prometheus"] == "rli-" + item["value"] + "-p"
-        assert item["tempo"] == "rli-" + item["value"] + "-t"
-    assert variables["experiment_name"]["kind"] == "CustomVariable"
+    assert selector["options"] == []
+    assert selector["query"]["datasource"]["name"] == "rli-catalog"
+    assert "vllm:.*" in selector["definition"]
+    assert variables["experiment_name"]["kind"] == "QueryVariable"
     assert variables["project"]["kind"] == "QueryVariable"
-    assert "${experiment_name.prometheus}" in json.dumps(posted)
-    assert "${experiment_name.tempo}" in json.dumps(posted)
+    assert "rli-${run_id}-p" in json.dumps(posted)
+    assert "rli-${run_id}-t" in json.dumps(posted)
     registered = [
         json.loads(body)
         for path, body in stack.backend.calls
         if path == "/api/datasources" and body
     ]
     assert {body["uid"] for body in registered} >= {
-        "rli-" + item["value"] + suffix for item in choices for suffix in ("-p", "-t")
+        "rli-" + item["run_id"] + suffix
+        for item in (first, second)
+        for suffix in ("-p", "-t")
     }
     opened = requests.get(
         stack.url + "/ui/runs/" + run_id, allow_redirects=False, timeout=3
@@ -545,7 +686,7 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     assert requests.get(root + "/view", timeout=3).status_code == 502
     stack.backend.fail_writes = False
     import rl_insight as monitor
-    from rl_insight.client.base import MonitorClient, MONITOR_CLIENT_REGISTRY
+    from rl_insight.client.base import MONITOR_CLIENT_REGISTRY, MonitorClient
 
     class LegacyClient(MonitorClient):
         def apply_event(self, event):
@@ -577,8 +718,8 @@ def test_existing_ray_api_keeps_one_run_identity(stack, context_delay):
         ExportTraceServiceRequest,
     )
 
-    from rl_insight.utils.constants import MonitorPaths
     from rl_insight.server.runtime import DEFAULT_TEMPLATE
+    from rl_insight.utils.constants import MonitorPaths
 
     template = json.loads(
         (MonitorPaths.GRAFANA_DASHBOARDS_DIR / DEFAULT_TEMPLATE).read_text(
@@ -647,7 +788,8 @@ def test_existing_ray_api_keeps_one_run_identity(stack, context_delay):
         for variable in stack.backend.results[path]["spec"]["variables"]
         if variable["spec"]["name"] == "experiment_name"
     )
-    assert [option["value"] for option in selector["options"]] == [context["run_id"]]
+    assert selector["options"] == []
+    assert selector["query"]["datasource"]["name"] == "rli-catalog"
     # Restore the template, change ports, then inspect sources before any view request.
     for public_url in ("", "https://monitor.example.invalid/insight"):
         stack.backend.results[path] = template
@@ -672,9 +814,12 @@ def test_existing_ray_api_keeps_one_run_identity(stack, context_delay):
                 for variable in stack.backend.results[path]["spec"]["variables"]
                 if variable["spec"]["name"] == "experiment_name"
             )
-            assert [option["value"] for option in selector["options"]] == [
-                context["run_id"]
-            ]
+            assert selector["options"] == []
+            catalog_source = stack.backend.results["/api/datasources/uid/rli-catalog"]
+            assert (
+                catalog_source["url"]
+                == (public_url or restarted) + "/api/v1/catalog/prometheus"
+            )
             assert (
                 requests.get(
                     restarted + "/api/v1/runs/" + context["run_id"], timeout=3
@@ -685,6 +830,7 @@ def test_existing_ray_api_keeps_one_run_identity(stack, context_delay):
 
 def _ray_scenario(url, port, real_backends=False, context_delay=0):
     import ray
+
     import rl_insight as insight
     from rl_insight.client.ray_monitor_client import _current_job_actor_name
     from rl_insight.utils.constants import MonitorRayActor
