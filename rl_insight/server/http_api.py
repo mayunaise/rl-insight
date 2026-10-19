@@ -19,14 +19,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 import os
+import re
 import time
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Lock
+from typing import Any
 from urllib.parse import parse_qsl
-from typing import Any, Sequence
 
 import requests
 import uvicorn
@@ -690,7 +691,37 @@ def install_queries(app, registry, conf):
 
 
 def install_views(app, registry, conf):
-    from .runtime import DEFAULT_TEMPLATE, prepare_run_view
+    from .runtime import DEFAULT_TEMPLATE, prepare_run_view, run_options
+
+    @app.get("/api/v1/catalog/prometheus/api/v1/{path:path}")
+    def catalog(path: str, request: Request):
+        if path in {
+            "label/execution/values",
+            "label/project/values",
+            "label/run_id/values",
+        }:
+            values = run_options(
+                registry,
+                conf,
+                path.split("/")[1],
+                list(request.query_params.multi_items()),
+            )
+        elif path in {"query", "query_range"}:
+            values = {
+                "resultType": "matrix" if path == "query_range" else "vector",
+                "result": [],
+            }
+        elif path in {"series", "labels"} or re.fullmatch(
+            r"label/[A-Za-z_][A-Za-z0-9_]*/values", path
+        ):
+            values = []
+        else:
+            raise RunError("Unsupported catalog query", 404)
+        return {"status": "success", "data": values}
+
+    @app.get("/api/v1/catalog/tempo/api/search")
+    def empty_traces():
+        return {"traces": []}
 
     lock = Lock()
 
