@@ -20,14 +20,15 @@ import argparse
 import json
 import logging
 import math
-import re
 import os
+import re
 import time
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from threading import Lock, Event, Thread
+from threading import Event, Lock, Thread
+from typing import Any
 from urllib.parse import parse_qsl
-from typing import Any, Sequence
 
 import requests
 import uvicorn
@@ -495,9 +496,22 @@ def prometheus(query: str, identity: RunContext) -> str:
 
 
 def trace_search(query: str, identity: RunContext) -> str:
-    return traces(query, identity) + (
-        " | select(resource.rl_insight.run_id, name, span.state_lane_id)"
-    )
+    if len(query) > 65536:
+        raise RunError("Query too large", 413)
+    # Built-in Agent Loop panels select extra span fields. Only a terminal field
+    # projection is allowed; filters still pass through the Run constraint parser.
+    fields = ["resource.rl_insight.run_id", "name", "span.state_lane_id"]
+    projection = re.search(r"\|\s*select\(([^()]*)\)\s*$", query)
+    if projection:
+        selected = [field.strip() for field in projection[1].split(",")]
+        if not all(
+            re.fullmatch(r"(?:span|resource)\.[A-Za-z_][A-Za-z0-9_.]*|name", field)
+            for field in selected
+        ):
+            raise RunError("Unsupported selected field", 422)
+        fields = list(dict.fromkeys(fields + selected))
+        query = query[: projection.start()].rstrip()
+    return traces(query, identity) + " | select(" + ", ".join(fields) + ")"
 
 
 def traces(query: str, identity: RunContext) -> str:
@@ -772,7 +786,37 @@ def install_queries(app, registry, conf):
 
 
 def install_views(app, registry, conf):
-    from .runtime import DEFAULT_TEMPLATE, prepare_run_view
+    from .runtime import DEFAULT_TEMPLATE, prepare_run_view, run_options
+
+    @app.get("/api/v1/catalog/prometheus/api/v1/{path:path}")
+    def catalog(path: str, request: Request):
+        if path in {
+            "label/execution/values",
+            "label/project/values",
+            "label/run_id/values",
+        }:
+            values = run_options(
+                registry,
+                conf,
+                path.split("/")[1],
+                list(request.query_params.multi_items()),
+            )
+        elif path in {"query", "query_range"}:
+            values = {
+                "resultType": "matrix" if path == "query_range" else "vector",
+                "result": [],
+            }
+        elif path in {"series", "labels"} or re.fullmatch(
+            r"label/[A-Za-z_][A-Za-z0-9_]*/values", path
+        ):
+            values = []
+        else:
+            raise RunError("Unsupported catalog query", 404)
+        return {"status": "success", "data": values}
+
+    @app.get("/api/v1/catalog/tempo/api/search")
+    def empty_traces():
+        return {"traces": []}
 
     lock = Lock()
 
@@ -784,9 +828,16 @@ def install_views(app, registry, conf):
         runs = registry.list_runs()
         if runs and bool(OmegaConf.select(conf, "grafana.enable", default=True)):
             try:
-                prepare(
-                    runs[0].run_id, base_url or runs[0].server_url, DEFAULT_TEMPLATE
+                current_url = (
+                    OmegaConf.select(conf, "server.public_url")
+                    or base_url
+                    or "http://"
+                    + format_host_port(
+                        local_addresses()["loopback"],
+                        int(OmegaConf.select(conf, "server.port", default=18080)),
+                    )
                 )
+                prepare(runs[0]["context"]["run_id"], str(current_url), None)
             except (RunError, OSError) as exc:
                 logger.warning(
                     "[rl-insight] Could not refresh the original dashboard: %s", exc

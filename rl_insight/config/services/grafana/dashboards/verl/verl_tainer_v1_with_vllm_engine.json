@@ -6,7 +6,9 @@
     "generation": 45,
     "creationTimestamp": "2026-07-08T14:34:31Z",
     "labels": {},
-    "annotations": {}
+    "annotations": {
+      "rl-insight/metrics-selector": "{__name__=~\"vllm:.*\"}"
+    }
   },
   "spec": {
     "annotations": [
@@ -20517,7 +20519,7 @@
             "text": "All",
             "value": "$__all"
           },
-          "label": "training: Experiment Name",
+          "label": "Experiment",
           "hide": "dontHide",
           "refresh": "onDashboardLoad",
           "skipUrlSync": false,
