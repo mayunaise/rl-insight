@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run catalog with recoverable, readable per-Run file projections."""
+"""Run catalog with recoverable, readable per-Run file projections.
+
+SQLite owns identity, idempotent creation and creation time. JSON under
+``runs/<full_run_id>/`` is an atomic metadata/config projection, not separate
+Prometheus/Tempo storage. Names never participate in paths or identity.
+"""
 
 from __future__ import annotations
 
@@ -113,12 +118,15 @@ class RunRegistry:
     def get(self, run_id: str) -> RunContext:
         return RunContext.from_dict(json.loads(self._read_run(run_id)["context"]))
 
-    def list_runs(self) -> list[RunContext]:
+    def list_runs(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._db.execute(
-                "SELECT context FROM runs ORDER BY created_at DESC, run_id DESC"
+                "SELECT context, created_at FROM runs ORDER BY created_at DESC, run_id DESC"
             ).fetchall()
-        return [RunContext.from_dict(json.loads(row["context"])) for row in rows]
+        return [
+            {"context": json.loads(row["context"]), "created_at": row["created_at"]}
+            for row in rows
+        ]
 
     def _read_run(self, run_id: str) -> sqlite3.Row:
         validate_id(run_id)

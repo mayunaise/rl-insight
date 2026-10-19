@@ -1192,7 +1192,7 @@
         "kind": "QueryVariable",
         "spec": {
           "name": "experiment",
-          "label": "experiment",
+          "label": "Experiment",
           "hide": "",
           "refresh": "onTimeRangeChanged",
           "skipUrlSync": true,

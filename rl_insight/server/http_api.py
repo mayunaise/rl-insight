@@ -400,9 +400,22 @@ def prometheus(query: str, identity: RunContext) -> str:
 
 
 def trace_search(query: str, identity: RunContext) -> str:
-    return traces(query, identity) + (
-        " | select(resource.rl_insight.run_id, name, span.state_lane_id)"
-    )
+    if len(query) > 65536:
+        raise RunError("Query too large", 413)
+    # Built-in Agent Loop panels select extra span fields. Only a terminal field
+    # projection is allowed; filters still pass through the Run constraint parser.
+    fields = ["resource.rl_insight.run_id", "name", "span.state_lane_id"]
+    projection = re.search(r"\|\s*select\(([^()]*)\)\s*$", query)
+    if projection:
+        selected = [field.strip() for field in projection[1].split(",")]
+        if not all(
+            re.fullmatch(r"(?:span|resource)\.[A-Za-z_][A-Za-z0-9_.]*|name", field)
+            for field in selected
+        ):
+            raise RunError("Unsupported selected field", 422)
+        fields = list(dict.fromkeys(fields + selected))
+        query = query[: projection.start()].rstrip()
+    return traces(query, identity) + " | select(" + ", ".join(fields) + ")"
 
 
 def traces(query: str, identity: RunContext) -> str:
@@ -698,7 +711,7 @@ def install_views(app, registry, conf):
                         int(OmegaConf.select(conf, "server.port", default=18080)),
                     )
                 )
-                prepare(runs[0].run_id, str(current_url), DEFAULT_TEMPLATE)
+                prepare(runs[0]["context"]["run_id"], str(current_url), None)
             except (RunError, OSError) as exc:
                 logger.warning(
                     "[rl-insight] Could not refresh the original dashboard: %s", exc

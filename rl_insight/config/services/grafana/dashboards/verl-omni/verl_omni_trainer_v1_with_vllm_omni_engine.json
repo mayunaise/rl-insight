@@ -7329,7 +7329,7 @@
             "text": "All",
             "value": "$__all"
           },
-          "label": "training: Experiment Name",
+          "label": "Experiment",
           "hide": "dontHide",
           "refresh": "onTimeRangeChanged",
           "skipUrlSync": false,
