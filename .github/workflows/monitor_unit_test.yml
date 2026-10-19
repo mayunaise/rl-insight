@@ -17,6 +17,7 @@ on:
       - "pyproject.toml"
       - "rl_insight/client/**"
       - "rl_insight/collector/**"
+      - "rl_insight/config/services/grafana/dashboards/**"
       - "rl_insight/utils/**"
       - "tests/monitor/ut/**"
       - "tests/monitor/e2e/**"

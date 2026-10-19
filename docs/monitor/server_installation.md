@@ -277,142 +277,33 @@ server:
   data_dir: /path/to/rl-insight/data
 ```
 
-## Run Data Isolation
+## Selecting experiment executions
 
-With the Ray backend and a Run-capable server, each initialized training job
-receives an immutable Run identity. The existing public API and Ray Hub continue
-to collect metrics and traces; Run identity is added without changing metric
-prefixes, span names or service names.
-
-```python
-import rl_insight
-
-rl_insight.init(
-    project="demo",
-    experiment_name="experiment",
-    config={"server": {"url": "http://<server-host>:18080"}},
-)
-rl_insight.metric_gauge("loss", 0.25)
-context = rl_insight.get_context()
-# Workers using the existing job Hub obtain the same context.
-rl_insight.finish()
-```
-
-The server creates a fresh `run_id` even when an experiment name is reused.
-Repeated creation with the same request ID is idempotent. `RunContext` contains
-only identity, experiment metadata and the server URL; no framework objects or
-backend credentials are included. Other clients can implement the optional
-`MonitorClient.get_context()` method without changing the event interface.
-
-Normal target registration through `update_prometheus_config` carries the Run
-identity. Registrations made before logger initialization are deferred until a
-context is available. A worker retries with backoff while targets remain pending,
-including initialization longer than 30 seconds and failed registration requests;
-a target leaves the queue only after successful registration. Unbound legacy
-targets remain unclassified. No framework source patch or native exporter wrapper
-is required for this increment.
-
-Under the existing `server.data_dir`, configuration and readable metadata are
-organized as:
+Use the **Experiment** selector in any built-in Grafana dashboard to choose a
+specific execution. With the Ray backend and a Run-capable server, repeated
+executions with the same project and experiment names are listed separately:
 
 ```text
-runs/<run_id>/
-    run.json
-    config.json
+gsm8k_20261019_143025_a1b2c3d4
 ```
 
-Directories use the full Run ID; project and experiment names stay in metadata.
-Names are never used as path components, so renaming display metadata requires
-no directory relocation. Short Run IDs are for display only.
-SQLite is the identity catalog. JSON files are recoverable projections, not
-editable control configuration. Only allowlisted observability config fields are
-saved. These directories do not partition Prometheus/Tempo raw storage and do
-not guarantee indefinite sample retention or implement data export.
+The label includes the original experiment name, creation time in UTC,
+and a short identifier. Keep using the same experiment name in training config;
+no timestamp or identifier needs to be supplied by the training framework.
+Selecting an execution automatically switches both metrics and traces while
+preserving the dashboard's panels and component-specific filters.
 
-Existing catalog entries remain valid. Reading a Run's metadata endpoint or
-retrying its creation rebuilds snapshots at the new path from SQLite. Old
-experimental directory snapshots are not automatically moved or deleted.
+Completed executions remain selectable after training ends or the server
+restarts. Available historical samples follow Prometheus/Tempo retention.
+The original dashboards remain available in their existing Grafana folders.
+The Quick Start, verl/vLLM, verl/SGLang, verl-omni and Agent Loop dashboards use
+the same selection behavior. Without server-managed executions, legacy and direct-emit push dashboards
+retain their existing filters.
 
-Run-scoped query endpoints are:
+If the server uses a fixed reverse-proxy address, set `server.public_url` in its
+YAML config so Grafana and SDK clients use that reachable address. Otherwise,
+restarting restores data-source addresses using the server's current port.
 
-- `/api/v1/runs/<run_id>/prometheus/api/v1/query` and `query_range`
-- `/api/v1/runs/<run_id>/prometheus/api/v1/series`, `labels`, `label/<name>/values`
-- `/api/v1/runs/<run_id>/tempo/api/search` and `traces/<trace_id>`
-
-PromQL selectors are constrained to the selected Run. TraceQL supports boolean
-combinations of spansets; unsupported syntax is rejected, never sent unscoped.
-Trace detail responses must belong entirely to the Run. Search results include
-only identified matching spans, with root metadata derived from those spans.
-Responses and requests have bounded budgets; oversized or incomplete searches
-fail explicitly.
-
-`/ui/runs/<run_id>` opens the original full verl/vLLM dashboard with Run-scoped
-data sources. Its native Grafana filter bar includes a single-select **Run ID**
-variable alongside the existing experiment filters, present by default even
-before the first training job (with no options until a Run is registered). Each
-option displays and selects the full Run ID. Finished jobs remain selectable
-from the persistent Run catalog; a live trainer or worker is not required.
-Selecting a Run switches both Prometheus and Tempo to that Run's scoped data
-sources. There is no All/multi-Run option. The existing dashboard keeps its UID,
-title and folder permissions; no per-Run dashboard is created. It is available
-from the original Grafana folder as well as the RL-Insight entry. Run creation
-and server startup refresh the options, including Runs with no remaining backend
-samples. Reopening the entry also refreshes them. A refresh failure is logged
-without preventing Run creation; the original dashboard must already be
-provisioned. Bound runtime files are updated so file provisioning retains the
-Run filter. On restart, data-source URLs use `server.public_url` when set,
-otherwise the current server port, rather than the historical registration URL.
-
-`/api/v1/runs/<run_id>/view?template=<relative-json-path>` supports
-another deployed Grafana v2 template using the same data sources. Panel layout,
-visualization and metric expressions remain unchanged. Templates requiring
-unsupported query syntax report that limitation; this increment does not claim
-all Agentic/third-party templates are validated.
-
-The default verl timeline names lanes by `state_lane_id` (for example `rank_0`
-or `replica_0`), without Grafana's `Trace Name` field prefix. Its state values,
-colors and ordering are preserved.
-
-Legacy servers and clients retain the original behavior. Run scoping applies
-only when both sides support Run identity, and is not authentication/RBAC.
-Direct access to the shared backends bypasses these query routes.
-
-The direct-emit push backend retains its URL-free initialization, local target
-registration and sink routing. It does not use this server-managed Run catalog
-or query isolation. No Run-capable server is required for push operation.
-
-This increment implements data isolation, not concurrent-task orchestration.
-Port allocation, endpoint leases/proofs, fixed-entry metric aggregation and
-independent task shutdown are separate work. Native target attribution assumes
-the registered address still belongs to the publisher; port-reuse protection
-requires that later increment. Catalog entries do not infer training completion
-from a worker finishing.
-
-`finish()` invokes the optional `MonitorClient.flush()`, releases resources with
-`close()` when supported even if flushing fails, then clears local state. The
-Ray client drains prior submissions, flushes queued OTLP spans and,
-when Run-aware Prometheus is enabled, waits for a scrape to store its internal
-`rl_insight_sdk_flush_sequence` marker. This keeps the Hub available for the
-final SDK metric sample without adding sleeps to training scripts. The Hub has
-a 30-second flush budget and the client waits at most 35 seconds. Failure is
-logged and local state is still cleared; unavailable backends cannot guarantee
-delivery. Custom clients may keep the default no-op. This does not stop the
-shared Hub or guarantee native exporter shutdown ordering.
-
-Local HTTP/Ray E2E tests run with the monitor suite. To run sequential Runs
-against a separately deployed real stack:
-
-```bash
-RL_INSIGHT_RUN_E2E_URL=http://<server-host>:18080 \
-  pytest tests/monitor/e2e/test_run_isolation.py::test_sequential_runs_on_managed_backends
-```
-
-The acceptance test uses explicit collector ports 19102 and 19103; ensure they
-are available. It checks actual stored metrics, traces, cross-Run trace-ID reads
-and reuse of the original Grafana dashboard. It emits a final metric immediately
-before finish and checks that value after Ray shutdown. No concurrent training
-or accelerator is required.
-
-## Next Step
-
-Continue with [Quick Start](./quick_start.md) to start the stack, instrument training code, and open Grafana.
+SDK users should call `rl_insight.finish()` before stopping Ray to flush final
+SDK samples. Backend failures are logged; native exporter shutdown ordering and
+recovery after job loss are not guaranteed.

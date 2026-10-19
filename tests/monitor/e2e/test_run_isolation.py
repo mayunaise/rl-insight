@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 import socket
 import subprocess
@@ -68,6 +69,14 @@ def stack(tmp_path):
         reject_native_once=False,
         native_rejections=0,
     )
+    from rl_insight.utils.constants import MonitorPaths
+
+    for template in MonitorPaths.GRAFANA_DASHBOARDS_DIR.rglob("*.json"):
+        dashboard = json.loads(template.read_text(encoding="utf-8"))
+        state.results[
+            "/apis/dashboard.grafana.app/v2/namespaces/default/dashboards/"
+            + dashboard["metadata"]["name"]
+        ] = {"metadata": {**dashboard["metadata"], "resourceVersion": "1"}}
     dashboard_uid = "a4cabbce-92af-4a84-9399-4deba24ae6d1"
     dashboard_path = (
         "/apis/dashboard.grafana.app/v2/namespaces/default/dashboards/" + dashboard_uid
@@ -175,7 +184,7 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     payload = {
         "request_id": uuid4().hex,
         "project": "../项目",
-        "experiment_name": "same-name <script>alert(1)</script> 100%_",
+        "experiment_name": 'trial+1.\\value" <script>alert(1)</script> 100%_',
         "config": {
             "server": {"namespace": "demo", "password": "secret"},
             "token": "secret",
@@ -346,19 +355,57 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         ).status_code
         == 422
     )
+    # Agent Loop's field projection must preserve its fields and ownership proof.
+    projected = requests.get(
+        root + "/tempo/api/search",
+        params={"q": '{name="train"} | select(span.turn, span.content)'},
+        timeout=3,
+    )
+    assert projected.status_code == 200, projected.text
+    selected = parse_qs(urlsplit(stack.backend.calls[-1][0]).query)["q"][0]
+    assert "resource.rl_insight.run_id = " in selected
+    assert selected.endswith(
+        " | select(resource.rl_insight.run_id, name, span.state_lane_id, span.turn, span.content)"
+    )
+    for unsupported in (
+        "{true} | count()",
+        "{true} | select(span.turn) | count()",
+        '{true} | select(span.turn, "bad")',
+    ):
+        assert (
+            requests.get(
+                root + "/tempo/api/search", params={"q": unsupported}, timeout=3
+            ).status_code
+            == 422
+        )
+    assert (
+        requests.get(
+            root + "/tempo/api/search",
+            params={"q": "{true} | select(" + "span.field," * 7000 + "span.last)"},
+            timeout=3,
+        ).status_code
+        == 413
+    )
     span["attributes"] = attrs(second["run_id"])
     assert requests.get(root + "/tempo/api/search", timeout=3).status_code == 502
     from rl_insight.server.runtime import run_dashboard
     from rl_insight.protocol import RunContext
 
-    dashboard = run_dashboard(
-        RunContext.from_dict(first), {"prometheus": "run-p", "tempo": "run-t"}
-    )
     template = json.loads(
         (
             Path(__file__).parents[3]
             / "rl_insight/config/services/grafana/dashboards/verl/verl_tainer_v1_with_vllm_engine.json"
         ).read_text(encoding="utf-8")
+    )
+    dashboard = run_dashboard(
+        RunContext.from_dict(first),
+        {"prometheus": "run-p", "tempo": "run-t"},
+        Path(__file__).parents[3]
+        / "rl_insight/config/services/grafana/dashboards/verl/verl_tainer_v1_with_vllm_engine.json",
+        [
+            requests.get(stack.url + "/api/v1/runs/" + item["run_id"], timeout=3).json()
+            for item in (first, second)
+        ],
     )
     assert dashboard["spec"]["layout"] == template["spec"]["layout"]
     assert dashboard["metadata"]["name"] == template["metadata"]["name"]
@@ -379,6 +426,59 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
             == template["spec"]["elements"][name]["spec"]["vizConfig"]
         )
     assert "rl_insight_monitor_" in json.dumps(dashboard)
+    from rl_insight.utils.constants import MonitorPaths
+
+    for file in MonitorPaths.GRAFANA_DASHBOARDS_DIR.rglob("*.json"):
+        original = json.loads(file.read_text(encoding="utf-8"))
+        path = (
+            "/apis/dashboard.grafana.app/v2/namespaces/default/dashboards/"
+            + original["metadata"]["name"]
+        )
+        bound = stack.backend.results[path]
+        assert bound["spec"]["title"] == original["spec"]["title"]
+        variables_all = {v["spec"]["name"]: v for v in bound["spec"]["variables"]}
+        key = "experiment" if "experiment" in variables_all else "experiment_name"
+        selection = variables_all[key]["spec"]
+        assert selection["label"] == "Experiment"
+        assert {option["value"] for option in selection["options"]} == {
+            first["run_id"],
+            second["run_id"],
+        }
+        assert len({option["text"] for option in selection["options"]}) == 2
+        assert "run_id" not in variables_all
+        assert (
+            bound["spec"]["layout"] == original["spec"]["layout"] or key == "experiment"
+        )
+
+        def queries(value):
+            if isinstance(value, dict):
+                if str(value.get("kind", "")).endswith("Variable"):
+                    assert value["spec"].get("hide") != ""
+                if value.get("kind") == "DataQuery" and value.get("group") in {
+                    "tempo",
+                    "prometheus",
+                }:
+                    assert (
+                        value["datasource"]["name"]
+                        == "${" + key + "." + value["group"] + "}"
+                    )
+                    expression = value["spec"].get(
+                        "expr", value["spec"].get("query", "")
+                    )
+                    assert "$" + key not in expression
+                    assert "${" + key + "}" not in expression
+                for item in value.values():
+                    queries(item)
+            elif isinstance(value, list):
+                for item in value:
+                    queries(item)
+
+        queries(bound["spec"])
+        for name, element in original["spec"]["elements"].items():
+            assert (
+                bound["spec"]["elements"][name]["spec"]["vizConfig"]
+                == element["spec"]["vizConfig"]
+            )
     prepared = requests.get(root + "/view", timeout=3)
     assert prepared.status_code == 200, prepared.text
     assert all(
@@ -398,20 +498,25 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     )
     variables = {v["spec"]["name"]: v for v in posted["spec"]["variables"]}
     assert len(variables) == len(posted["spec"]["variables"])
-    selector = variables["run_id"]["spec"]
-    assert selector["label"] == "Run ID"
+    assert "run_id" not in variables
+    selector = variables["experiment_name"]["spec"]
+    assert selector["label"] == "Experiment"
     assert selector["current"]["value"] == run_id
     assert selector["multi"] is False and selector["includeAll"] is False
     choices = json.loads(selector["query"])
     assert {item["value"] for item in choices} == {first["run_id"], second["run_id"]}
     for item in choices:
-        assert item["text"] == item["value"]
+        assert item["text"].startswith(payload["experiment_name"] + "_")
+        assert re.search(r"_\d{8}_\d{6}_[0-9a-f]{8}$", item["text"])
+        assert item["experiment_name"] == payload["experiment_name"]
+        pattern = json.loads('"' + item["experiment_pattern"] + '"')
+        assert re.fullmatch(pattern, payload["experiment_name"])
         assert item["prometheus"] == "rli-" + item["value"] + "-p"
         assert item["tempo"] == "rli-" + item["value"] + "-t"
-    assert variables["experiment_name"]["kind"] == "QueryVariable"
+    assert variables["experiment_name"]["kind"] == "CustomVariable"
     assert variables["project"]["kind"] == "QueryVariable"
-    assert "${run_id.prometheus}" in json.dumps(posted)
-    assert "${run_id.tempo}" in json.dumps(posted)
+    assert "${experiment_name.prometheus}" in json.dumps(posted)
+    assert "${experiment_name.tempo}" in json.dumps(posted)
     registered = [
         json.loads(body)
         for path, body in stack.backend.calls
@@ -425,7 +530,7 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
     )
     assert opened.status_code == 307
     assert "/d/" + template["metadata"]["name"] in opened.headers["Location"]
-    assert "var-run_id=" + run_id in opened.headers["Location"]
+    assert "var-experiment_name=" + run_id in opened.headers["Location"]
     other_view = requests.get(
         stack.url + "/api/v1/runs/" + second["run_id"] + "/view", timeout=3
     ).json()
@@ -483,9 +588,9 @@ def test_existing_ray_api_keeps_one_run_identity(stack, context_delay):
     selector = next(
         variable["spec"]
         for variable in template["spec"]["variables"]
-        if variable["spec"]["name"] == "run_id"
+        if variable["spec"]["name"] == "experiment_name"
     )
-    assert selector["hide"] == "dontHide" and selector["options"] == []
+    assert selector["label"] == "Experiment" and selector["options"] == []
 
     with socket.socket() as reserve:
         reserve.bind(("127.0.0.1", 0))
@@ -540,7 +645,7 @@ def test_existing_ray_api_keeps_one_run_identity(stack, context_delay):
     selector = next(
         variable["spec"]
         for variable in stack.backend.results[path]["spec"]["variables"]
-        if variable["spec"]["name"] == "run_id"
+        if variable["spec"]["name"] == "experiment_name"
     )
     assert [option["value"] for option in selector["options"]] == [context["run_id"]]
     # Restore the template, change ports, then inspect sources before any view request.
@@ -565,7 +670,7 @@ def test_existing_ray_api_keeps_one_run_identity(stack, context_delay):
             selector = next(
                 variable["spec"]
                 for variable in stack.backend.results[path]["spec"]["variables"]
-                if variable["spec"]["name"] == "run_id"
+                if variable["spec"]["name"] == "experiment_name"
             )
             assert [option["value"] for option in selector["options"]] == [
                 context["run_id"]
