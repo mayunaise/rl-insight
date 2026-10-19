@@ -260,3 +260,35 @@ def test_update_prometheus_config_should_register_in_process_when_push_active(
         ("host-b:9000", {}),
     ]
     post.assert_not_called()
+
+
+def test_discovery_projection_retries_windows_sharing_and_skips_unchanged_files(
+    tmp_path, monkeypatch
+):
+    targets = tmp_path / "targets.yml"
+    store = prometheus_module.PrometheusTargetStore(
+        tmp_path / "prometheus.yml", 9090, targets_file=targets
+    )
+    replace = prometheus_module.os.replace
+    attempts = {}
+
+    def busy_once(source, destination):
+        attempts[destination] = attempts.get(destination, 0) + 1
+        if attempts[destination] == 1:
+            error = PermissionError("Prometheus briefly holds the discovery file")
+            error.winerror = 5
+            raise error
+        return replace(source, destination)
+
+    monkeypatch.setattr(prometheus_module.os, "replace", busy_once)
+    monkeypatch.setattr(prometheus_module.time, "sleep", lambda _: None)
+    store.project_runs([], "127.0.0.1:18080")
+    assert yaml.safe_load(targets.read_text(encoding="utf-8")) == []
+    assert (
+        yaml.safe_load(targets.with_name("run-targets.yml").read_text(encoding="utf-8"))
+        == []
+    )
+    assert list(attempts.values()) == [2, 2]
+    store.project_runs([], "127.0.0.1:18080")
+    assert list(attempts.values()) == [2, 2]
+    assert not list(tmp_path.glob("*.tmp"))

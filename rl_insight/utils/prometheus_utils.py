@@ -195,19 +195,30 @@ class PrometheusTargetStore:
             }
             for (stored_job, target), labels in sorted(target_map.items())
         ]
-        payload = yaml.safe_dump(groups, sort_keys=False)
-        tmp_path = self.targets_file.with_name(
-            f".{self.targets_file.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        self._write_discovery(
+            self.targets_file, yaml.safe_dump(groups, sort_keys=False)
+        )
+
+    @staticmethod
+    def _write_discovery(path: Path, payload: str) -> None:
+        if path.exists() and path.read_text(encoding="utf-8") == payload:
+            return
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
         )
         try:
-            tmp_path.write_text(payload, encoding="utf-8")
-            os.replace(tmp_path, self.targets_file)
-        except BaseException:
-            try:
-                tmp_path.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+            temporary.write_text(payload, encoding="utf-8")
+            for attempt in range(6):
+                try:
+                    os.replace(temporary, path)
+                    break
+                except PermissionError as exc:
+                    # Windows readers can briefly deny delete/replace sharing.
+                    if getattr(exc, "winerror", None) not in {5, 32} or attempt == 5:
+                        raise
+                    time.sleep(0.02 * 2**attempt)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _read_targets(self) -> dict[tuple[str, str], dict[str, str]]:
         if not self.targets_file.exists():
@@ -250,7 +261,6 @@ class PrometheusTargetStore:
             self._write_targets(direct)
             runs = sorted({item["run_id"] for item in endpoints})
             path = self.targets_file.with_name("run-targets.yml")
-            temporary = path.with_suffix(".yml.tmp")
             payload = [
                 {
                     "targets": [server_address],
@@ -261,8 +271,7 @@ class PrometheusTargetStore:
                 }
                 for run_id in runs
             ]
-            temporary.write_text(yaml.safe_dump(payload), encoding="utf-8")
-            os.replace(temporary, path)
+            self._write_discovery(path, yaml.safe_dump(payload))
 
     def reload(self) -> bool:
         url = (
