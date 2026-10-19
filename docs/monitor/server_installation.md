@@ -279,31 +279,12 @@ server:
 
 ## Selecting experiment executions
 
-Use the **Experiment** selector in any built-in Grafana dashboard to choose a
-specific execution. With the Ray backend and a Run-capable server, repeated
-executions with the same project and experiment names are listed separately:
+With the Ray backend and a Run-capable server, use **Experiment** in any built-in
+Grafana dashboard to select an execution. Labels such as
+`gsm8k_20261019_143025_a1b2c3d4` include the experiment name, UTC creation time and
+short ID. Keep the original experiment name in training config.
 
-```text
-gsm8k_20261019_143025_a1b2c3d4
-```
+Selection switches both metrics and traces. Finished executions remain
+selectable after server restarts; historical data follows backend retention.
 
-The label includes the original experiment name, creation time in UTC,
-and a short identifier. Keep using the same experiment name in training config;
-no timestamp or identifier needs to be supplied by the training framework.
-Selecting an execution automatically switches both metrics and traces while
-preserving the dashboard's panels and component-specific filters.
-
-Completed executions remain selectable after training ends or the server
-restarts. Available historical samples follow Prometheus/Tempo retention.
-The original dashboards remain available in their existing Grafana folders.
-The Quick Start, verl/vLLM, verl/SGLang, verl-omni and Agent Loop dashboards use
-the same selection behavior. Without server-managed executions, legacy and direct-emit push dashboards
-retain their existing filters.
-
-If the server uses a fixed reverse-proxy address, set `server.public_url` in its
-YAML config so Grafana and SDK clients use that reachable address. Otherwise,
-restarting restores data-source addresses using the server's current port.
-
-SDK users should call `rl_insight.finish()` before stopping Ray to flush final
-SDK samples. Backend failures are logged; native exporter shutdown ordering and
-recovery after job loss are not guaranteed.
+Call `rl_insight.finish()` before stopping Ray to flush final SDK samples.
