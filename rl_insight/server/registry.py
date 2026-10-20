@@ -12,17 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run catalog with recoverable, readable per-Run file projections.
+"""SQLite Run catalog for identity, idempotent creation and metadata queries.
 
-SQLite owns identity, idempotent creation and creation time. JSON under
-``runs/<full_run_id>/`` is an atomic metadata/config projection, not separate
-Prometheus/Tempo storage. Names never participate in paths or identity.
+Prometheus/Tempo retain shared storage. No per-Run file copies are maintained.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import threading
 import time
@@ -111,8 +108,6 @@ class RunRegistry:
                         time.time(),
                     ),
                 )
-        # The DB owns identity. A failed projection can be rebuilt on get/retry.
-        self.snapshot(context.run_id)
         return context
 
     def get(self, run_id: str) -> RunContext:
@@ -138,31 +133,17 @@ class RunRegistry:
                 raise RunError("Run not found", 404)
             return row
 
-    def snapshot(self, run_id: str) -> dict[str, Any]:
-        with self._lock:
-            row = self._read_run(run_id)
-            context = RunContext.from_dict(json.loads(row["context"]))
-            directory = self.root / "runs" / run_id
-            metadata = {
-                "schema_version": 1,
-                "context": context.to_dict(),
-                "created_at": row["created_at"],
-                "status": "registered",
-                "ended_at": None,
-            }
-            self._write(directory / "run.json", metadata)
-            self._write(directory / "config.json", json.loads(row["config"]))
-            return metadata
-
-    @staticmethod
-    def _write(path: Path, value: Any) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name("." + path.name + "." + uuid4().hex)
-        try:
-            temporary.write_text(_json(value) + "\n", encoding="utf-8")
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+    def describe(self, run_id: str) -> dict[str, Any]:
+        """Read execution metadata and allowlisted config without writing files."""
+        row = self._read_run(run_id)
+        return {
+            "schema_version": 1,
+            "context": RunContext.from_dict(json.loads(row["context"])).to_dict(),
+            "config": json.loads(row["config"]),
+            "created_at": row["created_at"],
+            "status": "registered",
+            "ended_at": None,
+        }
 
     def close(self) -> None:
         with self._lock:

@@ -137,7 +137,7 @@ def create_app(conf: DictConfig) -> FastAPI:
 
     @app.get("/api/v1/runs/{run_id}")
     def get_run(run_id: str):
-        return registry.snapshot(run_id)
+        return registry.describe(run_id)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:

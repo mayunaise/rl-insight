@@ -20,6 +20,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -316,7 +317,7 @@ def test_dashboard_candidates_follow_observed_metrics(stack):
     assert requests.get(empty + "tempo/api/search", timeout=3).json()["traces"] == []
 
 
-def test_run_directories_and_scoped_queries(stack, monkeypatch):
+def test_run_catalog_and_scoped_queries(stack, monkeypatch):
     payload = {
         "request_id": uuid4().hex,
         "project": "../项目",
@@ -352,33 +353,20 @@ def test_run_directories_and_scoped_queries(stack, monkeypatch):
         timeout=3,
     ).json()
     assert first["run_id"] != second["run_id"]
-    directories = list((stack.data / "runs").iterdir())
-    assert {p.name for p in directories} == {first["run_id"], second["run_id"]}
-    for directory in directories:
-        assert directory.resolve().is_relative_to(stack.data)
-        context = json.loads((directory / "run.json").read_text(encoding="utf-8"))[
-            "context"
-        ]
-        assert context["run_id"] == directory.name
-        assert context["project"] == payload["project"]
-        assert context["experiment_name"] == payload["experiment_name"]
-        assert "secret" not in (directory / "config.json").read_text(encoding="utf-8")
-    first_directory = stack.data / "runs" / first["run_id"]
-    (first_directory / "run.json").unlink()
-    (first_directory / "config.json").unlink()
+    assert (stack.data / "runs.sqlite").is_file()
+    assert not (stack.data / "runs").exists()
+    details = requests.get(
+        stack.url + "/api/v1/runs/" + first["run_id"], timeout=3
+    ).json()
+    assert details["context"] == first
+    assert details["config"] == {"server": {"namespace": "demo"}}
+    assert "secret" not in json.dumps(details)
+    assert details["created_at"] > 0
     with serve(create_app(stack.conf)) as reopened:
         restored = requests.get(reopened + "/api/v1/runs/" + first["run_id"], timeout=3)
         assert restored.status_code == 200
-        assert restored.json()["context"] == first
-        assert (
-            json.loads((first_directory / "run.json").read_text(encoding="utf-8"))[
-                "context"
-            ]
-            == first
-        )
-        assert json.loads(
-            (first_directory / "config.json").read_text(encoding="utf-8")
-        ) == {"server": {"namespace": "demo"}}
+        assert restored.json() == details
+        assert not (stack.data / "runs").exists()
     run_id = first["run_id"]
     root = stack.url + "/api/v1/runs/" + run_id
     stack.backend.results["/api/v1/query"] = {
@@ -778,7 +766,10 @@ def test_existing_ray_api_keeps_one_run_identity(stack, context_delay):
         and "replica: '0'" in targets
         and "replica: '1'" in targets
     )
-    assert len(list((stack.data / "runs").iterdir())) == 1
+    with sqlite3.connect(stack.data / "runs.sqlite") as db:
+        assert db.execute("SELECT run_id FROM runs").fetchall() == [
+            (context["run_id"],)
+        ]
     path = (
         "/apis/dashboard.grafana.app/v2/namespaces/default/dashboards/"
         + template["metadata"]["name"]
