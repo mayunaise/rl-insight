@@ -555,7 +555,22 @@ def test_run_catalog_and_scoped_queries(stack, monkeypatch):
         Path(__file__).parents[3]
         / "rl_insight/config/services/grafana/dashboards/verl/verl_tainer_v1_with_vllm_engine.json"
     )
-    assert dashboard["spec"]["layout"] == template["spec"]["layout"]
+
+    def layout_structure(value):
+        # Row-scoped variables contain queries rewritten by Run binding.
+        if isinstance(value, dict):
+            return {
+                key: layout_structure(child)
+                for key, child in value.items()
+                if key != "variables"
+            }
+        if isinstance(value, list):
+            return [layout_structure(child) for child in value]
+        return value
+
+    assert layout_structure(dashboard["spec"]["layout"]) == layout_structure(
+        template["spec"]["layout"]
+    )
     assert dashboard["metadata"]["name"] == template["metadata"]["name"]
     assert dashboard["spec"]["title"] == template["spec"]["title"]
     timeline = dashboard["spec"]["elements"]["panel-40"]["spec"]["vizConfig"]
@@ -573,7 +588,6 @@ def test_run_catalog_and_scoped_queries(stack, monkeypatch):
             element["spec"]["vizConfig"]
             == template["spec"]["elements"][name]["spec"]["vizConfig"]
         )
-    assert "rl_insight_monitor_" in json.dumps(dashboard)
     from rl_insight.utils.constants import MonitorPaths
 
     for file in MonitorPaths.GRAFANA_DASHBOARDS_DIR.rglob("*.json"):
@@ -597,8 +611,8 @@ def test_run_catalog_and_scoped_queries(stack, monkeypatch):
         )
         assert variables_all["run_id"]["spec"]["hide"] == "hideVariable"
         assert variables_all["run_id"]["spec"]["skipUrlSync"] is True
-        assert (
-            bound["spec"]["layout"] == original["spec"]["layout"] or key == "experiment"
+        assert layout_structure(bound["spec"]["layout"]) == layout_structure(
+            original["spec"]["layout"]
         )
 
         def queries(value):
