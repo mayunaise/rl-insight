@@ -445,3 +445,31 @@ def test_provisioning_uses_fixed_gateway_sources_and_multiselect_without_credent
                     check_partition(child)
 
         check_partition(dashboard)
+
+
+def test_training_dashboards_keep_gauge_and_step_metrics_scoped():
+    import json
+    from pathlib import Path
+
+    root = Path(runtime_module.MonitorPaths.GRAFANA_DASHBOARDS_DIR)
+    checked = 0
+    for path in root.rglob("*.json"):
+        original = json.loads(path.read_text())
+        if "trainer-metric" not in original["spec"]["elements"]:
+            continue
+        dashboard = runtime_module.run_dashboard(path)
+        elements = dashboard["spec"]["elements"]
+        assert "trainer-gauge" in elements, path.name
+        gauge = elements["trainer-gauge"]["spec"]
+        query = gauge["data"]["spec"]["queries"][0]["spec"]["query"]
+        assert query["group"] == "prometheus"
+        assert 'run_id=~"${run_id:regex}"' in query["spec"]["expr"]
+        assert gauge["vizConfig"]["group"] == "timeseries"
+        assert "xField" not in gauge["vizConfig"]["spec"]["options"]
+        step = elements["trainer-metric"]["spec"]
+        query = step["data"]["spec"]["queries"][0]["spec"]["query"]
+        assert query["group"] == "tempo" and "metric_log" in query["spec"]["query"]
+        assert "resource.rl_insight.run_id" in query["spec"]["query"]
+        assert step["vizConfig"]["spec"]["options"]["xField"] == "global_step"
+        checked += 1
+    assert checked == 3
