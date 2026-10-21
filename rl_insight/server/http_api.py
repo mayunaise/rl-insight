@@ -594,16 +594,8 @@ def project_search(payload, context: RunContext | Sequence[RunContext]) -> int:
                     raise RunError(
                         "Backend returned a foreign or unidentified span", 502
                     )
-                # Ownership is checked above; keep the original timeline fields.
-                if len(_run_ids(context)) == 1 and not any(
-                    a.get("key") == "metric.name" for a in span.get("attributes", [])
-                ):
-                    span["attributes"] = [
-                        a
-                        for a in span.get("attributes", [])
-                        if a.get("key") != "rl_insight.run_id"
-                    ]
-                else:
+                # Lane identity distinguishes Runs without adding a plotted state.
+                if len(_run_ids(context)) > 1:
                     owner = pairs[0]["value"]["stringValue"]
                     for attribute in span.get("attributes", []):
                         if attribute.get("key") == "state_lane_id":
@@ -612,6 +604,16 @@ def project_search(payload, context: RunContext | Sequence[RunContext]) -> int:
                                 + "/"
                                 + attribute["value"]["stringValue"]
                             )
+                # Step panels partition on Run ID; timeline panels plot every
+                # extra attribute, so ownership metadata must not reach them.
+                if not any(
+                    a.get("key") == "metric.name" for a in span.get("attributes", [])
+                ):
+                    span["attributes"] = [
+                        a
+                        for a in span.get("attributes", [])
+                        if a.get("key") != "rl_insight.run_id"
+                    ]
             groups_out.append({"spans": spans, "matched": matched})
             members.extend(spans)
         if not members:

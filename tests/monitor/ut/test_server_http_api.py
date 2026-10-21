@@ -237,3 +237,45 @@ def test_tempo_tag_values_and_step_projection_keep_selected_run(monkeypatch, tmp
             response.json()["traces"][0]["spanSet"]["spans"][0]["attributes"][0]["key"]
             == "rl_insight.run_id"
         )
+
+
+def test_multirun_timeline_uses_run_lanes_without_plotting_identity_metadata():
+    from rl_insight.server.http_api import project_search
+    from rl_insight.utils.protocol import RunContext
+
+    contexts = [RunContext(c * 32, "p", "same", "http://server") for c in "ab"]
+    traces = []
+    for context in contexts:
+        traces.append(
+            {
+                "traceID": context.run_id,
+                "spanSet": {
+                    "matched": 1,
+                    "spans": [
+                        {
+                            "name": "actor_update",
+                            "startTimeUnixNano": "1",
+                            "durationNanos": "10",
+                            "attributes": [
+                                {
+                                    "key": "rl_insight.run_id",
+                                    "value": {"stringValue": context.run_id},
+                                },
+                                {
+                                    "key": "state_lane_id",
+                                    "value": {"stringValue": "rank_0"},
+                                },
+                            ],
+                        }
+                    ],
+                },
+            }
+        )
+    payload = {"traces": traces}
+    project_search(payload, contexts)
+    for trace, context in zip(payload["traces"], contexts):
+        attributes = {
+            a["key"]: a["value"]["stringValue"]
+            for a in trace["spanSet"]["spans"][0]["attributes"]
+        }
+        assert attributes == {"state_lane_id": context.run_id[:8] + "/rank_0"}
