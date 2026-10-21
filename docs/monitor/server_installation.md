@@ -279,11 +279,8 @@ server:
 
 ## Selecting experiment executions
 
-With the Ray backend and a Run-capable server, use **Experiment** in any built-in
-Grafana dashboard to select an execution. Labels such as
-`gsm8k_20261019_143025_a1b2c3d4` include the experiment name, UTC creation time and
-short ID. Keep the original experiment name in training config; selection
-switches both metrics and traces. Select **Project** first, then choose an
-**Experiment** from its history with metrics matching the dashboard type.
-Project lists all stored projects. The time range controls chart data, not these
-selection lists.
+Select **Project**, then choose one or more executions in **Experiment**.
+Each option shows the original experiment name, UTC creation time and short ID,
+such as `gsm8k_20261019_143025_a1b2c3d4`. **All** selects the matching executions
+in the chosen projects. The time range controls chart data, not these selection
+lists. Keep the original experiment name in training configuration.

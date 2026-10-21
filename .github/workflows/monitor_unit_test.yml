@@ -11,7 +11,6 @@ on:
       - v0.*
     paths:
       - "rl_insight/api.py"
-      - "rl_insight/protocol.py"
       - "rl_insight/__init__.py"
       - "rl_insight/server/**"
       - "pyproject.toml"

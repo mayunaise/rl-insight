@@ -23,7 +23,7 @@ from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
-from ..protocol import RunContext
+from ..utils.protocol import RunContext
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -50,10 +50,6 @@ class MonitorClient(ABC):
     def get_context(self) -> RunContext | None:
         """Optional identity support; existing third-party clients remain valid."""
         return None
-
-    def flush(self) -> None:
-        """Optional bounded drain; existing clients need no implementation."""
-        pass
 
 
 def register_monitor_client(backend: str, factory: MonitorClientFactory) -> None:

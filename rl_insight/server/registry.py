@@ -25,9 +25,9 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping
-from uuid import uuid4
 
-from ..protocol import RunContext, RunError, validate_id
+from .. import __version__
+from ..utils.protocol import RunContext, RunError, validate_id
 
 
 def _json(value: Any) -> str:
@@ -72,19 +72,18 @@ class RunRegistry:
 
     def create(
         self,
-        request_id: str,
+        run_id: str,
         project: str,
         experiment_name: str,
         server_url: str,
         config: Mapping[str, Any],
     ) -> RunContext:
-        validate_id(request_id)
-        context = RunContext(uuid4().hex, project, experiment_name, server_url)
+        context = RunContext(run_id, project, experiment_name, server_url)
         snapshot = _config_snapshot(config)
         with self._lock, self._db:
             self._db.execute("BEGIN IMMEDIATE")
             row = self._db.execute(
-                "SELECT * FROM runs WHERE request_id=?", (request_id,)
+                "SELECT * FROM runs WHERE run_id=?", (run_id,)
             ).fetchone()
             if row:
                 existing = RunContext.from_dict(json.loads(row["context"]))
@@ -98,12 +97,13 @@ class RunRegistry:
                     )
                 context = existing
             else:
+                # Keep the existing schema; caller-owned IDs are also request keys.
                 self._db.execute(
                     "INSERT INTO runs VALUES (?,?,?,?,?)",
                     (
                         context.run_id,
-                        request_id,
-                        _json(context.to_dict()),
+                        run_id,
+                        _json(context.metadata()),
                         _json(snapshot),
                         time.time(),
                     ),
@@ -137,7 +137,7 @@ class RunRegistry:
         """Read execution metadata and allowlisted config without writing files."""
         row = self._read_run(run_id)
         return {
-            "schema_version": 1,
+            "version": __version__,
             "context": RunContext.from_dict(json.loads(row["context"])).to_dict(),
             "config": json.loads(row["config"]),
             "created_at": row["created_at"],

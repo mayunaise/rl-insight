@@ -70,10 +70,6 @@ class OpenTelemetryTraceCollector:
         self._tracer = provider.get_tracer(__name__)
         self._provider = provider
 
-    def flush(self, timeout_millis: int = 30000) -> bool:
-        """Export queued spans without shutting down the shared provider."""
-        return self._provider is None or self._provider.force_flush(timeout_millis)
-
     @property
     def enabled(self) -> bool:
         return self._tracer is not None

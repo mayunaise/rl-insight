@@ -31,9 +31,9 @@ from typing import Any
 from omegaconf import DictConfig, OmegaConf
 
 from .client import create_monitor_client
-from .protocol import RunContext, RunError
-from .utils.monitor_config_loader import load_monitor_config
 from .utils import MonitorBackend, MonitorEventKind
+from .utils.monitor_config_loader import load_monitor_config
+from .utils.protocol import RunContext, RunError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -152,8 +152,8 @@ def init(
 
 
 def get_context() -> RunContext | None:
-    """Return the current immutable identity, if supported by the client."""
-    return _STATE.context
+    """Return an immutable snapshot of the current Run identity and live status."""
+    return _STATE.client.get_context() if _STATE.client else None
 
 
 def _client_initialized() -> bool:

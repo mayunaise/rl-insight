@@ -23,8 +23,8 @@ import ray
 from omegaconf import DictConfig
 
 from ..collector.ray_monitor_hub import MonitorHubActor
-from ..protocol import RunContext
-from ..utils.constants import MonitorEnv, MonitorRayActor
+from ..utils.constants import MonitorEnv, MonitorRayActor, MonitorServer
+from ..utils.protocol import RunContext, RunError
 from .base import MonitorClient
 
 logger = logging.getLogger(__name__)
@@ -48,10 +48,15 @@ def current_job_context() -> RunContext | None:
         hub = ray.get_actor(
             _current_job_actor_name(), namespace=MonitorRayActor.NAMESPACE
         )
-        value = ray.get(hub.get_context.remote(), timeout=2)
-        return RunContext.from_dict(value) if value else None
-    except (ValueError, ray.exceptions.RayError):
+    except ValueError:
         return None
+    try:
+        context = ray.get(hub.get_context.remote(), timeout=2)
+    except (ray.exceptions.GetTimeoutError, ray.exceptions.ActorUnavailableError):
+        return None
+    if not isinstance(context, RunContext):
+        raise RunError("Hub returned an invalid RunContext")
+    return context
 
 
 def get_or_create_monitor_hub(conf: DictConfig) -> Any:
@@ -88,6 +93,7 @@ def get_or_create_monitor_hub(conf: DictConfig) -> Any:
     actor_options: dict[str, Any] = {
         "name": actor_name,
         "namespace": namespace,
+        "get_if_exists": True,
     }
     server_url = str(conf.server.url).strip()
     if server_url:
@@ -121,27 +127,33 @@ def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
         return None
 
     handle = get_or_create_monitor_hub(conf)
-    value = ray.get(handle.get_context.remote(), timeout=15)
-    return MonitorRayClient(handle, RunContext.from_dict(value) if value else None)
+    return MonitorRayClient(handle)
 
 
 class MonitorRayClient(MonitorClient):
     """Ray facade: ``apply_event`` submits work to the hub without blocking on completion."""
 
-    def __init__(self, actor_handle: Any, context: RunContext | None = None) -> None:
+    def __init__(self, actor_handle: Any) -> None:
         """
         Args:
             actor_handle: Return value of ``get_or_create_monitor_hub``.
         """
         self._actor = actor_handle
-        self._context = context
 
-    def get_context(self) -> RunContext | None:
-        return self._context
-
-    def flush(self) -> None:
-        """Drain this client's prior submissions before the Ray job can exit."""
-        ray.get(self._actor.flush.remote(), timeout=35)
+    def get_context(self) -> RunContext:
+        # Includes discovery, bounded registration retries and actor scheduling.
+        timeout = (
+            MonitorServer.SERVICE_DISCOVERY_RETRIES
+            * (
+                MonitorServer.SERVICE_DISCOVERY_TIMEOUT_SECONDS
+                + MonitorServer.SERVICE_DISCOVERY_RETRY_DELAY_SECONDS
+            )
+            + 30
+        )
+        context = ray.get(self._actor.get_context.remote(), timeout=timeout)
+        if not isinstance(context, RunContext):
+            raise RunError("Hub returned an invalid RunContext")
+        return context
 
     def apply_event(self, event: dict[str, Any]) -> None:
         """Submit ``MonitorHubActor.apply_event`` on the actor (fire-and-forget; no ``ray.get``).

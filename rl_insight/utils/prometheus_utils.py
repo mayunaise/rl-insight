@@ -26,7 +26,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from ..protocol import RunContext
 
 import requests
 import yaml
@@ -41,6 +40,7 @@ from .constants import (
     PrometheusScrape,
     prometheus_targets_file_from_config,
 )
+from .protocol import RunContext, RunError
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.WARNING)
@@ -55,6 +55,8 @@ _pending_probe: threading.Thread | None = None
 def _wait_for_context() -> None:
     """Retry pending native targets for the lifetime of their worker process."""
     global _pending_probe
+    from ray.exceptions import RayActorError
+
     from ..client.ray_monitor_client import current_job_context
 
     delay = 0.1
@@ -63,9 +65,16 @@ def _wait_for_context() -> None:
             if not _pending_targets:
                 _pending_probe = None
                 return
-        context = current_job_context()
-        if context:
-            flush_pending_targets(context)
+        try:
+            context = current_job_context()
+            if context:
+                flush_pending_targets(context)
+        except (RunError, RayActorError) as exc:
+            logger.error("[rl-insight] Cannot resolve native target identity: %s", exc)
+            with _pending_lock:
+                _pending_targets.clear()
+                _pending_probe = None
+            return
         time.sleep(delay)
         delay = min(delay * 2, 2)
 
@@ -74,7 +83,12 @@ def flush_pending_targets(context: RunContext | None) -> None:
     with _pending_lock:
         pending = list(_pending_targets)
     for item in pending:
-        if _register_targets(*item, context):
+        try:
+            done = _register_targets(*item, context)
+        except RunError as exc:
+            logger.error("[rl-insight] Native target registration rejected: %s", exc)
+            done = True
+        if done:
             with _pending_lock:
                 if item in _pending_targets:
                     _pending_targets.remove(item)
@@ -489,7 +503,7 @@ def update_prometheus_config(
 
     initialized = True
     if context is None:
-        from ..api import get_context, _client_initialized
+        from ..api import _client_initialized, get_context
 
         context = get_context()
         initialized = _client_initialized()
@@ -510,7 +524,7 @@ def update_prometheus_config(
         if not initialized:
             from ..server.http_api import get_server_services
 
-            if get_server_services().get("run_context_version") == 1:
+            if get_server_services():
                 # Wait for logger initialization; never create a Run from an address.
                 from ..client.ray_monitor_client import current_job_context
 
@@ -574,10 +588,16 @@ def _register_targets(
     url = f"{base_url}/api/v1/prometheus/targets"
     try:
         response = requests.post(url, json=payload, timeout=10)
+        if 400 <= response.status_code < 500 and response.status_code not in {408, 429}:
+            raise RunError(
+                "Target registration rejected: " + response.text[:512],
+                response.status_code,
+            )
         response.raise_for_status()
-        print(
-            f"[rl-insight] Registered {len(server_addresses)} Prometheus targets "
-            f"with RL-Insight server (job_name={payload['job_name']})"
+        logger.info(
+            "[rl-insight] Registered %d Prometheus targets (job_name=%s)",
+            len(server_addresses),
+            payload["job_name"],
         )
         return True
     except requests.RequestException as exc:
