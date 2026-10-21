@@ -283,5 +283,7 @@ With the Ray backend and a Run-capable server, use **Experiment** in any built-i
 Grafana dashboard to select an execution. Labels such as
 `gsm8k_20261019_143025_a1b2c3d4` include the experiment name, UTC creation time and
 short ID. Keep the original experiment name in training config; selection
-switches both metrics and traces. Each dashboard lists only executions with matching
-metrics in the selected time range; changing Project or the range refreshes the choices.
+switches both metrics and traces. Select **Project** first, then choose an
+**Experiment** from its history with metrics matching the dashboard type.
+Project lists all stored projects. The time range controls chart data, not these
+selection lists.

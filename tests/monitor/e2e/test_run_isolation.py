@@ -226,7 +226,7 @@ def test_dashboard_candidates_follow_observed_metrics(stack):
             },
             timeout=3,
         ).json()
-        for project in ("project+1", "other", "project+1")
+        for project in ("project+1", "other", "sglang-only", "historical", "project+1")
     ]
     catalog = stack.url + "/api/v1/catalog/prometheus/api/v1/label/"
     params = {
@@ -238,6 +238,14 @@ def test_dashboard_candidates_follow_observed_metrics(stack):
     response = requests.get(catalog + "execution/values", params=params, timeout=3)
     assert response.status_code == 200, response.text
     assert response.json()["data"] == []  # Registered is not the same as observed.
+    projects = ["historical", "other", "project+1", "sglang-only"]
+    calls = [path for path, _ in stack.backend.calls if path.startswith("/api/v1/")]
+    response = requests.get(catalog + "project/values", params=params, timeout=3)
+    assert response.status_code == 200, response.text
+    assert response.json()["data"] == projects
+    assert calls == [
+        path for path, _ in stack.backend.calls if path.startswith("/api/v1/")
+    ]  # Project discovery needs no metrics backend.
     stack.backend.series = [
         {"run_id": runs[0]["run_id"], "name": "vllm:num_requests_running", "time": 150},
         {"run_id": runs[1]["run_id"], "name": "vllm:num_requests_running", "time": 250},
@@ -260,8 +268,16 @@ def test_dashboard_candidates_follow_observed_metrics(stack):
         re.search(r'\|same\+name\.\\"_\d{8}_\d{6}_[0-9a-f]{8}$', item)
         for item in choices
     )
-    assert values("project") == ["other", "project+1"]
-    assert [item.split("|", 1)[0] for item in values(end=200)] == [runs[0]["run_id"]]
+    assert values("project") == projects
+    assert values("project", start=400, end=500) == projects
+    assert values(start=400, end=500) == choices
+    assert values(end=200) == choices
+    assert values() == choices
+    path = next(
+        path for path, _ in reversed(stack.backend.calls) if path.startswith("/api/v1/")
+    )
+    assert urlsplit(path).path == "/api/v1/label/run_id/values"
+    assert set(parse_qs(urlsplit(path).query)) == {"match[]"}
     assert [
         item.split("|", 1)[0]
         for item in values(
@@ -279,6 +295,8 @@ def test_dashboard_candidates_follow_observed_metrics(stack):
         )
     ] == [runs[2]["run_id"]]
     assert values(**{"match[]": '{__name__=~"vllm_omni:.*",project=~".*"}'}) == []
+    assert values("project", **{"match[]": '{__name__=~"vllm_omni:.*"}'}) == projects
+    assert values(**{"match[]": '{__name__=~"vllm:.*",project=~"historical"}'}) == []
     for pattern, selected, expected in (
         ("vllm:.*", runs[0]["run_id"], [runs[0]["run_id"]]),
         ("vllm_omni:.*", runs[0]["run_id"], []),

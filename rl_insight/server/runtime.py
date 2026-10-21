@@ -20,7 +20,6 @@ import configparser
 import datetime as _dt
 import errno
 import json
-import math
 import os
 import re
 import shutil
@@ -936,7 +935,10 @@ DEFAULT_TEMPLATE = "verl/verl_tainer_v1_with_vllm_engine.json"
 
 
 def run_options(registry, conf, label, fields):
-    """Join observed metric identities with execution metadata for Grafana."""
+    """List stored projects or observed executions for Grafana."""
+    if label == "project":
+        return sorted({record["context"]["project"] for record in registry.list_runs()})
+
     from .http_api import read_backend
 
     if not bool(OmegaConf.select(conf, "prometheus.enable", default=True)):
@@ -968,40 +970,16 @@ def run_options(registry, conf, label, fields):
         literal + r"|\(" + literal + r"(?:\|" + literal + r")*\)", project
     ):
         raise RunError("Unsupported project selection", 422)
-    bounds = {}
-    for key in ("start", "end"):
-        values = [value for name, value in fields if name == key]
-        if len(values) > 1:
-            raise RunError("Expected one time range", 422)
-        try:
-            bounds[key] = float(values[0]) if values else None
-        except ValueError as exc:
-            raise RunError("Invalid time range", 422) from exc
-    end = bounds["end"] if bounds["end"] is not None else time.time()
-    start = bounds["start"] if bounds["start"] is not None else end - 900
-    if (
-        not math.isfinite(start)
-        or not math.isfinite(end)
-        or not 0 < end - start <= 2**31 - 1
-    ):
-        raise RunError("Invalid time range", 422)
-    # Query actual samples: metadata can include out-of-window series.
-    # last_over_time preserves metric names until aggregation, avoiding
-    # duplicate label sets when the template matches several metric families.
-    expression = (
-        "count by (run_id) (last_over_time({__name__=~"
-        + match[1]
-        + ',run_id!=""}['
-        + str(math.ceil(end - start))
-        + "s]))"
-    )
+    # Discover matching executions across retained history, independently of
+    # the dashboard's display window.
+    expression = "{__name__=~" + match[1] + ',run_id!=""}'
     endpoint = "http://" + format_host_port(
         local_addresses()["loopback"],
         int(OmegaConf.select(conf, "prometheus.prometheus_port", default=9090)),
     )
     status, body = read_backend(
-        endpoint + "/api/v1/query",
-        [("query", expression), ("time", str(end))],
+        endpoint + "/api/v1/label/run_id/values",
+        [("match[]", expression)],
     )
     try:
         payload = json.loads(body)
@@ -1012,23 +990,18 @@ def run_options(registry, conf, label, fields):
         ):
             raise ValueError("Metric discovery failed")
         data = payload["data"]
-        if (
-            not isinstance(data, dict)
-            or data.get("resultType") != "vector"
-            or not isinstance(data.get("result"), list)
+        if not isinstance(data, list) or not all(
+            isinstance(run_id, str) for run_id in data
         ):
-            raise ValueError("Expected metric samples")
-        observed = {item["metric"]["run_id"] for item in data["result"]}
-        if not all(isinstance(run_id, str) for run_id in observed):
             raise ValueError("Expected metric identities")
+        observed = set(data)
     except (ValueError, KeyError, TypeError) as exc:
         raise RunError("Invalid metric discovery response", 502) from exc
-    options, projects = [], set()
+    options = []
     for record in registry.list_runs():
         run = record["context"]
         if run["run_id"] not in observed:
             continue
-        projects.add(run["project"])
         if (selected is None or selected == run["run_id"]) and (
             project == ".*" or re.fullmatch(project, run["project"])
         ):
@@ -1038,7 +1011,7 @@ def run_options(registry, conf, label, fields):
                 if label == "run_id"
                 else f"{run['run_id']}|{run['experiment_name']}_{started:%Y%m%d_%H%M%S}_{run['run_id'][:8]}"
             )
-    return sorted(projects) if label == "project" else options
+    return options
 
 
 def run_dashboard(template: Path):
