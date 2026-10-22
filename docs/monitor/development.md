@@ -13,7 +13,7 @@ boundaries for contributors. For installation and usage, see
 | `server/registry.py` | Persist Run identity and lifecycle metadata; track target ownership and expiring registrations in memory. |
 | `server/http_api.py` | Accept Run and target requests and periodically project active registrations into service discovery. |
 | `utils/prometheus_utils.py` | Publish and renew registrations; maintain the existing Prometheus target file. |
-| `server/runtime.py` | Launch services, prepare scrape configuration, and provision the existing dashboards and Run-scoped data sources. |
+| `server/runtime.py` | Launch services, prepare scrape configuration, and provision the existing dashboards with fixed query data sources. |
 
 Paths above are relative to `rl_insight/`. Framework integrations continue using
 the existing SDK and target registration calls; concurrency adds no
@@ -22,6 +22,11 @@ framework-specific adapter or exporter wrapper. The push backend is unchanged.
 ## Collection and registration
 
 Each independent Ray job has a named, non-detached Hub and its own RunContext.
+The SDK creates the timestamp-prefixed Run ID before registration and retries
+with that identity. Workers initialized before the configured training client
+buffer events and attach to its Run; they do not create an unnamed execution.
+RunContext is defined once in `utils/protocol.py` and returned directly through
+Ray, including connection information and live event counts.
 The default `prometheus.metrics_report_port` is `0`; the Hub records the actual
 port after binding. An explicit port retains fixed-port behavior.
 
@@ -77,9 +82,10 @@ does not automatically mark a Run failed or ended.
 
 ## Persistence and recovery
 
-Run metadata lives in `data/runs.sqlite`. Per-Run `run.json` and `config.json`
-files under `data/runs/<run_id>/` are projections of that registry. Prometheus
-and Tempo use shared storage under `data/prometheus` and `data/tempo`.
+Run identity, allowlisted configuration and lifecycle metadata live only in
+`data/runs.sqlite`. There are no per-Run JSON snapshots or copied telemetry
+files. Prometheus and Tempo use shared storage under `data/prometheus` and
+`data/tempo`.
 
 Renewable target leases are intentionally not persisted. At server startup,
 stale renewable discovery entries are removed; surviving SDK processes
@@ -109,11 +115,16 @@ Grafana folders follow the directory structure. External dashboard directories
 use the same destination; user instructions are in
 [Custom Grafana Dashboards](./custom_dashboards.md).
 
-Run-aware views reuse the bundled panels and layout. The **Experiment** variable
-lists executions with matching metrics in the selected time range. Its display
-label contains the experiment name, UTC creation time and short ID; its value
-selects the Run. Project and time-range changes refresh the choices. Run-scoped
-Prometheus and Tempo data sources constrain both metrics and trace queries.
+Run-aware views reuse the latest bundled panels and layout, including training
+step plots backed by `metric_log` point records in Tempo. The **Experiment**
+variable supports multiple executions and All. Its display label contains the
+experiment name, UTC creation time and short ID; its value selects Run IDs.
+Choices depend on the project and observed metrics, independently of chart time.
+
+Grafana uses fixed Prometheus and Tempo query data sources. The server validates
+the selected Run IDs and constrains metric and trace expressions to that set.
+No per-Run data sources or query-time Grafana mutations are needed. Timeline
+identity metadata is hidden from plotted states; multi-Run lanes remain distinct.
 
 ## Compatibility and limits
 
@@ -125,8 +136,8 @@ Prometheus and Tempo data sources constrain both metrics and trace queries.
 - A new SDK can register directly with a server predating renewable targets,
   but cannot obtain renewal and owner-close behavior from it. Upgrade the
   server before SDK clients to use concurrent Run lifecycle management.
-- The Run database migration adds lifecycle columns. A server predating this
-  migration uses positional inserts and cannot create new Runs against the
+- The Run database migration adds lifecycle columns. The PR201 registry uses
+  positional inserts and cannot create new Runs against the
   migrated database. Direct downgrade is unsupported; retain a pre-upgrade
   backup if rollback is needed.
 - Direct scraping does not verify response ownership on each scrape. TTL limits

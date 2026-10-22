@@ -64,6 +64,9 @@ finally:
     ray.shutdown()
 ```
 
+For training metrics plotted by step, use
+`insight.metric_log("reward", 0.5, step=step)`.
+
 In distributed training, initialize monitoring in the workers as required by
 your integration. Wait for all workers to finish before calling `finish()` in
 the process that first initialized monitoring for the job.
@@ -80,10 +83,10 @@ login is `admin` / `admin`.
 4. Use **Project** and **Experiment** to choose the execution. Experiment choices
    include the experiment name, UTC start time, and a short ID, so repeated
    executions with the same name can be distinguished. The selection applies to
-   both metrics and traces.
+   both metrics and traces. Select multiple executions or **All** to compare jobs.
 
-Only executions with matching metrics in the selected time range are listed.
-Expand the time range to view earlier training. To add your own panels, see
+Execution choices depend on the selected project and collected metrics, not the
+chart time range. Set the time range to cover the selected training execution. To add your own panels, see
 [Custom Grafana Dashboards](./custom_dashboards.md).
 
 ## Monitor concurrent training jobs
@@ -136,6 +139,6 @@ or traces, and a failed monitoring process is not automatically recreated.
 | --- | --- |
 | Server reports missing or incompatible services | Run `rl-insight server install`, then start again. |
 | Dashboard is missing | Open **Dashboards**, then expand the appropriate folder. |
-| Execution is missing from **Experiment** | Check **Project**, expand the time range, and confirm the training job has sent metrics. |
+| Execution is missing from **Experiment** | Check **Project** and confirm the training job has sent metrics. Changing the chart time range does not change the execution list. |
 | Metrics are missing | Verify the server URL in every worker and that Prometheus can reach the training metrics endpoints. Open `http://<server-ip>:9090/targets` to check their status. |
 | Traces are missing | Verify that training processes can reach the trace port (default `4318`), select the correct execution and time range, and allow time for export. |

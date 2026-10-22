@@ -27,7 +27,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
-from ..protocol import RunContext, RunError
 
 import requests
 import yaml
@@ -42,6 +41,7 @@ from .constants import (
     PrometheusScrape,
     prometheus_targets_file_from_config,
 )
+from .protocol import RunContext, RunError
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.WARNING)
@@ -56,6 +56,8 @@ _pending_probe: threading.Thread | None = None
 def _wait_for_context() -> None:
     """Retry pending native targets for the lifetime of their worker process."""
     global _pending_probe
+    from ray.exceptions import RayActorError
+
     from ..client.ray_monitor_client import current_job_context
 
     delay = 0.1
@@ -64,9 +66,16 @@ def _wait_for_context() -> None:
             if not _pending_targets:
                 _pending_probe = None
                 return
-        context = current_job_context()
-        if context:
-            flush_pending_targets(context)
+        try:
+            context = current_job_context()
+            if context:
+                flush_pending_targets(context)
+        except (RunError, RayActorError) as exc:
+            logger.error("[rl-insight] Cannot resolve native target identity: %s", exc)
+            with _pending_lock:
+                _pending_targets.clear()
+                _pending_probe = None
+            return
         time.sleep(delay)
         delay = min(delay * 2, 2)
 
@@ -75,7 +84,12 @@ def flush_pending_targets(context: RunContext | None) -> None:
     with _pending_lock:
         pending = list(_pending_targets)
     for item in pending:
-        if _register_targets(*item, context):
+        try:
+            done = _register_targets(*item, context)
+        except RunError as exc:
+            logger.error("[rl-insight] Native target registration rejected: %s", exc)
+            done = True
+        if done:
             with _pending_lock:
                 if item in _pending_targets:
                     _pending_targets.remove(item)
@@ -217,32 +231,6 @@ class PrometheusTargetStore:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def _read_targets(self) -> dict[tuple[str, str], dict[str, str]]:
-        if not self.targets_file.exists():
-            return {}
-        groups = yaml.safe_load(self.targets_file.read_text(encoding="utf-8")) or []
-        if not isinstance(groups, list):
-            raise ValueError("Prometheus file_sd targets must be a list")
-
-        target_map: dict[tuple[str, str], dict[str, str]] = {}
-        for group in groups:
-            if not isinstance(group, Mapping):
-                raise ValueError(
-                    "Each Prometheus file_sd target group must be an object"
-                )
-            raw_labels = group.get("labels") or {}
-            if not isinstance(raw_labels, Mapping):
-                raise ValueError("Prometheus file_sd target labels must be an object")
-            labels = {str(key): str(value) for key, value in raw_labels.items()}
-            stored_job = labels.pop(PrometheusScrape.DYNAMIC_JOB_LABEL, "").strip()
-            if not stored_job:
-                raise ValueError(
-                    "Prometheus file_sd target group is missing managed job label"
-                )
-            for target in group.get("targets") or []:
-                target_map[(stored_job, str(target))] = dict(labels)
-        return target_map
-
     def check_ownership(self, targets, run_id):
         with self._lock, self._file_lock():
             addresses = {t.target for t in targets}
@@ -273,6 +261,32 @@ class PrometheusTargetStore:
                 }
             )
             self._write_targets(direct)
+
+    def _read_targets(self) -> dict[tuple[str, str], dict[str, str]]:
+        if not self.targets_file.exists():
+            return {}
+        groups = yaml.safe_load(self.targets_file.read_text(encoding="utf-8")) or []
+        if not isinstance(groups, list):
+            raise ValueError("Prometheus file_sd targets must be a list")
+
+        target_map: dict[tuple[str, str], dict[str, str]] = {}
+        for group in groups:
+            if not isinstance(group, Mapping):
+                raise ValueError(
+                    "Each Prometheus file_sd target group must be an object"
+                )
+            raw_labels = group.get("labels") or {}
+            if not isinstance(raw_labels, Mapping):
+                raise ValueError("Prometheus file_sd target labels must be an object")
+            labels = {str(key): str(value) for key, value in raw_labels.items()}
+            stored_job = labels.pop(PrometheusScrape.DYNAMIC_JOB_LABEL, "").strip()
+            if not stored_job:
+                raise ValueError(
+                    "Prometheus file_sd target group is missing managed job label"
+                )
+            for target in group.get("targets") or []:
+                target_map[(stored_job, str(target))] = dict(labels)
+        return target_map
 
     def reload(self) -> bool:
         url = (
@@ -505,11 +519,16 @@ def update_prometheus_config(
             f"{len(labels)} != {len(server_addresses)}"
         )
 
-    # Push targets stay local and do not require a server or RunContext.
+    # Push backend: no external RL-Insight server is involved. Register targets
+    # in-process so the local rollout poller scrapes them directly.
     from ..client.push.poller import get_active_registry
 
     registry = get_active_registry()
     if registry is None:
+        # Targets may be registered from a Ray actor process that never called
+        # rl_insight.init() (e.g. the verl colocated rollout actor). For the
+        # direct-emit push backend the client is self-contained, so lazily start
+        # it in this process once; its poller owns the scrape target registry.
         registry = _bootstrap_push_registry()
     if registry is not None:
         registry.set_targets(server_addresses, labels)
@@ -521,7 +540,7 @@ def update_prometheus_config(
 
     initialized = True
     if context is None:
-        from ..api import get_context, _client_initialized
+        from ..api import _client_initialized, get_context
 
         context = get_context()
         initialized = _client_initialized()
@@ -542,7 +561,7 @@ def update_prometheus_config(
         if not initialized:
             from ..server.http_api import get_server_services
 
-            if get_server_services().get("run_context_version") == 1:
+            if get_server_services():
                 # Wait for logger initialization; never create a Run from an address.
                 from ..client.ray_monitor_client import current_job_context
 
@@ -691,6 +710,16 @@ def _register_targets(
     except requests.RequestException as exc:
         success = False
         delay = _registration_retry(base_url, payload, exc) if context else None
+        if (
+            delay is None
+            and exc.response is not None
+            and 400 <= exc.response.status_code < 500
+            and exc.response.status_code not in {408, 429}
+        ):
+            raise RunError(
+                "Target registration rejected: " + exc.response.text[:512],
+                exc.response.status_code,
+            ) from exc
         logger.warning("Target registration failed: %s", exc)
     if context and delay is not None:
         with _publication_lock:

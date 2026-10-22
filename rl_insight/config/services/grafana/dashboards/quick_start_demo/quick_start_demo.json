@@ -62,7 +62,7 @@
                       "spec": {
                         "limit": 100,
                         "metricsQueryType": "range",
-                        "query": "{span.state_lane_id != \"\"}",
+                        "query": "{span.\"monitor.trace_segment\"=\"state_interval\" && span.state_lane_id!=\"\"} | select(span.state_lane_id)",
                         "queryType": "traceql",
                         "serviceMapUseNativeHistograms": false,
                         "spss": 100,

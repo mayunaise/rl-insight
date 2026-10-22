@@ -204,7 +204,7 @@ def test_register_should_preserve_concurrent_cross_process_updates(tmp_path) -> 
 def test_update_prometheus_config_should_send_normalized_targets_when_server_is_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    response = MagicMock()
+    response = MagicMock(status_code=200)
     post = MagicMock(return_value=response)
     monkeypatch.setenv("RL_INSIGHT_SERVER_URL", "http://server:18080/")
     monkeypatch.setattr(prometheus_module.requests, "post", post)
@@ -262,29 +262,24 @@ def test_update_prometheus_config_should_register_in_process_when_push_active(
     post.assert_not_called()
 
 
-def test_discovery_projection_retries_windows_sharing_and_skips_unchanged_files(
-    tmp_path, monkeypatch
+def test_deferred_targets_drop_permanent_errors_and_keep_transient_failures(
+    monkeypatch,
 ):
-    targets = tmp_path / "targets.yml"
-    store = prometheus_module.PrometheusTargetStore(
-        tmp_path / "prometheus.yml", 9090, targets_file=targets
-    )
-    replace = prometheus_module.os.replace
-    attempts = {}
+    from rl_insight.utils.protocol import RunContext
 
-    def busy_once(source, destination):
-        attempts[destination] = attempts.get(destination, 0) + 1
-        if attempts[destination] == 1:
-            error = PermissionError("Prometheus briefly holds the discovery file")
-            error.winerror = 5
-            raise error
-        return replace(source, destination)
-
-    monkeypatch.setattr(prometheus_module.os, "replace", busy_once)
-    monkeypatch.setattr(prometheus_module.time, "sleep", lambda _: None)
-    store.project_runs([])
-    assert yaml.safe_load(targets.read_text(encoding="utf-8")) == []
-    assert list(attempts.values()) == [2]
-    store.project_runs([])
-    assert list(attempts.values()) == [2]
-    assert not list(tmp_path.glob("*.tmp"))
+    context = RunContext.create("p", "e", "http://server")
+    item = (["host:9000"], "workers", None)
+    monkeypatch.setattr(prometheus_module, "_pending_targets", [item])
+    response = prometheus_module.requests.Response()
+    response.status_code = 400
+    response._content = b"invalid registration"
+    post = MagicMock(return_value=response)
+    monkeypatch.setattr(prometheus_module, "_publication_thread", MagicMock())
+    monkeypatch.setattr(prometheus_module, "_target_publications", {})
+    monkeypatch.setattr(prometheus_module.requests, "post", post)
+    prometheus_module.flush_pending_targets(context)
+    assert not prometheus_module._pending_targets
+    prometheus_module._pending_targets.append(item)
+    post.side_effect = prometheus_module.requests.ConnectionError("offline")
+    prometheus_module.flush_pending_targets(context)
+    assert prometheus_module._pending_targets == [item]

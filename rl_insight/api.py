@@ -23,16 +23,17 @@ import os
 import threading
 import time
 import warnings
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Generator, Mapping
+from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
 from .client import create_monitor_client
-from .protocol import RunContext, RunError
-from .utils.monitor_config_loader import load_monitor_config
 from .utils import MonitorBackend, MonitorEventKind
+from .utils.monitor_config_loader import load_monitor_config
+from .utils.protocol import RunContext, RunError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -44,9 +45,10 @@ __all__ = [
     "metric_count",
     "metric_gauge",
     "metric_histogram",
+    "metric_log",
+    "trace_op",
     "trace_span",
     "trace_state",
-    "trace_op",
 ]
 
 
@@ -89,10 +91,21 @@ def init(
         config: Optional dict-like or ``DictConfig`` overrides merged into training defaults; see ``load_monitor_config``.
 
     Note:
-        Repeated calls are ignored with ``RuntimeWarning``. Ray backend requires ``ray.init()`` first.
+        Ray requires ``ray.init()`` first. Argument-free Ray initialization attaches
+        to the current job's configured Run, buffering early events until that Run
+        exists. A later call with identity or config can complete initialization.
+        Other repeated calls are ignored with ``RuntimeWarning``.
     """
     global _STATE
-    if _STATE.enabled:
+    configured = (
+        project is not None or experiment_name is not None or config is not None
+    )
+    attaching = (
+        _STATE.conf is not None
+        and _STATE.conf.server.backend == MonitorBackend.RAY
+        and not _STATE.conf.get("run_metadata")
+    )
+    if _STATE.enabled and not (attaching and configured):
         warnings.warn(
             "[rl-insight] monitor.init() called more than once; "
             "ignoring re-initialization.",
@@ -111,15 +124,16 @@ def init(
             "or server.url in init config."
         )
         return
-    OmegaConf.update(
-        monitor_conf,
-        "run_metadata",
-        {
-            "project": project or "uncategorized",
-            "experiment_name": experiment_name or "unnamed",
-        },
-        force_add=True,
-    )
+    if configured or backend != MonitorBackend.RAY:
+        OmegaConf.update(
+            monitor_conf,
+            "run_metadata",
+            {
+                "project": project or "uncategorized",
+                "experiment_name": experiment_name or "unnamed",
+            },
+            force_add=True,
+        )
     client = create_monitor_client(monitor_conf)
     context = getattr(client, "get_context", lambda: None)() if client else None
     if context and (
@@ -130,11 +144,12 @@ def init(
     labels = {
         key: value
         for key, value in {
-            "project": project,
-            "experiment_name": experiment_name,
+            "project": context.project if context else project,
+            "experiment_name": context.experiment_name if context else experiment_name,
         }.items()
         if value is not None
     }
+    previous = _STATE.client
     _STATE = _MonitorState(
         enabled=client is not None,
         client=client,
@@ -143,19 +158,26 @@ def init(
         labels=labels,
         context=context,
     )
-    if client:
+    if previous is not None and previous is not client and hasattr(previous, "close"):
+        previous.close()
+    if client and (context is not None or backend != MonitorBackend.RAY):
         from .utils.prometheus_utils import flush_pending_targets
 
         flush_pending_targets(context)
 
 
 def get_context() -> RunContext | None:
-    """Return the current immutable identity, if supported by the client."""
-    return _STATE.context
+    """Return an immutable snapshot of the current Run identity and live status."""
+    return _STATE.client.get_context() if _STATE.client else None
 
 
 def _client_initialized() -> bool:
-    return _STATE.enabled
+    return _STATE.enabled and (
+        _STATE.context is not None
+        or (
+            _STATE.conf is not None and _STATE.conf.server.backend != MonitorBackend.RAY
+        )
+    )
 
 
 def finish() -> None:
@@ -172,7 +194,7 @@ def finish() -> None:
         if client is not None and hasattr(client, "close"):
             try:
                 client.close()
-            except Exception:  # noqa: BLE001 - shutdown must never raise
+            except Exception:
                 logger.debug("[rl-insight] client.close() failed", exc_info=True)
         _STATE = _MonitorState()
         _LANES.clear()
@@ -221,6 +243,39 @@ def metric_histogram(
     """
     doc = documentation or f"Histogram {name}"
     _emit(MonitorEventKind.HISTOGRAM, name, float(value), doc, labels)
+
+
+def metric_log(
+    name: str,
+    value: float,
+    *,
+    step: int,
+    **labels: Any,
+) -> None:
+    """Record a metric value for one training step in Tempo.
+
+    Args:
+        name: Metric name.
+        value: Observed value.
+        step: Training step.
+        **labels: Extra attributes attached to the record.
+    """
+    if not _STATE.enabled or _STATE.client is None:
+        return
+    # Tempo requires span timestamps; this is a point record, not a duration.
+    now = time.time_ns()
+    _emit_trace_span(
+        name="metric_log",
+        start_time_ns=now,
+        end_time_ns=now,
+        attributes={
+            **labels,
+            "monitor.trace_segment": "metric_log",
+            "metric.name": name,
+            "metric.value": float(value),
+            "global_step": int(step),
+        },
+    )
 
 
 @dataclass

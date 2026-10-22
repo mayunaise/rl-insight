@@ -17,9 +17,13 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
+from datetime import datetime, timezone
 from typing import Any, Mapping
 from urllib.parse import urlsplit
+from uuid import uuid4
+
+from .. import __version__
 
 
 class RunError(ValueError):
@@ -29,8 +33,15 @@ class RunError(ValueError):
 
 
 def validate_id(value: str) -> str:
-    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
-        raise RunError("Invalid Run/request ID")
+    if not isinstance(value, str) or not re.fullmatch(
+        r"(?:[0-9]{8}T[0-9]{6}Z_)?[0-9a-f]{32}", value
+    ):
+        raise RunError("Invalid Run ID")
+    if "_" in value:
+        try:
+            datetime.strptime(value.split("_", 1)[0], "%Y%m%dT%H%M%SZ")
+        except ValueError as exc:
+            raise RunError("Invalid Run timestamp") from exc
     return value
 
 
@@ -40,9 +51,39 @@ class RunContext:
     project: str
     experiment_name: str
     server_url: str
+    actor_name: str | None = None
+    namespace: str | None = None
+    node_ip: str | None = None
+    metrics_endpoint: str | None = None
+    otlp_endpoint: str | None = None
+    prometheus_metrics_enabled: bool | None = None
+    otel_traces_enabled: bool | None = None
+    events_applied: int | None = None
+
+    @classmethod
+    def create(cls, project: str, experiment_name: str, server_url: str) -> RunContext:
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ_") + uuid4().hex
+        return cls(run_id, project, experiment_name, server_url)
 
     def __post_init__(self) -> None:
         validate_id(self.run_id)
+        for field_name in (
+            "actor_name",
+            "namespace",
+            "node_ip",
+            "metrics_endpoint",
+            "otlp_endpoint",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, str):
+                raise RunError("Invalid Context connection field")
+        for value in (self.prometheus_metrics_enabled, self.otel_traces_enabled):
+            if value is not None and type(value) is not bool:
+                raise RunError("Invalid Context status flag")
+        if self.events_applied is not None and (
+            type(self.events_applied) is not int or self.events_applied < 0
+        ):
+            raise RunError("Invalid Context event count")
         for name in (self.project, self.experiment_name):
             if not isinstance(name, str) or not name.strip() or len(name) > 256:
                 raise RunError(
@@ -69,17 +110,31 @@ class RunContext:
         object.__setattr__(self, "server_url", self.server_url.rstrip("/"))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"version": 1, **asdict(self)}
+        return {
+            "version": __version__,
+            **{k: v for k, v in asdict(self).items() if v is not None},
+        }
+
+    def metadata(self) -> dict[str, Any]:
+        """Persist stable identity only; runtime status is a query-time snapshot."""
+        return {
+            "version": __version__,
+            **{
+                k: getattr(self, k)
+                for k in ("run_id", "project", "experiment_name", "server_url")
+            },
+        }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> RunContext:
         try:
-            if value.get("version") != 1:
-                raise ValueError
+            if not isinstance(value, Mapping):
+                raise TypeError
             return cls(
                 **{
-                    name: value[name]
-                    for name in ("run_id", "project", "experiment_name", "server_url")
+                    field.name: value[field.name]
+                    for field in fields(cls)
+                    if field.name in value
                 }
             )
         except (KeyError, TypeError, ValueError) as exc:

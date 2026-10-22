@@ -12,26 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run catalog with recoverable, readable per-Run file projections.
+"""SQLite Run catalog for identity, idempotent creation and metadata queries.
 
-SQLite owns identity, idempotent creation and creation time. JSON under
-``runs/<full_run_id>/`` is an atomic metadata/config projection, not separate
-Prometheus/Tempo storage. Names never participate in paths or identity.
+Prometheus/Tempo retain shared storage. No per-Run file copies are maintained.
 """
 
 from __future__ import annotations
 
-import json
 import hashlib
-import os
+import json
 import sqlite3
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
-from uuid import uuid4
+from typing import Any
 
-from ..protocol import RunContext, RunError, validate_id
+from .. import __version__
+from ..utils.protocol import RunContext, RunError, validate_id
 
 
 def _json(value: Any) -> str:
@@ -90,22 +88,21 @@ class RunRegistry:
 
     def create(
         self,
-        request_id: str,
+        run_id: str,
         project: str,
         experiment_name: str,
         server_url: str,
         config: Mapping[str, Any],
         owner_token: str = "",
     ) -> RunContext:
-        validate_id(request_id)
         if owner_token:
             validate_id(owner_token)
-        context = RunContext(uuid4().hex, project, experiment_name, server_url)
+        context = RunContext(run_id, project, experiment_name, server_url)
         snapshot = _config_snapshot(config)
         with self._lock, self._db:
             self._db.execute("BEGIN IMMEDIATE")
             row = self._db.execute(
-                "SELECT * FROM runs WHERE request_id=?", (request_id,)
+                "SELECT * FROM runs WHERE run_id=?", (run_id,)
             ).fetchone()
             if row:
                 expected_owner = (
@@ -128,12 +125,13 @@ class RunRegistry:
                     )
                 context = existing
             else:
+                # Caller-owned IDs are also idempotent request keys.
                 self._db.execute(
                     "INSERT INTO runs (run_id,request_id,context,config,created_at,owner_hash) VALUES (?,?,?,?,?,?)",
                     (
                         context.run_id,
-                        request_id,
-                        _json(context.to_dict()),
+                        run_id,
+                        _json(context.metadata()),
                         _json(snapshot),
                         time.time(),
                         hashlib.sha256(owner_token.encode()).hexdigest()
@@ -141,8 +139,6 @@ class RunRegistry:
                         else "",
                     ),
                 )
-        # The DB owns identity. A failed projection can be rebuilt on get/retry.
-        self.snapshot(context.run_id)
         return context
 
     def get(self, run_id: str) -> RunContext:
@@ -168,24 +164,20 @@ class RunRegistry:
                 raise RunError("Run not found", 404)
             return row
 
-    def snapshot(self, run_id: str) -> dict[str, Any]:
-        with self._lock:
-            row = self._read_run(run_id)
-            context = RunContext.from_dict(json.loads(row["context"]))
-            directory = self.root / "runs" / run_id
-            metadata = {
-                "schema_version": 1,
-                "context": context.to_dict(),
-                "created_at": row["created_at"],
-                "status": row["status"],
-                "ended_at": row["ended_at"],
-                "final_collection_confirmed": None
-                if row["final_confirmed"] is None
-                else bool(row["final_confirmed"]),
-            }
-            self._write(directory / "run.json", metadata)
-            self._write(directory / "config.json", json.loads(row["config"]))
-            return metadata
+    def describe(self, run_id: str) -> dict[str, Any]:
+        """Read execution metadata and allowlisted config without writing files."""
+        row = self._read_run(run_id)
+        return {
+            "version": __version__,
+            "context": RunContext.from_dict(json.loads(row["context"])).to_dict(),
+            "config": json.loads(row["config"]),
+            "created_at": row["created_at"],
+            "status": row["status"],
+            "ended_at": row["ended_at"],
+            "final_collection_confirmed": None
+            if row["final_confirmed"] is None
+            else bool(row["final_confirmed"]),
+        }
 
     def assert_open(self, run_id: str, *, allow_closing: bool = True) -> None:
         status = self._read_run(run_id)["status"]
@@ -244,7 +236,6 @@ class RunRegistry:
                     for key, value in self._targets.items()
                     if value["run_id"] != run_id
                 }
-        self.snapshot(run_id)
 
     def register_targets(self, context, publisher_id, job_name, targets):
         """Renew target ownership; only existing targets may renew while closing."""
@@ -290,16 +281,6 @@ class RunRegistry:
                 if val["expires_at"] > now
             }
             return list(self._targets.values())
-
-    @staticmethod
-    def _write(path: Path, value: Any) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name("." + path.name + "." + uuid4().hex)
-        try:
-            temporary.write_text(_json(value) + "\n", encoding="utf-8")
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
 
     def close(self) -> None:
         with self._lock:

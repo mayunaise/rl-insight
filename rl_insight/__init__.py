@@ -21,7 +21,8 @@ importing trainer-side optional dependencies such as Ray or OpenTelemetry.
 from __future__ import annotations
 
 from importlib import import_module
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any
 
@@ -54,11 +55,12 @@ _EXPORTS = {
     "agent_loop_session": ".agent_loop",
     "finish": ".api",
     "get_context": ".api",
-    "RunContext": ".protocol",
+    "RunContext": ".utils.protocol",
     "init": ".api",
     "metric_count": ".api",
     "metric_gauge": ".api",
     "metric_histogram": ".api",
+    "metric_log": ".api",
     "trace_op": ".api",
     "trace_span": ".api",
     "trace_state": ".api",

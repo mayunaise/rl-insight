@@ -25,21 +25,22 @@ import time
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from threading import Event, Lock, RLock, Thread
+from threading import Event, RLock, Thread
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 import requests
 import uvicorn
-from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Request, status
+from fastapi import Body, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from omegaconf import DictConfig, OmegaConf
 from starlette.concurrency import run_in_threadpool
 
-from ..protocol import RunContext, RunError
+from .. import __version__
 from ..utils.constants import MonitorEnv, MonitorPaths, MonitorServer, PrometheusScrape
 from ..utils.monitor_config_loader import load_server_config_file
 from ..utils.prometheus_utils import PrometheusTarget, PrometheusTargetStore
+from ..utils.protocol import RunContext, RunError, validate_id
 from .network import format_host_port, local_addresses
 from .registry import RunRegistry
 
@@ -121,7 +122,6 @@ def create_app(conf: DictConfig) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app):
         try:
-            await run_in_threadpool(refresh_views)
             await run_in_threadpool(project)
             thread = Thread(
                 target=projection_loop, name="insight-run-discovery", daemon=True
@@ -134,9 +134,9 @@ def create_app(conf: DictConfig) -> FastAPI:
                 await run_in_threadpool(thread.join, 6)
             registry.close()
 
-    app = FastAPI(title="RL-Insight server", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="RL-Insight server", version=__version__, lifespan=lifespan)
     install_queries(app, registry, conf)
-    refresh_views = install_views(app, registry, conf)
+    install_views(app, registry, conf)
 
     @app.exception_handler(RunError)
     async def run_error(_request, exc):
@@ -145,23 +145,21 @@ def create_app(conf: DictConfig) -> FastAPI:
     @app.post("/api/v1/runs")
     def create_run(
         request: Request,
-        background: BackgroundTasks,
         payload: dict[str, Any] = Body(...),
     ):
         context = registry.create(
-            payload.get("request_id", ""),
+            payload.get("run_id", ""),
             payload.get("project", "uncategorized"),
             payload.get("experiment_name", "unnamed"),
             str(OmegaConf.select(conf, "server.public_url") or request.base_url),
             payload.get("config", {}),
             payload.get("owner_token", ""),
         )
-        background.add_task(refresh_views, str(request.base_url))
         return context.to_dict()
 
     @app.get("/api/v1/runs/{run_id}")
     def get_run(run_id: str):
-        return registry.snapshot(run_id)
+        return registry.describe(run_id)
 
     @app.post("/api/v1/runs/{run_id}/close")
     def close_run(run_id: str, payload: dict[str, Any] = Body(...)):
@@ -186,7 +184,7 @@ def create_app(conf: DictConfig) -> FastAPI:
         """Expose enabled component ports for trainer-side endpoint discovery."""
         return {
             "status": "ok",
-            "run_context_version": 1,
+            "server_version": __version__,
             "target_registration_version": 1,
             "otlp_port": (
                 int(OmegaConf.select(conf, "otel.otel_port"))
@@ -276,7 +274,11 @@ def create_app(conf: DictConfig) -> FastAPI:
         if "run_context" in payload:
             supplied = RunContext.from_dict(payload["run_context"])
             context = registry.get(supplied.run_id)
-            if context != supplied:
+            if (context.run_id, context.project, context.experiment_name) != (
+                supplied.run_id,
+                supplied.project,
+                supplied.experiment_name,
+            ):
                 raise RunError("RunContext conflicts with registered metadata", 409)
             targets = [
                 PrometheusTarget(target.target, context.labels(target.labels))
@@ -370,16 +372,73 @@ def _tokens(query):
     return result
 
 
-def prometheus(query: str, identity: RunContext) -> str:
+def _run_ids(identity: RunContext | Sequence[RunContext]) -> tuple[str, ...]:
+    contexts = (identity,) if isinstance(identity, RunContext) else identity
+    return tuple(sorted({context.run_id for context in contexts}))
+
+
+def _literal_ids(operator: str, value: str) -> tuple[str, ...]:
+    """Accept exact IDs or Grafana's finite alternation, never arbitrary regex."""
+    if operator in {"=", "=="}:
+        return (validate_id(value),) if value else ()
+    if operator != "=~":
+        raise RunError("Run selection must use positive finite identities", 422)
+    if value.startswith("^") and value.endswith("$"):
+        value = value[1:-1]
+    if value.startswith("(") and value.endswith(")"):
+        value = value[1:-1]
+    if not value:
+        return ()
+    return tuple(sorted({validate_id(part) for part in value.split("|")}))
+
+
+def _scope_condition(identity: RunContext | Sequence[RunContext], tempo=False) -> str:
+    ids = _run_ids(identity)
+    value = ids[0] if len(ids) == 1 else "(" + "|".join(ids) + ")"
+    return (
+        ("resource.rl_insight.run_id" if tempo else "run_id")
+        + ("=" if len(ids) == 1 else "=~")
+        + json.dumps(value)
+    )
+
+
+def _query_context(registry, expressions, *, tempo=False):
+    selections = []
+    for expression in expressions:
+        if len(expression) > 65536:
+            raise RunError("Query too large", 413)
+        if tempo:
+            # Quoted values are separate tokens, so attribute-like text inside
+            # a user string cannot masquerade as an identity matcher.
+            tokens = re.findall(
+                r'"(?:[^"\\]|\\.)*"|[A-Za-z_][A-Za-z0-9_.]*|=~|!=|!~|==|=|[^\s]',
+                expression,
+            )
+        else:
+            tokens = [token[0] for token in _tokens(expression)]
+        name = "resource.rl_insight.run_id" if tempo else "run_id"
+        for i, token in enumerate(tokens):
+            if token == name and i + 2 < len(tokens) and tokens[i + 2].startswith('"'):
+                selections.append(
+                    _literal_ids(tokens[i + 1], json.loads(tokens[i + 2]))
+                )
+    if not selections:
+        raise RunError("A Run selection is required", 422)
+    if any(selection != selections[0] for selection in selections):
+        raise RunError("Conflicting Run selections", 403)
+    return tuple(registry.get(run_id) for run_id in selections[0])
+
+
+def prometheus(query: str, identity: RunContext | Sequence[RunContext]) -> str:
     """Constrain every metric/brace selector, including nested function args."""
     if len(query) > 65536:
         raise RunError("Query too large", 413)
     tokens = _tokens(query)
     if not tokens:
-        return "{run_id=" + json.dumps(identity.run_id) + "}"
+        return "{" + _scope_condition(identity) + "}"
     edits = []
     index = 0
-    matcher = "run_id=" + json.dumps(identity.run_id, ensure_ascii=True)
+    matcher = _scope_condition(identity)
     operand_expected = True
     while index < len(tokens):
         value, _start, end = tokens[index]
@@ -397,6 +456,7 @@ def prometheus(query: str, identity: RunContext) -> str:
                 raise RunError("Unsupported query", 422)
             content = tokens[index + 1 : close]
             cursor = 0
+            has_identity = False
             while cursor < len(content):
                 if cursor + 2 >= len(content):
                     raise RunError("Unsupported query", 422)
@@ -409,17 +469,20 @@ def prometheus(query: str, identity: RunContext) -> str:
                     or not literal.startswith('"')
                 ):
                     raise RunError("Unsupported query", 422)
-                if label == "run_id" and (
-                    operator != "=" or json.loads(literal) != identity.run_id
-                ):
-                    raise RunError("Query run_id conflicts with selected Run", 403)
+                if label == "run_id":
+                    if _literal_ids(operator, json.loads(literal)) != _run_ids(
+                        identity
+                    ):
+                        raise RunError("Query run_id conflicts with selected Runs", 403)
+                    has_identity = True
                 cursor += 3
                 if cursor < len(content):
                     if content[cursor][0] != ",":
                         raise RunError("Unsupported query", 422)
                     cursor += 1
             insertion = ("," if content else "") + matcher
-            edits.append((tokens[close][1], tokens[close][1], insertion))
+            if not has_identity:
+                edits.append((tokens[close][1], tokens[close][1], insertion))
             index = close
             operand_expected = False
         elif re.fullmatch(r"[A-Za-z_:][A-Za-z0-9_:]*", value):
@@ -481,31 +544,45 @@ def prometheus(query: str, identity: RunContext) -> str:
     return query
 
 
-def trace_search(query: str, identity: RunContext) -> str:
+def trace_search(query: str, identity: RunContext | Sequence[RunContext]) -> str:
     if len(query) > 65536:
         raise RunError("Query too large", 413)
     # Built-in Agent Loop panels select extra span fields. Only a terminal field
     # projection is allowed; filters still pass through the Run constraint parser.
-    fields = ["resource.rl_insight.run_id", "name", "span.state_lane_id"]
+    fields = [
+        "resource.rl_insight.run_id",
+        "name",
+        "span.state_lane_id",
+        "span.project",
+        "span.experiment_name",
+        "span.global_step",
+        'span."metric.name"',
+        'span."metric.value"',
+    ]
     projection = re.search(r"\|\s*select\(([^()]*)\)\s*$", query)
     if projection:
         selected = [field.strip() for field in projection[1].split(",")]
         if not all(
-            re.fullmatch(r"(?:span|resource)\.[A-Za-z_][A-Za-z0-9_.]*|name", field)
+            re.fullmatch(
+                r'(?:span|resource)\.(?:[A-Za-z_][A-Za-z0-9_.]*|"[A-Za-z_][A-Za-z0-9_.]*")|name',
+                field,
+            )
             for field in selected
         ):
             raise RunError("Unsupported selected field", 422)
-        fields = list(dict.fromkeys(fields + selected))
+        # An explicit projection defines the panel's columns. Keep only the
+        # common trace identity/lane fields plus those requested by the client.
+        fields = list(dict.fromkeys(fields[:3] + selected))
         query = query[: projection.start()].rstrip()
     return traces(query, identity) + " | select(" + ", ".join(fields) + ")"
 
 
-def traces(query: str, identity: RunContext) -> str:
+def traces(query: str, identity: RunContext | Sequence[RunContext]) -> str:
     """Boolean combinations of spansets; structural/pipeline syntax rejected."""
     if len(query) > 65536:
         raise RunError("Query too large", 413)
     result, cursor, count = [], 0, 0
-    condition = "resource.rl_insight.run_id = " + json.dumps(identity.run_id)
+    condition = _scope_condition(identity, tempo=True)
     while cursor < len(query):
         char = query[cursor]
         if char == "{":
@@ -575,8 +652,20 @@ def read_backend(url: str, fields: list[tuple[str, str]], *, auth=None, headers=
             raise RunError("Backend query failed", 502) from exc
 
 
-def project_search(payload, context: RunContext) -> int:
+def project_search(
+    payload, context: RunContext | Sequence[RunContext], query=""
+) -> int:
     """Keep only proven Run-local spans, never trace-wide root metadata."""
+    projection = re.search(r"\|\s*select\(([^()]*)\)\s*$", query)
+    selected = (
+        {
+            field.strip().split(".", 1)[1].strip('"')
+            for field in projection[1].split(",")
+            if "." in field
+        }
+        if projection
+        else None
+    )
     required, output = 0, []
     for trace in payload.get("traces", []):
         groups_out, members = [], []
@@ -588,24 +677,53 @@ def project_search(payload, context: RunContext) -> int:
             if matched > len(spans):
                 required = max(required, matched)
             for span in spans:
+                # OTLP point records have zero duration, omitted by protobuf JSON.
+                span.setdefault("durationNanos", "0")
                 pairs = [
                     a
                     for a in span.get("attributes", [])
                     if a.get("key") == "rl_insight.run_id"
                 ]
-                if (
-                    len(pairs) != 1
-                    or pairs[0].get("value", {}).get("stringValue") != context.run_id
-                ):
+                if len(pairs) != 1 or pairs[0].get("value", {}).get(
+                    "stringValue"
+                ) not in _run_ids(context):
                     raise RunError(
                         "Backend returned a foreign or unidentified span", 502
                     )
-                # Ownership is checked above; keep the original timeline fields.
-                span["attributes"] = [
-                    a
-                    for a in span.get("attributes", [])
-                    if a.get("key") != "rl_insight.run_id"
-                ]
+                if selected is not None:
+                    # Tempo can return attributes referenced by filters as well
+                    # as select(). Keep only the requested panel columns.
+                    span["attributes"] = [
+                        attribute
+                        for attribute in span.get("attributes", [])
+                        if attribute.get("key") in selected | {"rl_insight.run_id"}
+                    ]
+                # Lane identity distinguishes Runs without adding a plotted state.
+                if len(_run_ids(context)) > 1:
+                    owner = pairs[0]["value"]["stringValue"]
+                    for attribute in span.get("attributes", []):
+                        if attribute.get("key") == "state_lane_id":
+                            attribute["value"]["stringValue"] = (
+                                owner.rsplit("_", 1)[-1][:8]
+                                + "/"
+                                + attribute["value"]["stringValue"]
+                            )
+                # Step panels partition on Run ID; timeline panels plot every
+                # extra attribute, so ownership metadata must not reach them.
+                if not any(
+                    a.get("key") == "metric.name" for a in span.get("attributes", [])
+                ):
+                    hidden = {"rl_insight.run_id"}
+                    if any(
+                        a.get("key") == "state_lane_id"
+                        for a in span.get("attributes", [])
+                    ):
+                        hidden.update(("project", "experiment_name"))
+                    span["attributes"] = [
+                        a
+                        for a in span.get("attributes", [])
+                        if a.get("key") not in hidden
+                    ]
             groups_out.append({"spans": spans, "matched": matched})
             members.extend(spans)
         if not members:
@@ -631,7 +749,7 @@ def project_search(payload, context: RunContext) -> int:
     return required
 
 
-def trace_owned(payload, context: RunContext) -> bool:
+def trace_owned(payload, context: RunContext | Sequence[RunContext]) -> bool:
     resources = payload.get("batches", payload.get("resourceSpans", []))
     if not resources:
         return False
@@ -641,10 +759,9 @@ def trace_owned(payload, context: RunContext) -> bool:
             for a in resource.get("resource", {}).get("attributes", [])
             if a.get("key") == "rl_insight.run_id"
         ]
-        if (
-            len(pairs) != 1
-            or pairs[0].get("value", {}).get("stringValue") != context.run_id
-        ):
+        if len(pairs) != 1 or pairs[0].get("value", {}).get(
+            "stringValue"
+        ) not in _run_ids(context):
             return False
     return True
 
@@ -664,7 +781,26 @@ def install_queries(app, registry, conf):
     }
 
     def query(run_id, backend, path, fields):
-        context = registry.get(run_id)
+        context = (registry.get(run_id),) if run_id else None
+        if context is None and not (backend == "tempo" and path.startswith("traces/")):
+            expressions = [v for k, v in fields if k in {"q", "query", "match[]"}]
+            context = _query_context(registry, expressions, tempo=backend == "tempo")
+            if not context:
+                if backend == "prometheus":
+                    data = (
+                        {
+                            "resultType": "matrix"
+                            if path == "query_range"
+                            else "vector",
+                            "result": [],
+                        }
+                        if path in {"query", "query_range"}
+                        else []
+                    )
+                    return JSONResponse({"status": "success", "data": data})
+                return JSONResponse(
+                    {"traces": []} if path == "search" else {"tagValues": []}
+                )
         if not bool(OmegaConf.select(conf, backend + ".enable", default=True)):
             raise RunError("Backend disabled", 503)
         if backend == "prometheus":
@@ -702,6 +838,15 @@ def install_queries(app, registry, conf):
                     ("q", trace_search(values[0] if values else "", context)),
                     ("spss", str(budget)),
                 ]
+            elif re.fullmatch(
+                r'(?:v2/)?search/tag/[A-Za-z_][A-Za-z0-9_."]*/values', path
+            ):
+                values = [v for k, v in fields if k == "q"]
+                if len(values) != 1 or any(k == "tags" for k, _ in fields):
+                    raise RunError("Expected one scoped tag query", 422)
+                fields = [(k, v) for k, v in fields if k != "q"] + [
+                    ("q", traces(values[0], context))
+                ]
             elif not re.fullmatch(r"traces/[0-9a-fA-F]{32}", path):
                 raise RunError("Unsupported trace query path", 404)
             url = endpoints[backend] + "/api/" + path
@@ -710,7 +855,7 @@ def install_queries(app, registry, conf):
             try:
                 payload = json.loads(body)
                 if path == "search":
-                    needed = project_search(payload, context)
+                    needed = project_search(payload, context, dict(fields)["q"])
                     if needed:
                         fields = [(k, v) for k, v in fields if k != "spss"] + [
                             ("spss", str(needed))
@@ -721,16 +866,46 @@ def install_queries(app, registry, conf):
                         if not 200 <= status < 300:
                             raise RunError("Complete trace search failed", 502)
                         payload = json.loads(body)
-                        if project_search(payload, context):
+                        if project_search(payload, context, dict(fields)["q"]):
                             raise RunError("Trace search is incomplete", 502)
-                elif not trace_owned(payload, context):
-                    raise RunError("Trace not found in this Run", 404)
+                elif path.startswith("traces/"):
+                    if context is None:
+                        resources = payload.get(
+                            "batches", payload.get("resourceSpans", [])
+                        )
+                        owners = {
+                            a.get("value", {}).get("stringValue")
+                            for resource in resources
+                            for a in resource.get("resource", {}).get("attributes", [])
+                            if a.get("key") == "rl_insight.run_id"
+                        }
+                        if len(owners) != 1:
+                            raise RunError("Trace has no unique Run owner", 404)
+                        context = (registry.get(next(iter(owners))),)
+                    if not trace_owned(payload, context):
+                        raise RunError("Trace not found in this Run", 404)
                 body = json.dumps(payload).encode()
             except (ValueError, KeyError, TypeError, AttributeError) as exc:
                 if isinstance(exc, RunError):
                     raise
                 raise RunError("Invalid backend trace response", 502) from exc
         return Response(body, status_code=status, media_type="application/json")
+
+    @app.get("/api/v1/query/{backend}/api/{path:path}")
+    @app.get("/api/v1/query/{backend}/api/v1/{path:path}")
+    def fixed_query(backend: str, path: str, request: Request):
+        if backend not in endpoints:
+            raise RunError("Unknown backend", 404)
+        # Grafana fetches attribute names before constructing scoped queries.
+        # An empty schema response needs no access to telemetry or Run data.
+        if backend == "tempo" and path in {"search/tags", "v2/search/tags"}:
+            return {"scopes": []} if path.startswith("v2/") else {"tagNames": []}
+        if backend == "prometheus" and path == "status/buildinfo":
+            status, body = read_backend(
+                endpoints[backend] + "/api/v1/status/buildinfo", []
+            )
+            return Response(body, status_code=status, media_type="application/json")
+        return query(None, backend, path, list(request.query_params.multi_items()))
 
     @app.get("/api/v1/runs/{run_id}/prometheus/api/v1/{path:path}")
     def metrics(run_id: str, path: str, request: Request):
@@ -780,6 +955,7 @@ def install_views(app, registry, conf):
             "label/execution/values",
             "label/project/values",
             "label/run_id/values",
+            "label/metric_name/values",
         }:
             values = run_options(
                 registry,
@@ -804,40 +980,17 @@ def install_views(app, registry, conf):
     def empty_traces():
         return {"traces": []}
 
-    lock = Lock()
-
-    def prepare(run_id, base_url, template):
-        with lock:
-            return prepare_run_view(registry, conf, run_id, base_url, template)
-
-    def refresh(base_url=None):
-        runs = registry.list_runs()
-        if runs and bool(OmegaConf.select(conf, "grafana.enable", default=True)):
-            try:
-                current_url = (
-                    OmegaConf.select(conf, "server.public_url")
-                    or base_url
-                    or "http://"
-                    + format_host_port(
-                        local_addresses()["loopback"],
-                        int(OmegaConf.select(conf, "server.port", default=18080)),
-                    )
-                )
-                prepare(runs[0]["context"]["run_id"], str(current_url), None)
-            except (RunError, OSError) as exc:
-                logger.warning(
-                    "[rl-insight] Could not refresh the original dashboard: %s", exc
-                )
-
     @app.get("/api/v1/runs/{run_id}/view")
     def view(run_id: str, request: Request, template: str = DEFAULT_TEMPLATE):
-        return prepare(run_id, str(request.base_url), template)
+        return prepare_run_view(registry, conf, run_id, str(request.base_url), template)
 
     @app.get("/ui/runs/{run_id}")
     def page(run_id: str, request: Request, template: str = DEFAULT_TEMPLATE):
-        return RedirectResponse(prepare(run_id, str(request.base_url), template)["url"])
-
-    return refresh
+        return RedirectResponse(
+            prepare_run_view(registry, conf, run_id, str(request.base_url), template)[
+                "url"
+            ]
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -20,7 +20,6 @@ import configparser
 import datetime as _dt
 import errno
 import json
-import math
 import os
 import re
 import shutil
@@ -41,12 +40,12 @@ import requests
 import yaml
 from omegaconf import DictConfig, OmegaConf
 
-from ..protocol import RunError
 from ..utils.constants import (
     MonitorPaths,
     PrometheusScrape,
     prometheus_targets_file_from_config,
 )
+from ..utils.protocol import RunContext, RunError
 from .catalog import DEFAULT_STATE_ROOT, STATE_FILE
 from .dependencies import (
     DependencyManager,
@@ -865,9 +864,28 @@ def _render_grafana_provisioning(
     datasources_dir.mkdir(parents=True, exist_ok=True)
     dashboards_dir.mkdir(parents=True, exist_ok=True)
 
-    datasources: list[dict[str, Any]] = []
+    query_base = (
+        str(
+            OmegaConf.select(conf, "server.public_url")
+            or (
+                "http://"
+                + format_host_port(local_addresses()["loopback"], int(conf.server.port))
+            )
+        ).rstrip("/")
+        + "/api/v1"
+    )
+    datasources: list[dict[str, Any]] = [
+        {
+            "name": "Run catalog",
+            "uid": "rli-catalog",
+            "type": "prometheus",
+            "access": "proxy",
+            "url": query_base + "/catalog/prometheus",
+            "editable": False,
+            "jsonData": {"httpMethod": "GET"},
+        }
+    ]
     if bool(OmegaConf.select(conf, "prometheus.enable", default=True)):
-        prometheus_port = int(OmegaConf.select(conf, "prometheus.prometheus_port"))
         datasources.append(
             {
                 "name": "Prometheus",
@@ -875,23 +893,31 @@ def _render_grafana_provisioning(
                 "type": "prometheus",
                 "access": "proxy",
                 "isDefault": True,
-                "url": "http://"
-                + format_host_port(local_addresses()["loopback"], prometheus_port),
-                "editable": True,
+                "url": query_base + "/query/prometheus",
+                "editable": False,
+                "jsonData": {"httpMethod": "GET"},
             }
         )
     if bool(OmegaConf.select(conf, "tempo.enable", default=True)):
-        tempo_query_port = int(OmegaConf.select(conf, "tempo.query_port"))
         datasources.append(
             {
                 "name": "Tempo",
                 "uid": "tempo",
                 "type": "tempo",
                 "access": "proxy",
-                "isDefault": not datasources,
-                "url": "http://"
-                + format_host_port(local_addresses()["loopback"], tempo_query_port),
-                "editable": True,
+                "isDefault": not bool(
+                    OmegaConf.select(conf, "prometheus.enable", default=True)
+                ),
+                "url": query_base + "/query/tempo",
+                "editable": False,
+                # Grafana omits the dashboard range on tag queries when this is
+                # unset or left at the 30-minute default. Match Tempo retention
+                # so tag options stay inside the traces Tempo still stores.
+                "jsonData": {
+                    "timeRangeForTags": _duration_seconds(
+                        _select_str(conf, "tempo.retention_time") or "30d"
+                    )
+                },
             }
         )
     datasource_data = {
@@ -928,8 +954,47 @@ DEFAULT_TEMPLATE = "verl/verl_tainer_v1_with_vllm_engine.json"
 
 
 def run_options(registry, conf, label, fields):
-    """Join observed metric identities with execution metadata for Grafana."""
-    from .http_api import read_backend
+    """List stored projects, observed executions or Run-scoped metric names."""
+    if label == "project":
+        return sorted({record["context"]["project"] for record in registry.list_runs()})
+
+    from .http_api import _query_context, read_backend, traces
+
+    if label == "metric_name":
+        contexts = _query_context(
+            registry, [value for key, value in fields if key == "match[]"]
+        )
+        if not contexts:
+            return []
+        if not bool(OmegaConf.select(conf, "tempo.enable", default=True)):
+            raise RunError("Tempo disabled", 503)
+        query = traces(
+            '{span."monitor.trace_segment"="metric_log" && span.global_step != nil && span."metric.value" != nil}',
+            contexts,
+        )
+        try:
+            query_fields = [("q", query)] + [
+                (key, str(int(float(value))))
+                for key, value in fields
+                if key in {"start", "end"}
+            ]
+        except (ValueError, OverflowError) as exc:
+            raise RunError("Invalid metric discovery time", 422) from exc
+        endpoint = "http://" + format_host_port(
+            local_addresses()["loopback"],
+            int(OmegaConf.select(conf, "tempo.query_port", default=3200)),
+        )
+        status, body = read_backend(
+            endpoint + "/api/v2/search/tag/span.metric.name/values", query_fields
+        )
+        try:
+            payload = json.loads(body)
+            values = [item["value"] for item in payload["tagValues"]]
+            if status != 200 or not all(isinstance(value, str) for value in values):
+                raise ValueError("Metric discovery failed")
+            return sorted(set(values))
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RunError("Invalid metric discovery response", 502) from exc
 
     if not bool(OmegaConf.select(conf, "prometheus.enable", default=True)):
         raise RunError("Prometheus disabled", 503)
@@ -940,7 +1005,7 @@ def run_options(registry, conf, label, fields):
         + quoted
         + r"(?:,\s*project=~"
         + quoted
-        + r")?(?:,\s*run_id="
+        + r")?(?:,\s*run_id(?:=|=~)"
         + quoted
         + r")?\}",
         selectors[0] if len(selectors) == 1 else "",
@@ -950,7 +1015,9 @@ def run_options(registry, conf, label, fields):
     try:
         json.loads(match[1])
         project = json.loads(match[2]) if match[2] else ".*"
-        selected = json.loads(match[3]) if match[3] else None
+        from .http_api import _literal_ids
+
+        selected = set(_literal_ids("=~", json.loads(match[3]))) if match[3] else None
     except ValueError as exc:
         raise RunError("Invalid selector string", 422) from exc
     # Grafana's regex formatter emits escaped literals or one alternation.
@@ -960,40 +1027,16 @@ def run_options(registry, conf, label, fields):
         literal + r"|\(" + literal + r"(?:\|" + literal + r")*\)", project
     ):
         raise RunError("Unsupported project selection", 422)
-    bounds = {}
-    for key in ("start", "end"):
-        values = [value for name, value in fields if name == key]
-        if len(values) > 1:
-            raise RunError("Expected one time range", 422)
-        try:
-            bounds[key] = float(values[0]) if values else None
-        except ValueError as exc:
-            raise RunError("Invalid time range", 422) from exc
-    end = bounds["end"] if bounds["end"] is not None else time.time()
-    start = bounds["start"] if bounds["start"] is not None else end - 900
-    if (
-        not math.isfinite(start)
-        or not math.isfinite(end)
-        or not 0 < end - start <= 2**31 - 1
-    ):
-        raise RunError("Invalid time range", 422)
-    # Query actual samples: metadata can include out-of-window series.
-    # last_over_time preserves metric names until aggregation, avoiding
-    # duplicate label sets when the template matches several metric families.
-    expression = (
-        "count by (run_id) (last_over_time({__name__=~"
-        + match[1]
-        + ',run_id!=""}['
-        + str(math.ceil(end - start))
-        + "s]))"
-    )
+    # Discover matching executions across retained history, independently of
+    # the dashboard's display window.
+    expression = "{__name__=~" + match[1] + ',run_id!=""}'
     endpoint = "http://" + format_host_port(
         local_addresses()["loopback"],
         int(OmegaConf.select(conf, "prometheus.prometheus_port", default=9090)),
     )
     status, body = read_backend(
-        endpoint + "/api/v1/query",
-        [("query", expression), ("time", str(end))],
+        endpoint + "/api/v1/label/run_id/values",
+        [("match[]", expression)],
     )
     try:
         payload = json.loads(body)
@@ -1004,43 +1047,104 @@ def run_options(registry, conf, label, fields):
         ):
             raise ValueError("Metric discovery failed")
         data = payload["data"]
-        if (
-            not isinstance(data, dict)
-            or data.get("resultType") != "vector"
-            or not isinstance(data.get("result"), list)
+        if not isinstance(data, list) or not all(
+            isinstance(run_id, str) for run_id in data
         ):
-            raise ValueError("Expected metric samples")
-        observed = {item["metric"]["run_id"] for item in data["result"]}
-        if not all(isinstance(run_id, str) for run_id in observed):
             raise ValueError("Expected metric identities")
+        observed = set(data)
     except (ValueError, KeyError, TypeError) as exc:
         raise RunError("Invalid metric discovery response", 502) from exc
-    options, projects = [], set()
+    options = []
     for record in registry.list_runs():
         run = record["context"]
         if run["run_id"] not in observed:
             continue
-        projects.add(run["project"])
-        if (selected is None or selected == run["run_id"]) and (
+        if (selected is None or run["run_id"] in selected) and (
             project == ".*" or re.fullmatch(project, run["project"])
         ):
             started = _dt.datetime.fromtimestamp(record["created_at"], _dt.timezone.utc)
             options.append(
                 run["run_id"]
                 if label == "run_id"
-                else f"{run['run_id']}|{run['experiment_name']}_{started:%Y%m%d_%H%M%S}_{run['run_id'][:8]}"
+                else f"{run['run_id']}|{run['experiment_name']}_{started:%Y%m%d_%H%M%S}_{run['run_id'].rsplit('_', 1)[-1][:8]}"
             )
-    return sorted(projects) if label == "project" else options
+    return options
+
+
+def _scope_dashboard_query(expression, backend):
+    """Bind standard PromQL/TraceQL without interpreting Grafana variables."""
+    from .http_api import prometheus, traces
+
+    if backend == "prometheus":
+        for macro in ("label_values", "query_result"):
+            prefix = macro + "("
+            if expression.startswith(prefix) and expression.endswith(")"):
+                inner = expression[len(prefix) : -1]
+                if macro == "label_values":
+                    if "," not in inner:
+                        return prefix + '{run_id=~"${run_id:regex}"}, ' + inner + ")"
+                    inner, label = inner.rsplit(",", 1)
+                    return (
+                        prefix
+                        + _scope_dashboard_query(inner, backend)
+                        + ","
+                        + label
+                        + ")"
+                    )
+                return prefix + _scope_dashboard_query(inner, backend) + ")"
+    # Protect template braces and duration macros before using the shared parser.
+    variables = {}
+
+    def protect(match):
+        name = match.group()
+        token = (
+            str(987650 + len(variables)) + "m"
+            if any(word in name.lower() for word in ("interval", "range"))
+            else "rlinsightvariable" + str(len(variables))
+        )
+        variables[token] = name
+        return token
+
+    prepared = re.sub(r"\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*", protect, expression)
+    context = RunContext("0" * 32, "template", "template", "http://template")
+    if backend == "prometheus":
+        prepared = prometheus(prepared, context)
+        # Retain Run identity through aggregations, including histogram buckets.
+        prepared = re.sub(
+            r"\bby\s*\(([^)]*)\)",
+            lambda m: "by (" + m[1] + ", run_id)"
+            if "run_id" not in {label.strip() for label in m[1].split(",")}
+            else m[0],
+            prepared,
+        )
+        prepared = re.sub(
+            r"\b(sum|avg|min|max|count|stddev|stdvar|group)\s*\(",
+            r"\1 by (run_id) (",
+            prepared,
+        )
+    else:
+        projection = re.search(r"\|\s*select\([^()]*\)\s*$", prepared)
+        suffix = projection[0] if projection else ""
+        prepared = (
+            traces(prepared[: projection.start()] if projection else prepared, context)
+            + suffix
+        )
+    prepared = prepared.replace(
+        'run_id="' + "0" * 32 + '"', 'run_id=~"${run_id:regex}"'
+    )
+    for token, name in variables.items():
+        prepared = prepared.replace(token, name)
+    return prepared
 
 
 def run_dashboard(template: Path):
+    """Apply common execution selection to the original provisioned dashboard."""
     dashboard = json.loads(template.read_text(encoding="utf-8"))
     metric_selector = (
         dashboard["metadata"]
         .get("annotations", {})
         .get("rl-insight/metrics-selector", '{__name__=~"rl_insight_monitor_.*"}')
     )
-    dashboard["metadata"] = {"name": dashboard["metadata"]["name"]}
     spec = dashboard["spec"]
     selector = next(
         (
@@ -1050,8 +1154,15 @@ def run_dashboard(template: Path):
         ),
         "experiment_name",
     )
+    reference = re.compile(
+        r"\$(?:"
+        + re.escape(selector)
+        + r"\b|\{"
+        + re.escape(selector)
+        + r"(?::[^}]+)?\})"
+    )
 
-    def variable_query(expression):
+    def catalog_query(expression):
         return {
             "kind": "DataQuery",
             "group": "prometheus",
@@ -1060,111 +1171,146 @@ def run_dashboard(template: Path):
             "spec": {"query": expression, "refId": "StandardVariableQuery"},
         }
 
-    variable_reference = re.compile(
-        r"\$(?:" + re.escape(selector) + r"\b|\{" + re.escape(selector) + r"\})"
-    )
-
     def bind(value):
         if isinstance(value, str):
-            # Run-scoped sources enforce identity. Original name regexes are
-            # redundant, including Agent Loop's experiment segment in lane IDs.
-            return variable_reference.sub(".*", value)
-        if isinstance(value, dict):
-            if str(value.get("kind", "")).endswith("Variable"):
-                variable = value["spec"]
-                if variable.get("hide") == "":
-                    variable["hide"] = "dontHide"
-                if variable.get("name") == "project":
-                    expression = "label_values(" + metric_selector + ", project)"
-                    variable.update(
-                        query=variable_query(expression),
-                        definition=expression,
-                        refresh="onTimeRangeChanged",
-                        allowCustomValue=False,
-                    )
-                    return value
-            if value.get("kind") == "DataQuery":
-                backend = value.get("group")
-                if backend == "grafana":
-                    return value
-                if backend not in {"prometheus", "tempo"}:
-                    raise RunError("Unsupported dashboard data source", 422)
-                value["datasource"] = {"name": "rli-${run_id}-" + backend[0]}
-            for key, child in value.items():
-                value[key] = bind(child)
-        elif isinstance(value, list):
+            return reference.sub(".*", value)
+        if isinstance(value, list):
             return [bind(child) for child in value]
-        return value
+        if not isinstance(value, dict):
+            return value
+        if (
+            value.get("kind") == "Transformation"
+            and value.get("group") == "partitionByValues"
+        ):
+            fields = value["spec"]["options"]["fields"]
+            if "metric.name" in fields and "rl_insight.run_id" not in fields:
+                fields.append("rl_insight.run_id")
+        if str(value.get("kind", "")).endswith("Variable"):
+            variable = value["spec"]
+            if variable.get("hide") == "":
+                variable["hide"] = "dontHide"
+            if variable.get("name") == "project":
+                expression = "label_values(" + metric_selector + ", project)"
+                variable.update(
+                    query=catalog_query(expression),
+                    definition=expression,
+                    refresh="onDashboardLoad",
+                    multi=True,
+                    includeAll=True,
+                    allowCustomValue=False,
+                )
+                return value
+        if value.get("kind") == "DatasourceVariable":
+            variable = value["spec"]
+            source_name = {"prometheus": "Prometheus", "tempo": "Tempo"}[
+                variable["pluginId"]
+            ]
+            variable.update(
+                regex="^" + source_name + "$",
+                allowCustomValue=False,
+                current={"text": source_name, "value": variable["pluginId"]},
+            )
+            return value
+        if value.get("kind") == "DataQuery":
+            backend = value.get("group")
+            if backend == "grafana":
+                return value
+            if backend not in {"prometheus", "tempo"}:
+                raise RunError("Unsupported dashboard data source", 422)
+            value = {key: bind(child) for key, child in value.items()}
+            value["datasource"] = {"name": backend}
+            query = value["spec"]
+            if (
+                backend == "tempo"
+                and query.get("type") == 1
+                and query.get("label") == "metric.name"
+            ):
+                # Tempo's variable API ignores its TraceQL query. The catalog
+                # preserves the selected Run scope while listing metric names.
+                return catalog_query(
+                    'label_values({run_id=~"${run_id:regex}"}, metric_name)'
+                )
+            for key in ("expr", "query"):
+                if isinstance(query.get(key), str) and query[key]:
+                    query[key] = _scope_dashboard_query(query[key], backend)
+            if backend == "prometheus" and query.get("legendFormat") not in {
+                None,
+                "",
+                "__auto",
+            }:
+                query["legendFormat"] += " / {{run_id}}"
+            return value
+        return {key: bind(child) for key, child in value.items()}
 
-    bind(spec)
-    spec["variables"] = [v for v in spec["variables"] if v["spec"]["name"] != "run_id"]
+    bind_spec = bind(spec)
+    dashboard["spec"] = spec = bind_spec
     has_project = any(v["spec"]["name"] == "project" for v in spec["variables"])
     selection = (
-        metric_selector[:-1] + ',project=~"${project}"}'
+        metric_selector[:-1] + ',project=~"${project:regex}"}'
         if has_project
         else metric_selector
     )
     expression = "label_values(" + selection + ", execution)"
-    execution: dict[str, Any] = {
+    options = {
+        "name": selector,
+        "label": "Experiment",
+        "query": catalog_query(expression),
+        "definition": expression,
+        "regex": r"/^(?<value>(?:[0-9]{8}T[0-9]{6}Z_)?[0-9a-f]{32})\|(?<text>[\s\S]*)$/",
+        "regexApplyTo": "value",
+        "sort": "disabled",
+        "current": {"text": [], "value": []},
+        "options": [],
+        "refresh": "onTimeRangeChanged",
+        "multi": True,
+        "includeAll": True,
+        "allowCustomValue": False,
+        "hide": "dontHide",
+        "skipUrlSync": False,
+    }
+    variables = spec["variables"]
+    variables[:] = [
+        v for v in variables if v["spec"]["name"] not in {selector, "run_id"}
+    ]
+    variables.insert(
+        next(
+            (i + 1 for i, v in enumerate(variables) if v["spec"]["name"] == "project"),
+            0,
+        ),
+        {"kind": "QueryVariable", "spec": options},
+    )
+    identity_query = (
+        "label_values("
+        + selection[:-1]
+        + ',run_id=~"${'
+        + selector
+        + ':regex}"}, run_id)'
+    )
+    hidden = {
         "kind": "QueryVariable",
         "spec": {
-            "name": selector,
-            "label": "Experiment",
-            "query": variable_query(expression),
-            "definition": expression,
-            "regex": r"/^(?<value>[0-9a-f]{32})\|(?<text>[\s\S]*)$/",
-            "regexApplyTo": "value",
-            "sort": "disabled",
-            "current": {"text": "", "value": ""},
-            "options": [],
-            "refresh": "onTimeRangeChanged",
-            "multi": False,
-            "includeAll": False,
-            "allowCustomValue": False,
-            "hide": "dontHide",
-            "skipUrlSync": False,
+            **options,
+            "name": "run_id",
+            "label": "Run ID",
+            "hide": "hideVariable",
+            "skipUrlSync": True,
+            "regex": "",
+            "query": catalog_query(identity_query),
+            "definition": identity_query,
         },
     }
-    replaced = False
-    for index, variable in enumerate(spec["variables"]):
-        value = variable["spec"]
-        if value["name"] == selector:
-            spec["variables"][index] = execution
-            replaced = True
-        elif variable["kind"] == "DatasourceVariable":
-            value.update(
-                regex="^rli-${run_id}-" + value["pluginId"][0] + "$",
-                current={"text": "", "value": ""},
-                allowCustomValue=False,
-            )
-    if not replaced:
-        spec["variables"].insert(0, execution)
-    # Grafana can preserve an obsolete URL value on its first validation. Only
-    # the catalog-validated identity may select a data source; this hidden
-    # variable cannot be overridden by URL parameters.
-    identity_query = (
-        "label_values(" + selection[:-1] + ',run_id="${' + selector + '}"}, run_id)'
-    )
-    spec["variables"].append(
-        {
-            "kind": "QueryVariable",
-            "spec": {
-                **execution["spec"],
-                "name": "run_id",
-                "label": "Run ID",
-                "query": variable_query(identity_query),
-                "definition": identity_query,
-                "regex": "",
-                "hide": "hideVariable",
-                "skipUrlSync": True,
-            },
-        }
+    variables.insert(
+        next(i + 1 for i, v in enumerate(variables) if v["spec"]["name"] == selector),
+        hidden,
     )
     return dashboard
 
 
 def prepare_run_view(registry, conf, run_id, base_url, template=DEFAULT_TEMPLATE):
-    """Bind the existing Grafana dashboard and data sources to registered Runs."""
+    """Link to an existing dashboard; never mutate Grafana at query time."""
+    registry.get(run_id)
+    if not bool(OmegaConf.select(conf, "grafana.enable", default=True)):
+        raise RunError("Grafana disabled", 503)
     root = Path(
         str(
             OmegaConf.select(
@@ -1174,117 +1320,15 @@ def prepare_run_view(registry, conf, run_id, base_url, template=DEFAULT_TEMPLATE
             )
         )
     ).resolve()
-    grafana = "http://" + format_host_port(
-        local_addresses()["loopback"],
-        int(OmegaConf.select(conf, "grafana.port", default=3000)),
-    )
-
-    registry.get(run_id)
-    if not bool(OmegaConf.select(conf, "grafana.enable", default=True)):
-        raise RunError("Grafana disabled", 503)
-    # A startup/catalog refresh updates all deployed built-ins in one pass.
-    # Extra dashboards remain opt-in through the explicit template endpoint.
-    templates = (
-        [template]
-        if template is not None
-        else [
-            str(file.relative_to(MonitorPaths.GRAFANA_DASHBOARDS_DIR))
-            for file in sorted(MonitorPaths.GRAFANA_DASHBOARDS_DIR.rglob("*.json"))
-            if (root / file.relative_to(MonitorPaths.GRAFANA_DASHBOARDS_DIR)).is_file()
-        ]
-    )
-    files = [(root / relative).resolve() for relative in templates]
-    if not files or any(
-        not file.is_relative_to(root) or file.suffix != ".json" or not file.is_file()
-        for file in files
-    ):
+    file = (root / template).resolve()
+    if not file.is_relative_to(root) or not file.is_file() or file.suffix != ".json":
         raise RunError("Unknown dashboard template", 404)
-    base = str(OmegaConf.select(conf, "server.public_url") or base_url).rstrip("/")
-    identifiers = {
-        kind: "rli-" + run_id + "-" + kind[0] for kind in ("prometheus", "tempo")
-    }
-    runs = registry.list_runs()
-    with requests.Session() as session:
-        session.trust_env = False
-        token = OmegaConf.select(conf, "grafana.api_token", default="")
-        if token:
-            session.headers["Authorization"] = "Bearer " + str(token)
-        username = OmegaConf.select(conf, "grafana.username", default="")
-        if username:
-            session.auth = (
-                str(username),
-                str(OmegaConf.select(conf, "grafana.password", default="")),
-            )
-
-        def call(method, path, **kwargs):
-            try:
-                response = session.request(
-                    method,
-                    grafana + path,
-                    timeout=(3, 5),
-                    allow_redirects=False,
-                    **kwargs,
-                )
-            except requests.RequestException as exc:
-                raise RunError("Grafana request failed", 502) from exc
-            if response.status_code == 404 and method == "GET":
-                return response
-            if not 200 <= response.status_code < 300:
-                raise RunError("Grafana provisioning failed", 502)
-            return response
-
-        # The catalog exposes metadata only. Empty selections use empty sources,
-        # never the unscoped deployment-wide Prometheus or Tempo sources.
-        sources = [("rli-catalog", "prometheus", "/api/v1/catalog/prometheus")]
-        for kind in identifiers:
-            sources.append(("rli--" + kind[0], kind, "/api/v1/catalog/" + kind))
-        for record in runs:
-            run = record["context"]
-            for kind in identifiers:
-                sources.append(
-                    (
-                        "rli-" + run["run_id"] + "-" + kind[0],
-                        kind,
-                        "/api/v1/runs/" + run["run_id"] + "/" + kind,
-                    )
-                )
-        for uid, kind, route in sources:
-            current = call("GET", "/api/datasources/uid/" + uid)
-            payload = {
-                "uid": uid,
-                "name": uid,
-                "type": kind,
-                "access": "proxy",
-                "url": base + route,
-                "editable": False,
-                "jsonData": {"httpMethod": "GET"},
-            }
-            if current.status_code == 404:
-                call("POST", "/api/datasources", json=payload)
-            elif current.json().get("url") != payload["url"]:
-                call("PUT", "/api/datasources/uid/" + uid, json=payload)
-        path = "/apis/dashboard.grafana.app/v2/namespaces/default/dashboards"
-        for file in files:
-            dashboard = run_dashboard(file)
-            staged = json.dumps(dashboard, ensure_ascii=False, indent=2)
-            uid = dashboard["metadata"]["name"]
-            current = call("GET", path + "/" + uid)
-            if current.status_code == 404:
-                raise RunError("Original dashboard is not provisioned in Grafana", 503)
-            # Keep its folder, permissions and provisioning ownership.
-            dashboard["metadata"] = current.json()["metadata"]
-            call("PUT", path + "/" + uid, json=dashboard)
-            runtime = OmegaConf.select(conf, "server.runtime_dir")
-            if runtime:
-                folder = (Path(str(runtime)) / "dashboards").resolve()
-                target = (folder / file.relative_to(root)).resolve()
-                if target.is_relative_to(folder) and target.is_file():
-                    temporary = target.with_suffix(".json.tmp")
-                    temporary.write_text(
-                        staged,
-                        encoding="utf-8",
-                    )
-                    temporary.replace(target)
+    dashboard = json.loads(file.read_text(encoding="utf-8"))
+    selector = next(
+        v["spec"]["name"]
+        for v in dashboard["spec"]["variables"]
+        if v["spec"]["name"] in {"experiment_name", "experiment"}
+    )
     address = urlsplit(base_url)
     public = str(
         OmegaConf.select(conf, "grafana.public_url")
@@ -1294,21 +1338,13 @@ def prepare_run_view(registry, conf, run_id, base_url, template=DEFAULT_TEMPLATE
             + format_host_port(address.hostname, int(conf.grafana.port))
         )
     )
-    selection = urlencode(
-        {
-            "var-"
-            + next(
-                v["spec"]["name"]
-                for v in dashboard["spec"]["variables"]
-                if v["spec"]["name"] in {"experiment_name", "experiment"}
-                and v["kind"] == "QueryVariable"
-            ): run_id,
-            "var-datasource": identifiers["prometheus"],
-        }
-    )
     return {
-        "url": public.rstrip("/") + "/d/" + uid + "?" + selection,
-        "datasources": identifiers,
+        "url": public.rstrip("/")
+        + "/d/"
+        + dashboard["metadata"]["name"]
+        + "?"
+        + urlencode({"var-" + selector: run_id}),
+        "datasources": {"prometheus": "prometheus", "tempo": "tempo"},
     }
 
 
@@ -1323,6 +1359,7 @@ def _stage_grafana_dashboards(conf: DictConfig, runtime_dir: Path) -> Path:
 
     extra = OmegaConf.select(conf, "grafana.extra_dashboard_dir")
     if extra is None:
+        _bind_builtin_dashboards(target)
         return target
 
     planned_json = {
@@ -1353,7 +1390,19 @@ def _stage_grafana_dashboards(conf: DictConfig, runtime_dir: Path) -> Path:
         planned_json.add(relative_path)
 
     _copy_dashboard_directory(extra_source, target)
+    _bind_builtin_dashboards(target)
     return target
+
+
+def _bind_builtin_dashboards(target: Path) -> None:
+    for source in MonitorPaths.GRAFANA_DASHBOARDS_DIR.rglob("*.json"):
+        destination = target / source.relative_to(MonitorPaths.GRAFANA_DASHBOARDS_DIR)
+        if destination.is_file():
+            destination.write_text(
+                json.dumps(run_dashboard(destination), ensure_ascii=False, indent=2)
+                + "\n",
+                encoding="utf-8",
+            )
 
 
 def _copy_dashboard_directory(source: Path, target: Path) -> None:
@@ -1540,6 +1589,16 @@ def _set_tempo_retention(
     data.setdefault("compactor", {}).setdefault("compaction", {})["block_retention"] = (
         retention
     )
+
+
+def _duration_seconds(value: str) -> int:
+    raw = value.strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    if len(raw) >= 2 and raw[-1] in units and raw[:-1].isdigit():
+        return int(raw[:-1]) * units[raw[-1]]
+    if raw.isdigit():
+        return int(raw)
+    return 30 * 86400
 
 
 def _tempo_duration(value: str) -> str:
