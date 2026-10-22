@@ -409,6 +409,9 @@ def _process_worker(
     if track_sum:
         submitted_sum = sum(_hist_sum(n) for n in worker_counts)
 
+    # Keep the producer alive until its asynchronous actor submissions complete.
+    # A parent-process status query cannot order calls from other producers.
+    _ray.get(hub_handle.get_context.remote(), timeout=EVENT_DRAIN_TIMEOUT_S)
     result_queue.put(
         {
             "submitted": submitted,
