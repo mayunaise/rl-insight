@@ -64,7 +64,12 @@ def serve(app):
 def stack(tmp_path):
     backend = FastAPI()
     state = SimpleNamespace(
-        ids=[], spans=[], calls=[], lose_response=False, registrations=[]
+        ids=[],
+        spans=[],
+        span_attributes=[],
+        calls=[],
+        lose_response=False,
+        registrations=[],
     )
 
     @backend.get("/{path:path}")
@@ -150,6 +155,18 @@ def stack(tmp_path):
                 }
                 state.spans.extend(
                     (attrs.get("rl_insight.run_id"), span.name)
+                    for scope in resource.scope_spans
+                    for span in scope.spans
+                )
+                state.span_attributes.extend(
+                    {
+                        "run_id": attrs.get("rl_insight.run_id"),
+                        "name": span.name,
+                        "attributes": {
+                            attribute.key: attribute.value.string_value
+                            for attribute in span.attributes
+                        },
+                    }
                     for scope in resource.scope_spans
                     for span in scope.spans
                 )
@@ -264,6 +281,38 @@ from rl_insight.client.ray_monitor_client import current_job_context
 url = sys.argv[1]
 ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
 try:
+    insight.init()
+    with insight.trace_state("driver_prepare", state_lane_id="early_driver"):
+        pass
+    assert insight.get_context() is None
+
+    @ray.remote(num_cpus=0)
+    class EarlyWorker:
+        def trace_before_training(self):
+            insight.init()
+            with insight.trace_state("sleep", state_lane_id="early_replica"):
+                pass
+            context = insight.get_context()
+            return context.to_dict() if context else None
+
+        def wait_for_context(self):
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                context = insight.get_context()
+                if context:
+                    return context.to_dict()
+                time.sleep(0.1)
+            raise TimeoutError("Early worker did not connect to the training Run")
+
+    early_workers = [EarlyWorker.remote(), EarlyWorker.remote()]
+    early_contexts = ray.get(
+        [worker.trace_before_training.remote() for worker in early_workers], timeout=20
+    )
+    assert early_contexts == [None, None], (
+        "Argument-free worker init must defer Run creation until training init", early_contexts
+    )
+    delayed_context = early_workers[1].wait_for_context.remote()
+
     @ray.remote
     def native():
         insight.update_prometheus_config(["127.0.0.1:19999"])
@@ -281,6 +330,8 @@ try:
         port = sock.getsockname()[1]
     insight.init(project="ray", experiment_name="same", config={"server": {"url": url}, "prometheus": {"metrics_report_port": port}})
     first = insight.get_context()
+    assert ray.get(delayed_context)["run_id"] == first.run_id
+    assert ray.get(early_workers[0].wait_for_context.remote())["run_id"] == first.run_id
     insight.metric_gauge("reward", 2)
     @ray.remote
     def worker():
@@ -324,6 +375,27 @@ finally:
         == 200
     )
     assert (context["run_id"], "actor_update") in stack.backend.spans
+    early_spans = [
+        span for span in stack.backend.span_attributes if span["name"] == "sleep"
+    ]
+    assert len(early_spans) == 2
+    assert all(
+        span["run_id"] == context["run_id"]
+        and span["attributes"]["project"] == "ray"
+        and span["attributes"]["experiment_name"] == "same"
+        and span["attributes"]["state_lane_id"] == "early_replica"
+        for span in early_spans
+    )
+    driver_spans = [
+        span
+        for span in stack.backend.span_attributes
+        if span["name"] == "driver_prepare"
+    ]
+    assert len(driver_spans) == 1
+    assert driver_spans[0]["run_id"] == context["run_id"]
+    assert driver_spans[0]["attributes"]["project"] == "ray"
+    assert driver_spans[0]["attributes"]["experiment_name"] == "same"
+    assert driver_spans[0]["attributes"]["state_lane_id"] == "early_driver"
     import yaml
 
     targets = yaml.safe_load(

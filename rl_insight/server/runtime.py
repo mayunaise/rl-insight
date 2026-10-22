@@ -954,11 +954,47 @@ DEFAULT_TEMPLATE = "verl/verl_tainer_v1_with_vllm_engine.json"
 
 
 def run_options(registry, conf, label, fields):
-    """List stored projects or observed executions for Grafana."""
+    """List stored projects, observed executions or Run-scoped metric names."""
     if label == "project":
         return sorted({record["context"]["project"] for record in registry.list_runs()})
 
-    from .http_api import read_backend
+    from .http_api import _query_context, read_backend, traces
+
+    if label == "metric_name":
+        contexts = _query_context(
+            registry, [value for key, value in fields if key == "match[]"]
+        )
+        if not contexts:
+            return []
+        if not bool(OmegaConf.select(conf, "tempo.enable", default=True)):
+            raise RunError("Tempo disabled", 503)
+        query = traces(
+            '{span."monitor.trace_segment"="metric_log" && span.global_step != nil && span."metric.value" != nil}',
+            contexts,
+        )
+        try:
+            query_fields = [("q", query)] + [
+                (key, str(int(float(value))))
+                for key, value in fields
+                if key in {"start", "end"}
+            ]
+        except (ValueError, OverflowError) as exc:
+            raise RunError("Invalid metric discovery time", 422) from exc
+        endpoint = "http://" + format_host_port(
+            local_addresses()["loopback"],
+            int(OmegaConf.select(conf, "tempo.query_port", default=3200)),
+        )
+        status, body = read_backend(
+            endpoint + "/api/v2/search/tag/span.metric.name/values", query_fields
+        )
+        try:
+            payload = json.loads(body)
+            values = [item["value"] for item in payload["tagValues"]]
+            if status != 200 or not all(isinstance(value, str) for value in values):
+                raise ValueError("Metric discovery failed")
+            return sorted(set(values))
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RunError("Invalid metric discovery response", 502) from exc
 
     if not bool(OmegaConf.select(conf, "prometheus.enable", default=True)):
         raise RunError("Prometheus disabled", 503)
@@ -1184,6 +1220,16 @@ def run_dashboard(template: Path):
             value = {key: bind(child) for key, child in value.items()}
             value["datasource"] = {"name": backend}
             query = value["spec"]
+            if (
+                backend == "tempo"
+                and query.get("type") == 1
+                and query.get("label") == "metric.name"
+            ):
+                # Tempo's variable API ignores its TraceQL query. The catalog
+                # preserves the selected Run scope while listing metric names.
+                return catalog_query(
+                    'label_values({run_id=~"${run_id:regex}"}, metric_name)'
+                )
             for key in ("expr", "query"):
                 if isinstance(query.get(key), str) and query[key]:
                     query[key] = _scope_dashboard_query(query[key], backend)

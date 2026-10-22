@@ -431,9 +431,27 @@ def test_provisioning_uses_fixed_gateway_sources_and_multiselect_without_credent
         )
         assert execution["multi"] and execution["includeAll"]
         assert "rli-${run_id}" not in json.dumps(dashboard)
+        for element in dashboard["spec"]["elements"].values():
+            panel = element.get("spec", {})
+            if panel.get("title") in {"state timeline", "state_timeline"}:
+                query = panel["data"]["spec"]["queries"][0]["spec"]["query"]["spec"][
+                    "query"
+                ]
+                assert '"state_interval"' in query
+                assert "select(span.state_lane_id)" in query
+                assert "metric.name" not in query and "global_step" not in query
 
         def check_partition(value):
             if isinstance(value, dict):
+                if value.get("kind") == "QueryVariable" and value["spec"]["name"] in {
+                    "trainer_metric",
+                    "metric_group",
+                }:
+                    query = value["spec"]["query"]
+                    assert query["group"] == "prometheus"
+                    assert query["datasource"]["name"] == "rli-catalog"
+                    assert "${run_id:regex}" in query["spec"]["query"]
+                    assert "metric_name" in query["spec"]["query"]
                 if value.get("group") == "partitionByValues":
                     fields = value["spec"]["options"]["fields"]
                     if "metric.name" in fields:

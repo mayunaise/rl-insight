@@ -213,7 +213,10 @@ class MonitorHubActor(MonitorCollector):
                 if event.get("kind") == MonitorEventKind.TRACE
                 else "labels"
             )
-            event[field] = context.labels(event.get(field))
+            labels = dict(event.get(field) or {})
+            labels.setdefault("project", context.project)
+            labels.setdefault("experiment_name", context.experiment_name)
+            event[field] = context.labels(labels)
         try:
             kind = event["kind"]
         except KeyError as e:

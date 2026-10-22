@@ -165,6 +165,13 @@ def test_tempo_tag_values_and_step_projection_keep_selected_run(monkeypatch, tmp
 
     calls = []
     owner = "20261021T083025Z_" + "a" * 32
+    context = http_api.RunContext(owner, "p", "same", "http://server")
+    timeline = http_api.trace_search(
+        '{span."monitor.trace_segment"="state_interval" && span.state_lane_id!=""} | select(span.state_lane_id)',
+        context,
+    )
+    assert "metric.name" not in timeline and "metric.value" not in timeline
+    assert "global_step" not in timeline and "span.project" not in timeline
 
     def backend(url, fields, **kwargs):
         calls.append((url, dict(fields)))
@@ -224,6 +231,33 @@ def test_tempo_tag_values_and_step_projection_keep_selected_run(monkeypatch, tmp
         assert response.status_code == 200, response.text
         assert response.json()["tagValues"][0]["value"] == "loss"
         assert owner in calls[-1][1]["q"] and "select(" not in calls[-1][1]["q"]
+        response = client.get(
+            "/api/v1/catalog/prometheus/api/v1/label/metric_name/values",
+            params={
+                "match[]": '{run_id=~"' + owner + '"}',
+                "start": "1792600000.5",
+                "end": "1792600300.5",
+            },
+        )
+        assert response.json() == {"status": "success", "data": ["loss"]}
+        assert owner in calls[-1][1]["q"]
+        assert calls[-1][1]["start"] == "1792600000"
+        assert calls[-1][1]["end"] == "1792600300"
+        count = len(calls)
+        assert (
+            client.get(
+                "/api/v1/catalog/prometheus/api/v1/label/metric_name/values"
+            ).status_code
+            == 422
+        )
+        assert (
+            client.get(
+                "/api/v1/catalog/prometheus/api/v1/label/metric_name/values",
+                params={"match[]": '{run_id=~""}'},
+            ).json()["data"]
+            == []
+        )
+        assert len(calls) == count
         response = client.get(base + "search", params={"q": expression})
         assert response.status_code == 200, response.text
         assert (
@@ -265,6 +299,20 @@ def test_multirun_timeline_uses_run_lanes_without_plotting_identity_metadata():
                                     "key": "state_lane_id",
                                     "value": {"stringValue": "rank_0"},
                                 },
+                                {
+                                    "key": "project",
+                                    "value": {"stringValue": context.project},
+                                },
+                                {
+                                    "key": "experiment_name",
+                                    "value": {"stringValue": context.experiment_name},
+                                },
+                                {
+                                    "key": "monitor.trace_segment",
+                                    "value": {"stringValue": "state_interval"},
+                                },
+                                {"key": "global_step", "value": {"intValue": "3"}},
+                                {"key": "metric.value", "value": {"doubleValue": 0.5}},
                             ],
                         }
                     ],
@@ -272,7 +320,9 @@ def test_multirun_timeline_uses_run_lanes_without_plotting_identity_metadata():
             }
         )
     payload = {"traces": traces}
-    project_search(payload, contexts)
+    project_search(
+        payload, contexts, '{span.state_lane_id!=""} | select(span.state_lane_id)'
+    )
     for trace, context in zip(payload["traces"], contexts):
         attributes = {
             a["key"]: a["value"]["stringValue"]

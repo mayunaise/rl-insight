@@ -488,7 +488,9 @@ def trace_search(query: str, identity: RunContext | Sequence[RunContext]) -> str
             for field in selected
         ):
             raise RunError("Unsupported selected field", 422)
-        fields = list(dict.fromkeys(fields + selected))
+        # An explicit projection defines the panel's columns. Keep only the
+        # common trace identity/lane fields plus those requested by the client.
+        fields = list(dict.fromkeys(fields[:3] + selected))
         query = query[: projection.start()].rstrip()
     return traces(query, identity) + " | select(" + ", ".join(fields) + ")"
 
@@ -568,8 +570,20 @@ def read_backend(url: str, fields: list[tuple[str, str]], *, auth=None, headers=
             raise RunError("Backend query failed", 502) from exc
 
 
-def project_search(payload, context: RunContext | Sequence[RunContext]) -> int:
+def project_search(
+    payload, context: RunContext | Sequence[RunContext], query=""
+) -> int:
     """Keep only proven Run-local spans, never trace-wide root metadata."""
+    projection = re.search(r"\|\s*select\(([^()]*)\)\s*$", query)
+    selected = (
+        {
+            field.strip().split(".", 1)[1].strip('"')
+            for field in projection[1].split(",")
+            if "." in field
+        }
+        if projection
+        else None
+    )
     required, output = 0, []
     for trace in payload.get("traces", []):
         groups_out, members = [], []
@@ -594,6 +608,14 @@ def project_search(payload, context: RunContext | Sequence[RunContext]) -> int:
                     raise RunError(
                         "Backend returned a foreign or unidentified span", 502
                     )
+                if selected is not None:
+                    # Tempo can return attributes referenced by filters as well
+                    # as select(). Keep only the requested panel columns.
+                    span["attributes"] = [
+                        attribute
+                        for attribute in span.get("attributes", [])
+                        if attribute.get("key") in selected | {"rl_insight.run_id"}
+                    ]
                 # Lane identity distinguishes Runs without adding a plotted state.
                 if len(_run_ids(context)) > 1:
                     owner = pairs[0]["value"]["stringValue"]
@@ -609,10 +631,16 @@ def project_search(payload, context: RunContext | Sequence[RunContext]) -> int:
                 if not any(
                     a.get("key") == "metric.name" for a in span.get("attributes", [])
                 ):
+                    hidden = {"rl_insight.run_id"}
+                    if any(
+                        a.get("key") == "state_lane_id"
+                        for a in span.get("attributes", [])
+                    ):
+                        hidden.update(("project", "experiment_name"))
                     span["attributes"] = [
                         a
                         for a in span.get("attributes", [])
-                        if a.get("key") != "rl_insight.run_id"
+                        if a.get("key") not in hidden
                     ]
             groups_out.append({"spans": spans, "matched": matched})
             members.extend(spans)
@@ -745,7 +773,7 @@ def install_queries(app, registry, conf):
             try:
                 payload = json.loads(body)
                 if path == "search":
-                    needed = project_search(payload, context)
+                    needed = project_search(payload, context, dict(fields)["q"])
                     if needed:
                         fields = [(k, v) for k, v in fields if k != "spss"] + [
                             ("spss", str(needed))
@@ -756,7 +784,7 @@ def install_queries(app, registry, conf):
                         if not 200 <= status < 300:
                             raise RunError("Complete trace search failed", 502)
                         payload = json.loads(body)
-                        if project_search(payload, context):
+                        if project_search(payload, context, dict(fields)["q"]):
                             raise RunError("Trace search is incomplete", 502)
                 elif path.startswith("traces/"):
                     if context is None:
@@ -845,6 +873,7 @@ def install_views(app, registry, conf):
             "label/execution/values",
             "label/project/values",
             "label/run_id/values",
+            "label/metric_name/values",
         }:
             values = run_options(
                 registry,
