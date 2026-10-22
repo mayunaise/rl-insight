@@ -279,8 +279,4 @@ server:
 
 ## Selecting experiment executions
 
-Select **Project**, then choose one or more executions in **Experiment**.
-Each option shows the original experiment name, UTC creation time and short ID,
-such as `gsm8k_20261019_143025_a1b2c3d4`. **All** selects the matching executions
-in the chosen projects. The time range controls chart data, not these selection
-lists. Keep the original experiment name in training configuration.
+Select **Project**, then choose one or more executions in **Experiment**. Each option shows the original experiment name, UTC creation time and short ID, such as `gsm8k_20261019_143025_a1b2c3d4`. **All** selects the matching executions in the chosen projects. The time range controls chart data, not these selection lists. Keep the original experiment name in training configuration.

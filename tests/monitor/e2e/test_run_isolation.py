@@ -65,17 +65,13 @@ def stack(tmp_path):
     backend = FastAPI()
     state = SimpleNamespace(
         ids=[],
-        spans=[],
         span_attributes=[],
-        calls=[],
         lose_response=False,
-        registrations=[],
     )
 
     @backend.get("/{path:path}")
     def query(path: str, request: Request):
         fields = dict(request.query_params)
-        state.calls.append((path, fields))
         if path == "api/v1/label/run_id/values":
             return {"status": "success", "data": state.ids}
         expression = fields.get("query") or fields.get("q", "")
@@ -96,29 +92,23 @@ def stack(tmp_path):
                 "traces": [
                     {
                         "traceID": str(i + 1).zfill(32),
-                        "spanSets": [
-                            {
-                                "matched": 1,
-                                "spans": [
-                                    {
-                                        "name": "actor_update",
-                                        "spanID": str(i + 1).zfill(16),
-                                        "startTimeUnixNano": "1000000000",
-                                        "durationNanos": "1000000",
-                                        "attributes": [
-                                            {
-                                                "key": "rl_insight.run_id",
-                                                "value": {"stringValue": run_id},
-                                            },
-                                            {
-                                                "key": "state_lane_id",
-                                                "value": {"stringValue": "actor_0"},
-                                            },
-                                        ],
-                                    }
-                                ],
-                            }
-                        ],
+                        "spanSet": {
+                            "matched": 1,
+                            "spans": [
+                                {
+                                    "name": "actor_update",
+                                    "startTimeUnixNano": "1000000000",
+                                    "durationNanos": "1000000",
+                                    "attributes": [
+                                        {"key": k, "value": {"stringValue": v}}
+                                        for k, v in {
+                                            "rl_insight.run_id": run_id,
+                                            "state_lane_id": "actor_0",
+                                        }.items()
+                                    ],
+                                }
+                            ],
+                        },
                     }
                     for i, run_id in enumerate(state.ids)
                     if run_id in selected
@@ -153,11 +143,6 @@ def stack(tmp_path):
                 attrs = {
                     a.key: a.value.string_value for a in resource.resource.attributes
                 }
-                state.spans.extend(
-                    (attrs.get("rl_insight.run_id"), span.name)
-                    for scope in resource.scope_spans
-                    for span in scope.spans
-                )
                 state.span_attributes.extend(
                     {
                         "run_id": attrs.get("rl_insight.run_id"),
@@ -215,6 +200,18 @@ def test_same_named_runs_support_selection_isolation_and_catalog_restart(stack):
         }
         response = requests.post(stack.url + "/api/v1/runs", json=payload, timeout=5)
         assert response.status_code == 200
+        from rl_insight import __version__
+
+        assert response.json()["run_id"] == run_id
+        assert response.json()["version"] == __version__
+        assert (
+            requests.post(
+                stack.url + "/api/v1/runs",
+                json={**payload, "project": "conflict"},
+                timeout=5,
+            ).status_code
+            == 409
+        )
         assert (
             requests.post(stack.url + "/api/v1/runs", json=payload, timeout=5).json()
             == response.json()
@@ -236,11 +233,16 @@ def test_same_named_runs_support_selection_isolation_and_catalog_restart(stack):
             timeout=5,
         )
         assert len(traces.json()["traces"]) == len(chosen)
+    for query in ("reward", 'reward{run_id=~".*"}', 'reward{run_id!=""}'):
+        assert requests.get(
+            base + "prometheus/api/v1/query", params={"query": query}, timeout=5
+        ).status_code in {400, 422}
+    conflicting = 'reward{run_id="' + ids[0] + '"} + reward{run_id="' + ids[1] + '"}'
     assert (
         requests.get(
-            base + "prometheus/api/v1/query", params={"query": "reward"}, timeout=5
+            base + "prometheus/api/v1/query", params={"query": conflicting}, timeout=5
         ).status_code
-        == 422
+        == 403
     )
     assert (
         requests.get(
@@ -374,28 +376,23 @@ finally:
         ).status_code
         == 200
     )
-    assert (context["run_id"], "actor_update") in stack.backend.spans
-    early_spans = [
-        span for span in stack.backend.span_attributes if span["name"] == "sleep"
-    ]
-    assert len(early_spans) == 2
-    assert all(
-        span["run_id"] == context["run_id"]
-        and span["attributes"]["project"] == "ray"
-        and span["attributes"]["experiment_name"] == "same"
-        and span["attributes"]["state_lane_id"] == "early_replica"
-        for span in early_spans
+    assert any(
+        s["run_id"] == context["run_id"] and s["name"] == "actor_update"
+        for s in stack.backend.span_attributes
     )
-    driver_spans = [
-        span
-        for span in stack.backend.span_attributes
-        if span["name"] == "driver_prepare"
-    ]
-    assert len(driver_spans) == 1
-    assert driver_spans[0]["run_id"] == context["run_id"]
-    assert driver_spans[0]["attributes"]["project"] == "ray"
-    assert driver_spans[0]["attributes"]["experiment_name"] == "same"
-    assert driver_spans[0]["attributes"]["state_lane_id"] == "early_driver"
+    for name, lane, count in (
+        ("sleep", "early_replica", 2),
+        ("driver_prepare", "early_driver", 1),
+    ):
+        spans = [s for s in stack.backend.span_attributes if s["name"] == name]
+        assert len(spans) == count
+        for span in spans:
+            assert span["run_id"] == context["run_id"]
+            assert {
+                "project": "ray",
+                "experiment_name": "same",
+                "state_lane_id": lane,
+            }.items() <= span["attributes"].items()
     import yaml
 
     targets = yaml.safe_load(
