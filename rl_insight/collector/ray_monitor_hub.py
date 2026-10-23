@@ -316,7 +316,11 @@ class MonitorHubActor(MonitorCollector):
                 self._metrics_server.server_close()
 
     def flush(self) -> None:
-        """Confirm prior events reached OTLP and a real Prometheus scrape."""
+        """Confirm final OTLP export and SDK scrape during creator shutdown.
+
+        Workers use an ordered Context read to drain events, leaving this one
+        collection wait until the creator has joined all workers.
+        """
         deadline = time.monotonic() + 30
         if not self._trace_collector.flush():
             raise TimeoutError("OTLP export did not finish within the flush budget")

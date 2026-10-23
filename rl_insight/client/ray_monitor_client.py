@@ -231,13 +231,15 @@ class MonitorRayClient(MonitorClient):
             delay = min(delay * 2, 2)
 
     def flush(self) -> None:
-        """Drain this client's prior submissions before the Ray job can exit."""
+        """Drain prior events; only the creator waits for backend collection."""
         if not self._flush_pending():
             return
+        # A serial Context read follows this client's prior events. Workers must
+        # not each occupy the Hub waiting for another scrape.
         operation = (
             self._actor.prepare_finish.remote(self._owner_token)
             if self._owner_token
-            else self._actor.flush.remote()
+            else self._actor.get_context.remote()
         )
         ray.get(operation, timeout=35)
 

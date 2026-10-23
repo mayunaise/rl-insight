@@ -8,7 +8,7 @@ boundaries for contributors. For installation and usage, see
 
 | Existing module | Responsibility |
 | --- | --- |
-| `client/ray_monitor_client.py` | Resolve the Ray-job-scoped Hub and retain the creator's Run-close token. Worker clients flush without ending the Run. |
+| `client/ray_monitor_client.py` | Resolve the Ray-job-scoped Hub and retain the creator's Run-close token. Worker clients drain their submitted events without ending the Run. |
 | `collector/ray_monitor_hub.py` | Create the Run, collect SDK events, expose metrics on the bound port, export traces, and perform owner-controlled shutdown. |
 | `server/registry.py` | Persist Run identity and lifecycle metadata; track target ownership and expiring registrations in memory. |
 | `server/http_api.py` | Accept Run and target requests and periodically project active registrations into service discovery. |
@@ -70,8 +70,12 @@ The Hub creator holds the owner token; the registry persists its hash. Creator
 3. Mark the Run `ended`, remove only its targets, stop local renewal, and close
    the Hub's metrics HTTP endpoint.
 
-Worker `finish()` only flushes. Creator shutdown must follow worker completion;
-the Hub rejects events once closing starts. `final_collection_confirmed` records
+Worker `finish()` drains its prior event submissions with an ordered Hub Context
+read. It does not wait for a Prometheus scrape or OTLP export. Multiple workers
+can therefore finish without serial backend waits in the Hub. Their events stay
+in the shared collectors until the creator flushes once. Creator shutdown must
+follow worker completion; the Hub rejects events once closing starts.
+`final_collection_confirmed` records
 whether the SDK flush succeeded. It does not confirm the last snapshot of
 independently exiting native exporters, or assert training success.
 

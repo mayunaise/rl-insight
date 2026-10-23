@@ -68,6 +68,8 @@ def stack(tmp_path):
     state = SimpleNamespace(
         ids=[],
         span_attributes=[],
+        flush_queries=[],
+        flush_blocked=False,
         lose_response=False,
     )
 
@@ -81,6 +83,9 @@ def stack(tmp_path):
         if "rl_insight_sdk_flush_sequence" in expression:
             # Protocol backend acknowledges collection; real backends verify actual scrapes.
             selected = re.findall(r'run_id="([^"]+)"', expression)
+            state.flush_queries.extend(selected)
+            if state.flush_blocked:
+                selected = []
         if path.startswith("api/v1/"):
             return {
                 "status": "success",
@@ -531,19 +536,29 @@ def _ray_scenario(url, port, managed=False, address=None, release=None):
         print("CONTEXT " + json.dumps(context.to_dict()), flush=True)
 
         @ray.remote(num_cpus=0)
-        def worker():
-            insight.init()
-            insight.metric_gauge("worker_loss", 0.25)
-            insight.metric_log("reward_mean", 1.5, step=0)
-            run_id = insight.get_context().run_id
-            insight.finish()
-            return run_id
+        class Worker:
+            def ready(self):
+                insight.init()
+                return insight.get_context().run_id
 
-        assert ray.get(worker.remote(), timeout=40) == context.run_id
+            def finish(self):
+                insight.metric_count("worker_finished", 1)
+                insight.metric_log("reward_mean", 1.5, step=0)
+                insight.finish()
+
+        workers = [Worker.remote() for _ in range(5)]
+        assert (
+            ray.get([w.ready.remote() for w in workers], timeout=40)
+            == [context.run_id] * 5
+        )
+        ray.get([w.finish.remote() for w in workers], timeout=10)
+        assert insight.get_context().events_applied >= 11
+        print("WORKERS_DONE", flush=True)
         while release and not Path(release).exists():
             insight.metric_gauge("loss", 0.25)
             time.sleep(0.1)
         insight.metric_gauge("final_step", 2)
+        insight.metric_log("final_step", 2, step=1)
     finally:
         insight.finish()
         ray.shutdown()
@@ -553,6 +568,7 @@ def test_two_ray_jobs_keep_monitoring_when_one_finishes(stack, tmp_path):
     import ray
 
     cluster = ray.init(num_cpus=4, include_dashboard=False, logging_level="ERROR")
+    stack.backend.flush_blocked = True
     children = []
     files = []
     releases = [tmp_path / "release-a", tmp_path / "release-b"]
@@ -578,10 +594,13 @@ def test_two_ray_jobs_keep_monitoring_when_one_finishes(stack, tmp_path):
             children.append((child, output))
         deadline = time.monotonic() + 50
         contexts = []
-        while len(contexts) != 2:
+        workers_done = False
+        while len(contexts) != 2 or not workers_done:
             contexts = []
+            workers_done = True
             for child, output in children:
                 text = output.read_text(encoding="utf-8")
+                workers_done = workers_done and "WORKERS_DONE" in text
                 lines = [
                     line[8:]
                     for line in text.splitlines()
@@ -595,6 +614,9 @@ def test_two_ray_jobs_keep_monitoring_when_one_finishes(stack, tmp_path):
             ]
             time.sleep(0.05)
         assert contexts[0]["run_id"] != contexts[1]["run_id"]
+        # Worker shutdown drains its own events without waiting for any scrape.
+        assert stack.backend.flush_queries == []
+        stack.backend.flush_blocked = False
         for context in contexts:
             root = stack.url + "/api/v1/runs/" + context["run_id"]
             import yaml
@@ -612,6 +634,10 @@ def test_two_ray_jobs_keep_monitoring_when_one_finishes(stack, tmp_path):
             assert context["metrics_endpoint"] == "http://" + address + "/metrics"
             assert 'run_id="' + context["run_id"] + '"' in response.text
             assert "rl_insight_monitor_loss" in response.text
+            assert re.search(
+                r"rl_insight_monitor_worker_finished_total\{[^\n]+\} 5\.0",
+                response.text,
+            )
             assert requests.get(root, timeout=3).json()["status"] == "registered"
         releases[0].touch()
         assert children[0][0].wait(30) == 0, children[0][1].read_text()
@@ -653,6 +679,18 @@ def test_two_ray_jobs_keep_monitoring_when_one_finishes(stack, tmp_path):
             for span in stack.backend.span_attributes
             if span["name"] == "metric_log"
         } == {context["run_id"] for context in contexts}
+        for context in contexts:
+            spans = [
+                span
+                for span in stack.backend.span_attributes
+                if span["run_id"] == context["run_id"] and span["name"] == "metric_log"
+            ]
+            assert len(spans) == 6
+            assert {span["attributes"]["metric.name"] for span in spans} == {
+                "reward_mean",
+                "final_step",
+            }
+            assert stack.backend.flush_queries.count(context["run_id"]) == 1
     finally:
         for release in releases:
             release.touch()
