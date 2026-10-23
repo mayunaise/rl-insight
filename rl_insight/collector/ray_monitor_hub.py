@@ -37,7 +37,7 @@ from ..utils import (
     update_prometheus_config,
 )
 from ..utils.constants import MonitorRayActor
-from ..utils.protocol import RunContext, RunError
+from ..utils.protocol import RunContext, RunError, validate_version
 from .base import MonitorCollector
 
 logger = logging.getLogger(__name__)
@@ -108,6 +108,7 @@ def _register_run(
                     if response.status_code != 200:
                         raise RunError("Unexpected Run registration response")
                     registered = RunContext.from_dict(json.loads(body))
+                    validate_version(registered.version)
                     if (
                         registered.run_id,
                         registered.project,

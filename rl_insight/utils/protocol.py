@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Mapping
 from urllib.parse import urlsplit
@@ -30,6 +30,13 @@ class RunError(ValueError):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
         self.status = status
+
+
+def validate_version(value: Any) -> None:
+    if not isinstance(value, str) or value != __version__:
+        raise RunError(
+            f"RL-Insight version mismatch: expected {__version__!r}, got {value!r}", 409
+        )
 
 
 def validate_id(value: str) -> str:
@@ -59,6 +66,7 @@ class RunContext:
     prometheus_metrics_enabled: bool | None = None
     otel_traces_enabled: bool | None = None
     events_applied: int | None = None
+    version: str = field(default_factory=lambda: __version__)
 
     @classmethod
     def create(cls, project: str, experiment_name: str, server_url: str) -> RunContext:
@@ -110,15 +118,12 @@ class RunContext:
         object.__setattr__(self, "server_url", self.server_url.rstrip("/"))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "version": __version__,
-            **{k: v for k, v in asdict(self).items() if v is not None},
-        }
+        return {k: v for k, v in asdict(self).items() if v is not None}
 
     def metadata(self) -> dict[str, Any]:
         """Persist stable identity only; runtime status is a query-time snapshot."""
         return {
-            "version": __version__,
+            "version": self.version,
             **{
                 k: getattr(self, k)
                 for k in ("run_id", "project", "experiment_name", "server_url")
@@ -134,8 +139,9 @@ class RunContext:
                 **{
                     field.name: value[field.name]
                     for field in fields(cls)
-                    if field.name in value
-                }
+                    if field.name in value and field.name != "version"
+                },
+                version=value.get("version", ""),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise RunError("Invalid RunContext") from exc

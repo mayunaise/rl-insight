@@ -35,6 +35,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from omegaconf import OmegaConf
 
+from rl_insight import __version__
 from rl_insight.server.http_api import create_app
 from rl_insight.utils.protocol import RunContext
 
@@ -194,14 +195,13 @@ def test_same_named_runs_support_selection_isolation_and_catalog_restart(stack):
     stack.backend.ids = ids
     for i, run_id in enumerate(ids):
         payload = {
+            "version": __version__,
             "run_id": run_id,
             "project": "p" if i < 2 else "other",
             "experiment_name": "same",
         }
         response = requests.post(stack.url + "/api/v1/runs", json=payload, timeout=5)
         assert response.status_code == 200
-        from rl_insight import __version__
-
         assert response.json()["run_id"] == run_id
         assert response.json()["version"] == __version__
         assert (

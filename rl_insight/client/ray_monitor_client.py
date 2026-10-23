@@ -26,7 +26,7 @@ from omegaconf import DictConfig
 
 from ..collector.ray_monitor_hub import MonitorHubActor
 from ..utils.constants import MonitorEnv, MonitorRayActor, MonitorServer
-from ..utils.protocol import RunContext, RunError
+from ..utils.protocol import RunContext, RunError, validate_version
 from .base import MonitorClient
 
 logger = logging.getLogger(__name__)
@@ -58,6 +58,7 @@ def current_job_context() -> RunContext | None:
         return None
     if not isinstance(context, RunContext):
         raise RunError("Hub returned an invalid RunContext")
+    validate_version(getattr(context, "version", None))
     return context
 
 
@@ -174,6 +175,7 @@ class MonitorRayClient(MonitorClient):
         context = ray.get(self._actor.get_context.remote(), timeout=timeout)
         if not isinstance(context, RunContext):
             raise RunError("Hub returned an invalid RunContext")
+        validate_version(getattr(context, "version", None))
         return context
 
     def apply_event(self, event: dict[str, Any]) -> None:

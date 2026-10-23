@@ -39,7 +39,7 @@ from .. import __version__
 from ..utils.constants import MonitorEnv, MonitorPaths, MonitorServer, PrometheusScrape
 from ..utils.monitor_config_loader import load_server_config_file
 from ..utils.prometheus_utils import PrometheusTarget, PrometheusTargetStore
-from ..utils.protocol import RunContext, RunError, validate_id
+from ..utils.protocol import RunContext, RunError, validate_id, validate_version
 from .network import format_host_port, local_addresses
 from .registry import RunRegistry
 
@@ -75,9 +75,11 @@ def get_server_services() -> dict[str, Any]:
                 raise ValueError(
                     f"services response must be an object, got {type(data).__name__}"
                 )
-            return data
         except (requests.RequestException, ValueError) as exc:
             last_error = exc
+        else:
+            validate_version(data.get("server_version"))
+            return data
 
         if attempt + 1 < MonitorServer.SERVICE_DISCOVERY_RETRIES:
             time.sleep(MonitorServer.SERVICE_DISCOVERY_RETRY_DELAY_SECONDS)
@@ -123,6 +125,7 @@ def create_app(conf: DictConfig) -> FastAPI:
         request: Request,
         payload: dict[str, Any] = Body(...),
     ):
+        validate_version(payload.get("version"))
         context = registry.create(
             payload.get("run_id", ""),
             payload.get("project", "uncategorized"),
@@ -213,6 +216,7 @@ def create_app(conf: DictConfig) -> FastAPI:
         job_name = str(payload.get("job_name") or PrometheusScrape.TRAINER_METRICS_JOB)
         if "run_context" in payload:
             supplied = RunContext.from_dict(payload["run_context"])
+            validate_version(supplied.version)
             context = registry.get(supplied.run_id)
             if (context.run_id, context.project, context.experiment_name) != (
                 supplied.run_id,

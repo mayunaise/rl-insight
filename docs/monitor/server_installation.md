@@ -8,6 +8,8 @@ RL-Insight Monitor needs three services before online monitoring can run:
 | Tempo      | stores and queries RL state traces  | `>= 2.0.0`     | `2.6.1`         |
 | Grafana    | shows dashboards and trace views    | `>= 13.0.0`    | `13.0.0`        |
 
+Use the same RL-Insight package version on the training driver, all workers and the server. Starting with 0.4.0, missing or different versions are rejected during initialization and Run-aware registration.
+
 Choose one of the three approaches below depending on your network environment. To run the same stack in a container instead of installing services on the host, see the **Run with Docker** section below.
 
 ## Supported Platforms
