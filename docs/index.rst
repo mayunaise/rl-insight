@@ -27,6 +27,13 @@ For offline Recipe utilities, see the
    Metric Name Catalog <monitor/metric-name-catalog>
 
 .. toctree::
+   :maxdepth: 2
+   :caption: Tuning Guides
+
+   Async RL Training Tuning Guide <tuning_case/async_mode_tuning_tutorial>
+   Multimodal Model Tuning Using RL-Insight <tuning_case/multimodal_model_tuning_using_rl_insight>
+
+.. toctree::
    :hidden:
 
    monitor/hardware/cpu_monitoring_zh
