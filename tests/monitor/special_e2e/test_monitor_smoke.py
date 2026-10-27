@@ -34,6 +34,7 @@ from rl_insight import agent_loop_session, trace_span
 from rl_insight.agent_loop import agent_loop_lane_id
 from rl_insight.client.ray_monitor_client import _current_job_actor_name
 from rl_insight.utils.constants import MonitorRayActor
+from rl_insight.utils.protocol import CONTEXT_SDK_VERSION_HEADER
 
 pytestmark = pytest.mark.skipif(
     sys.platform not in {"linux", "win32"},
@@ -58,6 +59,7 @@ def _wait_for_json(
     url: str,
     *,
     params: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
     ready: Callable[[dict[str, Any]], bool] = bool,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + READY_TIMEOUT_SECONDS
@@ -65,7 +67,7 @@ def _wait_for_json(
     last_payload: dict[str, Any] | None = None
     while time.monotonic() < deadline:
         try:
-            response = requests.get(url, params=params, timeout=3)
+            response = requests.get(url, params=params, headers=headers, timeout=3)
             response.raise_for_status()
             payload = response.json()
             last_payload = payload
@@ -86,6 +88,7 @@ def monitor_stack() -> Generator[dict[str, str], None, None]:
     os.environ["RL_INSIGHT_SERVER_URL"] = SERVER_URL
     services = _wait_for_json(
         f"{SERVER_URL}/api/v1/services",
+        headers={CONTEXT_SDK_VERSION_HEADER: insight.__version__},
         ready=lambda data: data.get("status") == "ok",
     )
     endpoints = {
@@ -217,7 +220,7 @@ def test_agent_loop_dashboard_should_query_generated_protocol_data(
 ) -> None:
     """Generate one Agent Loop run and verify Tempo and Prometheus queryability."""
     project = "rl-insight-e2e"
-    experiment_name = EXPERIMENT_NAME
+    experiment_name = insight.get_context().experiment_name
     sample = "0"
     session_index = "0"
     session_id = f"session-{TEST_RUN_ID}"

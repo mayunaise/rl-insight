@@ -24,9 +24,16 @@ from typing import Any, cast
 import ray
 from omegaconf import DictConfig
 
+from .. import __version__
 from ..collector.ray_monitor_hub import MonitorHubActor
+from ..server.http_api import get_server_services
 from ..utils.constants import MonitorEnv, MonitorRayActor, MonitorServer
-from ..utils.protocol import RunContext, RunError, validate_version
+from ..utils.protocol import (
+    CONTEXT_REQUIRED_VERSION,
+    RunContext,
+    RunError,
+    require_context_version,
+)
 from .base import MonitorClient
 
 logger = logging.getLogger(__name__)
@@ -53,12 +60,33 @@ def current_job_context() -> RunContext | None:
     except ValueError:
         return None
     try:
-        context = ray.get(hub.get_context.remote(), timeout=2)
+        return _read_hub_context(hub, timeout=2)
     except (ray.exceptions.GetTimeoutError, ray.exceptions.ActorUnavailableError):
         return None
+
+
+def _read_hub_context(hub: Any, *, timeout: float) -> RunContext:
+    if not hasattr(hub, "get_context"):
+        require_context_version(None, "Ray Hub (missing get_context)")
+    try:
+        context = ray.get(hub.get_context.remote(), timeout=timeout)
+    except ray.exceptions.ActorUnavailableError:
+        # Preserve the caller's retry path for temporary unavailability.
+        raise
+    except (ray.exceptions.RayActorError, ray.exceptions.RayTaskError) as exc:
+        if "No module named 'rl_insight.utils.protocol'" in str(exc):
+            require_context_version(None, "Ray worker SDK (missing Context module)")
+        message = (
+            "Failed to read RL-Insight Context from Ray Hub. "
+            f"The SDK on the driver, Hub and all workers must be >= {CONTEXT_REQUIRED_VERSION}. "
+            "Upgrade older SDKs and restart the training job. "
+            "See the chained Ray error for the underlying cause."
+        )
+        logger.error(message)
+        raise RunError(message, 502) from exc
     if not isinstance(context, RunContext):
-        raise RunError("Hub returned an invalid RunContext")
-    validate_version(getattr(context, "version", None))
+        require_context_version(None, "Ray Hub (invalid Context)")
+    require_context_version(getattr(context, "version", None), "Ray Hub")
     return context
 
 
@@ -131,6 +159,7 @@ def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
         logger.warning("[rl-insight] Ray is not initialized; monitoring is disabled.")
         return None
 
+    get_server_services(str(conf.server.url))
     handle = get_or_create_monitor_hub(conf, create=bool(conf.get("run_metadata")))
     return MonitorRayClient(handle)
 
@@ -149,6 +178,8 @@ class MonitorRayClient(MonitorClient):
         self._lock = threading.Lock()
         self._closed = threading.Event()
         self._waiter: threading.Thread | None = None
+        self._compatibility_error: RunError | None = None
+        self._context_checked = False
 
     def _resolve_actor(self) -> bool:
         if self._actor is None:
@@ -161,9 +192,11 @@ class MonitorRayClient(MonitorClient):
         return True
 
     def get_context(self) -> RunContext | None:
+        if self._compatibility_error is not None:
+            raise self._compatibility_error
         if not self._resolve_actor():
             return None
-        # Includes discovery, bounded registration retries and actor scheduling.
+        # Includes service discovery and actor scheduling.
         timeout = (
             MonitorServer.SERVICE_DISCOVERY_RETRIES
             * (
@@ -172,10 +205,12 @@ class MonitorRayClient(MonitorClient):
             )
             + 30
         )
-        context = ray.get(self._actor.get_context.remote(), timeout=timeout)
-        if not isinstance(context, RunContext):
-            raise RunError("Hub returned an invalid RunContext")
-        validate_version(getattr(context, "version", None))
+        try:
+            context = _read_hub_context(self._actor, timeout=timeout)
+        except RunError as exc:
+            self._compatibility_error = exc
+            raise
+        self._context_checked = True
         return context
 
     def apply_event(self, event: dict[str, Any]) -> None:
@@ -187,10 +222,13 @@ class MonitorRayClient(MonitorClient):
         Note:
             Errors on the hub side are not surfaced here. Ordering follows Ray actor scheduling.
         """
+        event = {**event, "client_version": __version__}
         with self._lock:
+            if self._compatibility_error is not None:
+                raise self._compatibility_error
             if self._closed.is_set():
                 raise RunError("Monitor client is closed")
-            if self._actor is not None and not self._pending:
+            if self._context_checked and not self._pending:
                 self._actor.apply_event.remote(event)
                 return
             if len(self._pending) >= 1024:
@@ -208,6 +246,7 @@ class MonitorRayClient(MonitorClient):
         with self._lock:
             if not self._resolve_actor():
                 return False
+            self.get_context()
             while self._pending:
                 self._actor.apply_event.remote(self._pending[0])
                 self._pending.popleft()
@@ -219,6 +258,12 @@ class MonitorRayClient(MonitorClient):
             try:
                 if self._flush_pending():
                     return
+            except RunError as exc:
+                with self._lock:
+                    self._compatibility_error = exc
+                    self._pending.clear()
+                logger.error("[rl-insight] Cannot initialize pending events: %s", exc)
+                return
             except ray.exceptions.RayError:
                 logger.exception("[rl-insight] Cannot attach pending events to the Run")
             if self._closed.wait(delay):

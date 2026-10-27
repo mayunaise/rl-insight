@@ -87,7 +87,8 @@ def init(
     Args:
         project: Optional project name attached to all metrics and traces as the ``project`` label/attribute.
         experiment_name: Optional experiment name attached to all metrics and traces as the
-            ``experiment_name`` label/attribute.
+            ``experiment_name`` label/attribute. The Ray Hub appends one execution ID;
+            ``get_context().experiment_name`` returns the resulting telemetry name.
         config: Optional dict-like or ``DictConfig`` overrides merged into training defaults; see ``load_monitor_config``.
 
     Note:
@@ -138,7 +139,7 @@ def init(
     context = getattr(client, "get_context", lambda: None)() if client else None
     if context and (
         (project and project != context.project)
-        or (experiment_name and experiment_name != context.experiment_name)
+        or (experiment_name and experiment_name != context.original_experiment_name)
     ):
         raise RunError("Experiment metadata conflicts with the existing Run")
     labels = {
@@ -594,8 +595,7 @@ def _emit_trace_span(
     }
     merged_attributes.update(attributes)
     if _STATE.context:
-        _STATE.context.labels(merged_attributes)  # Validate reserved identity aliases.
-        merged_attributes["rl_insight.run_id"] = _STATE.context.run_id
+        merged_attributes = _STATE.context.labels(merged_attributes)
 
     event = {
         "kind": MonitorEventKind.TRACE,

@@ -32,6 +32,7 @@ import yaml
 from omegaconf import DictConfig, OmegaConf
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
+from .. import __version__
 from ..server.network import format_host_port, local_addresses
 from .constants import (
     MonitorBackend,
@@ -40,7 +41,12 @@ from .constants import (
     PrometheusScrape,
     prometheus_targets_file_from_config,
 )
-from .protocol import RunContext, RunError
+from .protocol import (
+    CONTEXT_SDK_VERSION_HEADER,
+    InvalidVersionError,
+    RunContext,
+    RunError,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.WARNING)
@@ -582,14 +588,22 @@ def _register_targets(
         "job_name": job_name or PrometheusScrape.TRAINER_METRICS_JOB,
         "targets": _build_target_payload(server_addresses, labels),
     }
-    if context:
-        payload["run_context"] = context.to_dict()
-        payload["identity_in_metrics"] = identity_in_metrics
+    if context and not identity_in_metrics:
+        for target in payload["targets"]:
+            target["labels"] = context.labels(target.get("labels"))
     url = f"{base_url}/api/v1/prometheus/targets"
     try:
-        response = requests.post(url, json=payload, timeout=10)
+        response = requests.post(
+            url,
+            json=payload,
+            headers={CONTEXT_SDK_VERSION_HEADER: __version__},
+            timeout=10,
+        )
         if 400 <= response.status_code < 500 and response.status_code not in {408, 429}:
-            raise RunError(
+            error_type = (
+                InvalidVersionError if response.status_code == 409 else RunError
+            )
+            raise error_type(
                 "Target registration rejected: " + response.text[:512],
                 response.status_code,
             )

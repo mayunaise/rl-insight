@@ -12,18 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Runtime-independent identity shared by collectors and query routes."""
+"""Execution identity and live status shared by a job's Hub and workers."""
 
 from __future__ import annotations
 
-import re
-from dataclasses import asdict, dataclass, field, fields
+import logging
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from packaging.version import InvalidVersion, Version
+
 from .. import __version__
+
+logger = logging.getLogger(__name__)
+
+# This feature's minimum stays fixed when the package version increases.
+CONTEXT_REQUIRED_VERSION = Version("0.4.0")
+CONTEXT_SDK_VERSION_HEADER = "X-RL-Insight-Client-Version"
 
 
 class RunError(ValueError):
@@ -32,32 +40,34 @@ class RunError(ValueError):
         self.status = status
 
 
-def validate_version(value: Any) -> None:
-    if not isinstance(value, str) or value != __version__:
-        raise RunError(
-            f"RL-Insight version mismatch: expected {__version__!r}, got {value!r}", 409
+class InvalidVersionError(RunError):
+    """The peer does not meet the Context version requirement."""
+
+
+def require_context_version(value: Any, component: str) -> None:
+    try:
+        supported = (
+            isinstance(value, str) and Version(value) >= CONTEXT_REQUIRED_VERSION
         )
-
-
-def validate_id(value: str) -> str:
-    if not isinstance(value, str) or not re.fullmatch(
-        r"(?:[0-9]{8}T[0-9]{6}Z_)?[0-9a-f]{32}", value
-    ):
-        raise RunError("Invalid Run ID")
-    if "_" in value:
-        try:
-            datetime.strptime(value.split("_", 1)[0], "%Y%m%dT%H%M%SZ")
-        except ValueError as exc:
-            raise RunError("Invalid Run timestamp") from exc
-    return value
+    except InvalidVersion:
+        supported = False
+    if not supported:
+        message = (
+            f"RL-Insight Context requires {component} >= {CONTEXT_REQUIRED_VERSION}; "
+            f"received version {value!r}. Upgrade the RL-Insight server and SDK on "
+            f"the driver and all workers to >= {CONTEXT_REQUIRED_VERSION}, "
+            "then restart the training job."
+        )
+        logger.error(message)
+        raise InvalidVersionError(message, 409)
 
 
 @dataclass(frozen=True)
 class RunContext:
-    run_id: str
     project: str
     experiment_name: str
     server_url: str
+    original_experiment_name: str | None = None
     actor_name: str | None = None
     namespace: str | None = None
     node_ip: str | None = None
@@ -70,11 +80,15 @@ class RunContext:
 
     @classmethod
     def create(cls, project: str, experiment_name: str, server_url: str) -> RunContext:
-        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ_") + uuid4().hex
-        return cls(run_id, project, experiment_name, server_url)
+        suffix = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S_") + uuid4().hex[:8]
+        return cls(
+            project,
+            f"{experiment_name}_{suffix}",
+            server_url,
+            original_experiment_name=experiment_name,
+        )
 
     def __post_init__(self) -> None:
-        validate_id(self.run_id)
         for field_name in (
             "actor_name",
             "namespace",
@@ -92,7 +106,10 @@ class RunContext:
             type(self.events_applied) is not int or self.events_applied < 0
         ):
             raise RunError("Invalid Context event count")
-        for name in (self.project, self.experiment_name):
+        for name in (
+            self.project,
+            self.original_experiment_name or self.experiment_name,
+        ):
             if not isinstance(name, str) or not name.strip() or len(name) > 256:
                 raise RunError(
                     "Run names must be non-empty strings of at most 256 characters"
@@ -120,38 +137,7 @@ class RunContext:
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
 
-    def metadata(self) -> dict[str, Any]:
-        """Persist stable identity only; runtime status is a query-time snapshot."""
-        return {
-            "version": self.version,
-            **{
-                k: getattr(self, k)
-                for k in ("run_id", "project", "experiment_name", "server_url")
-            },
-        }
-
-    @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> RunContext:
-        try:
-            if not isinstance(value, Mapping):
-                raise TypeError
-            return cls(
-                **{
-                    field.name: value[field.name]
-                    for field in fields(cls)
-                    if field.name in value and field.name != "version"
-                },
-                version=value.get("version", ""),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RunError("Invalid RunContext") from exc
-
     def labels(self, supplied: Mapping[str, Any] | None = None) -> dict[str, Any]:
         labels = dict(supplied or {})
-        for key in ("run_id", "rl_insight.run_id", "exported_run_id"):
-            if key in labels and labels[key] != self.run_id:
-                raise RunError("run_id conflicts with RunContext")
-        labels.pop("rl_insight.run_id", None)
-        labels.pop("exported_run_id", None)
-        labels["run_id"] = self.run_id
+        labels.update(project=self.project, experiment_name=self.experiment_name)
         return labels

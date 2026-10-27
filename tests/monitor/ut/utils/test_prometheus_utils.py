@@ -25,7 +25,9 @@ import pytest
 import yaml
 from prometheus_client import CollectorRegistry, Gauge, make_wsgi_app
 
+from rl_insight import __version__
 from rl_insight.utils import prometheus_utils as prometheus_module
+from rl_insight.utils.protocol import CONTEXT_SDK_VERSION_HEADER, RunContext
 
 
 def _register_target_in_process(
@@ -213,6 +215,7 @@ def test_update_prometheus_config_should_send_normalized_targets_when_server_is_
         ["host-a:9000", "host-b:9000"],
         job_name="workers",
         labels=[{"rank": 0}, None],
+        context=RunContext("p", "e", "http://server:18080"),
     )
 
     post.assert_called_once_with(
@@ -220,10 +223,17 @@ def test_update_prometheus_config_should_send_normalized_targets_when_server_is_
         json={
             "job_name": "workers",
             "targets": [
-                {"target": "host-a:9000", "labels": {"rank": "0"}},
-                {"target": "host-b:9000"},
+                {
+                    "target": "host-a:9000",
+                    "labels": {"rank": "0", "project": "p", "experiment_name": "e"},
+                },
+                {
+                    "target": "host-b:9000",
+                    "labels": {"project": "p", "experiment_name": "e"},
+                },
             ],
         },
+        headers={CONTEXT_SDK_VERSION_HEADER: __version__},
         timeout=10,
     )
     response.raise_for_status.assert_called_once_with()

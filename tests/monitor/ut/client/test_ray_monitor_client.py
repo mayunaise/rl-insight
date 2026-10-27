@@ -21,8 +21,10 @@ from unittest.mock import MagicMock
 import pytest
 from omegaconf import OmegaConf
 
+from rl_insight import __version__
 from rl_insight.client import ray_monitor_client as client_module
 from rl_insight.utils.constants import MonitorRayActor
+from rl_insight.utils.protocol import RunContext
 
 _JOB_ACTOR_NAME = f"{MonitorRayActor.NAME}_test123"
 
@@ -105,11 +107,21 @@ def test_get_or_create_monitor_hub_should_reuse_winner_when_creation_races(
     get_actor.assert_called_with(_JOB_ACTOR_NAME, namespace=MonitorRayActor.NAMESPACE)
 
 
-def test_apply_event_should_submit_without_waiting_when_client_has_actor() -> None:
+def test_apply_event_should_submit_without_waiting_when_hub_is_verified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     actor = MagicMock()
     client = client_module.MonitorRayClient(actor)
     event = {"kind": "counter", "name": "steps", "value": 1}
+    monkeypatch.setattr(
+        client_module.ray,
+        "get",
+        lambda *args, **kwargs: RunContext("p", "e", "http://server"),
+    )
+    client.get_context()
 
     client.apply_event(event)
 
-    actor.apply_event.remote.assert_called_once_with(event)
+    actor.apply_event.remote.assert_called_once_with(
+        {**event, "client_version": __version__}
+    )

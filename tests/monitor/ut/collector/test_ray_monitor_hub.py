@@ -16,12 +16,14 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, cast
 from unittest.mock import MagicMock, call
 
 import pytest
 from omegaconf import OmegaConf
 
+from rl_insight import __version__
 from rl_insight.collector import ray_monitor_hub as hub_module
 from rl_insight.utils.constants import MonitorEventKind, MonitorRayActor
 from rl_insight.utils.protocol import RunContext
@@ -50,7 +52,6 @@ def hub() -> Any:
 def test_init_should_configure_collectors_and_register_scrape_target_when_created(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(hub_module, "_register_run", lambda context, config: context)
     registry = MagicMock()
     trace_collector = MagicMock(enabled=True)
     start_server = MagicMock()
@@ -77,13 +78,16 @@ def test_init_should_configure_collectors_and_register_scrape_target_when_create
     trace_factory.assert_called_once_with(
         namespace="trainer",
         endpoint="http://host:4318/v1/traces",
-        resource_attributes={"rl_insight.run_id": instance._context.run_id},
     )
     start_server.assert_called_once_with(9092, addr="10.0.0.8")
     update_config.assert_called_once_with(
         ["10.0.0.8:9092"], context=instance._context, identity_in_metrics=True
     )
     assert instance._registry is registry
+    assert instance._context.original_experiment_name == "unnamed"
+    assert re.fullmatch(
+        r"unnamed_[0-9]{8}-[0-9]{6}_[0-9a-f]{8}", instance._context.experiment_name
+    )
 
 
 @pytest.mark.parametrize(
@@ -117,7 +121,7 @@ def test_apply_event_should_dispatch_metric_when_kind_is_supported(
     method: str,
     expected_call: Any,
 ) -> None:
-    hub.apply_event(event)
+    hub.apply_event({**event, "client_version": __version__})
 
     assert hub._events_applied == 1
     assert getattr(hub._registry, method).call_args == expected_call
@@ -126,18 +130,26 @@ def test_apply_event_should_dispatch_metric_when_kind_is_supported(
 def test_apply_event_should_export_trace_when_trace_collection_is_enabled(
     hub: Any,
 ) -> None:
+    hub._context = RunContext.create("p", "same", "http://server")
     event = {
         "kind": "trace",
         "name": "rollout",
         "start_time_ns": "10",
         "end_time_ns": 25,
-        "attributes": {"step": 3},
+        "attributes": {"step": 3, "experiment_name": "same"},
     }
 
-    hub.apply_event(event)
+    hub.apply_event({**event, "client_version": __version__})
 
     hub._trace_collector.record_span.assert_called_once_with(
-        "rollout", 10, 25, attributes={"step": 3}
+        "rollout",
+        10,
+        25,
+        attributes={
+            "step": 3,
+            "project": "p",
+            "experiment_name": hub._context.experiment_name,
+        },
     )
 
 
@@ -149,7 +161,7 @@ def test_apply_event_should_raise_value_error_when_event_is_invalid(
     hub: Any, event: dict[str, object], message: str
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        hub.apply_event(event)
+        hub.apply_event({**event, "client_version": __version__})
 
 
 def test_get_context_should_describe_identity_and_live_status(hub: Any) -> None:
@@ -157,11 +169,11 @@ def test_get_context_should_describe_identity_and_live_status(hub: Any) -> None:
     hub._metrics_port = 9092
     hub._events_applied = 4
 
-    hub._context = RunContext("a" * 32, "p", "e", "http://server")
+    hub._context = RunContext("p", "e", "http://server")
     hub._conf = OmegaConf.create({"server": {"url": "http://server"}})
     hub._services = {"otlp_port": 4318}
     context = hub.get_context()
-    assert context.run_id == "a" * 32
+    assert context.experiment_name == "e"
     assert context.events_applied == 4
     hub._events_applied = 5
     assert hub.get_context().events_applied == 5
@@ -188,27 +200,3 @@ def test_get_context_should_describe_identity_and_live_status(hub: Any) -> None:
         "otel_traces_enabled": True,
         "events_applied": 4,
     }
-
-
-def test_registration_rejects_a_response_after_deadline(monkeypatch):
-    import json
-
-    now = [0.0]
-    context = RunContext.create("p", "e", "http://server")
-    session = MagicMock()
-    response = session.post.return_value
-    response.status_code = 200
-
-    def chunks(**kwargs):
-        now[0] = 20.0
-        yield json.dumps(context.metadata()).encode()
-
-    response.iter_content.side_effect = chunks
-    monkeypatch.setattr(
-        hub_module.requests,
-        "Session",
-        lambda: MagicMock(__enter__=lambda self: session, __exit__=lambda *args: None),
-    )
-    monkeypatch.setattr(hub_module.time, "monotonic", lambda: now[0])
-    with pytest.raises(TimeoutError, match="budget"):
-        hub_module._register_run(context, {}, budget=10)

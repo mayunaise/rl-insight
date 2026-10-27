@@ -8,7 +8,9 @@ RL-Insight Monitor needs three services before online monitoring can run:
 | Tempo      | stores and queries RL state traces  | `>= 2.0.0`     | `2.6.1`         |
 | Grafana    | shows dashboards and trace views    | `>= 13.0.0`    | `13.0.0`        |
 
-Use the same RL-Insight package version on the training driver, all workers and the server. Starting with 0.4.0, missing or different versions are rejected during initialization and Run-aware registration.
+The Context feature requires RL-Insight server, Hub, and driver/worker SDK versions >= 0.4.0. This minimum stays fixed when the package is upgraded; component versions do not need to match exactly. Upgrade the server and SDK on every training node, then restart the training job. The SDK checks Server and Hub support during initialization or when an early worker first attaches. Missing/invalid versions and missing Context interfaces produce an upgrade error; incompatible calls do not fall back to the old protocol.
+
+SDK HTTP requests carry `X-RL-Insight-Client-Version`; Ray events carry a top-level `client_version`. The services and target-registration APIs return HTTP 409 for unsupported clients, and the Hub rejects unsupported events before processing them. The receiving side also logs the upgrade instructions because older SDKs may swallow HTTP failures or submit Ray events without reading the result; their training process may continue despite rejected monitoring data. Health checks do not require SDK version metadata. Transient connection failures retain their retry behavior.
 
 Choose one of the three approaches below depending on your network environment. To run the same stack in a container instead of installing services on the host, see the **Run with Docker** section below.
 
@@ -281,4 +283,4 @@ server:
 
 ## Selecting experiment executions
 
-Select **Project**, then choose one or more executions in **Experiment**. Each option shows the original experiment name, UTC creation time and short ID, such as `gsm8k_20261019_143025_a1b2c3d4`. **All** selects the matching executions in the chosen projects. The time range controls chart data, not these selection lists. Keep the original experiment name in training configuration.
+Select **Project**, then choose one or more executions in **Experiment**. The job Hub appends a UTC timestamp and an 8-character UUID suffix to the original experiment name once, and all workers use this execution name for metrics, traces and native exporter labels. **All** selects the matching executions in the chosen projects. Options use each dashboard's existing data sources and query time range. Keep the original experiment name in training configuration; `rl_insight.get_context().experiment_name` returns the actual telemetry name. This provides execution filtering within shared backend storage.
