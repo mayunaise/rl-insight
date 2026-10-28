@@ -66,13 +66,15 @@ def _wait_for_context() -> None:
     from ..client.ray_monitor_client import initialize_current_job_connection
 
     delay = 0.1
+    context: RunContext | None = None
     while True:
         with _pending_lock:
             if not _pending_targets:
                 _pending_probe = None
                 return
         try:
-            context = initialize_current_job_connection()
+            if context is None:
+                context = initialize_current_job_connection()
             if context:
                 flush_pending_targets(context)
         except (RunError, RayActorError) as exc:

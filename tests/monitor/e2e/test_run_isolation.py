@@ -158,7 +158,7 @@ import json, socket, sys, time
 import requests
 import ray
 import rl_insight as insight
-from rl_insight.client.ray_monitor_client import current_job_context
+from rl_insight.client.ray_monitor_client import initialize_current_job_connection
 
 url = sys.argv[1]
 ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
@@ -200,7 +200,7 @@ try:
         insight.update_prometheus_config(["127.0.0.1:19999"])
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            context = current_job_context()
+            context = initialize_current_job_connection()
             if context:
                 return context.experiment_name
             time.sleep(0.1)
