@@ -118,7 +118,7 @@ def test_apply_event_should_submit_without_waiting_when_hub_is_verified(
         "get",
         lambda *args, **kwargs: RunContext("p", "e", "http://server"),
     )
-    client.get_context()
+    client.initialize()
 
     client.apply_event(event)
 

@@ -8,7 +8,7 @@ RL-Insight Monitor needs three services before online monitoring can run:
 | Tempo      | stores and queries RL state traces  | `>= 2.0.0`     | `2.6.1`         |
 | Grafana    | shows dashboards and trace views    | `>= 13.0.0`    | `13.0.0`        |
 
-The SDK checks Server and Hub compatibility during initialization. Server, Hub and SDK versions must be at least 0.4.0; this minimum stays fixed when the package version increases. A failed check raises `InvalidVersionError` with upgrade instructions. Restart the training job after upgrading affected components.
+During initialization, the SDK reports incompatible Server or Hub versions with an upgrade message.
 
 Choose one of the three approaches below depending on your network environment. To run the same stack in a container instead of installing services on the host, see the **Run with Docker** section below.
 
@@ -281,4 +281,6 @@ server:
 
 ## Selecting experiment executions
 
-Select **Project**, then choose one or more executions in **Experiment**. The job Hub appends a UTC timestamp and an 8-character UUID suffix to the original experiment name once, and all workers use this execution name for metrics, traces and native exporter labels. **All** selects the matching executions in the chosen projects. Options use each dashboard's existing data sources and query time range. Keep the original experiment name in training configuration; `rl_insight.get_context().experiment_name` returns the actual telemetry name. This provides execution filtering within shared backend storage.
+Keep the original project and experiment names in your training configuration. In Grafana, select **Project**, then choose the execution you want from **Experiment**. Each entry includes the configured experiment name, a UTC timestamp and a short suffix, for example `gsm8k_20261028-101530_a1b2c3d4`, so repeated jobs with the same configured name can be selected separately.
+
+Choose multiple executions or **All** to compare runs. Set the dashboard time range to cover the executions you want to inspect.

@@ -50,15 +50,21 @@ def _current_job_actor_name() -> str:
     return f"{MonitorRayActor.NAME}_{job_id_str}"
 
 
-def current_job_context() -> RunContext | None:
-    """Resolve only an existing Hub; native registration must not create a Run."""
+def _existing_job_hub() -> Any:
     if not ray.is_initialized():
         return None
     try:
-        hub: Any = ray.get_actor(
+        return ray.get_actor(
             _current_job_actor_name(), namespace=MonitorRayActor.NAMESPACE
         )
     except ValueError:
+        return None
+
+
+def current_job_context() -> RunContext | None:
+    """Read an existing Hub without creating or initializing a connection."""
+    hub = _existing_job_hub()
+    if hub is None:
         return None
     try:
         return _read_hub_context(hub, timeout=2)
@@ -66,16 +72,34 @@ def current_job_context() -> RunContext | None:
         return None
 
 
-def _read_hub_context(
-    hub: Any, *, timeout: float, initialize: bool = True
-) -> RunContext:
-    if initialize and not hasattr(hub, "connect"):
+def initialize_current_job_connection() -> RunContext | None:
+    """Initialize native collection against an existing Hub, without creating one."""
+    hub = _existing_job_hub()
+    if hub is None:
+        return None
+    try:
+        return _initialize_hub_connection(hub, timeout=2)
+    except (ray.exceptions.GetTimeoutError, ray.exceptions.ActorUnavailableError):
+        return None
+
+
+def _read_hub_context(hub: Any, *, timeout: float) -> RunContext:
+    try:
+        context = ray.get(hub.get_context.remote(), timeout=timeout)
+    except ray.exceptions.ActorUnavailableError:
+        raise
+    except (ray.exceptions.RayActorError, ray.exceptions.RayTaskError) as exc:
+        raise RunError("Failed to read the Ray Hub Context", 502) from exc
+    if not isinstance(context, RunContext):
+        raise RunError("Ray Hub returned an invalid Context", 502)
+    return context
+
+
+def _initialize_hub_connection(hub: Any, *, timeout: float) -> RunContext:
+    if not hasattr(hub, "connect"):
         require_version(None, "Ray Hub (initialization API unavailable)")
     try:
-        reference = (
-            hub.connect.remote(__version__) if initialize else hub.get_context.remote()
-        )
-        context = ray.get(reference, timeout=timeout)
+        context = ray.get(hub.connect.remote(__version__), timeout=timeout)
     except ray.exceptions.ActorUnavailableError:
         # Preserve the caller's retry path for temporary unavailability.
         raise
@@ -96,8 +120,7 @@ def _read_hub_context(
         raise RunError(message, 502) from exc
     if not isinstance(context, RunContext):
         raise RunError("Ray Hub returned an invalid Context", 502)
-    if initialize:
-        require_version(getattr(context, "version", None), "Ray Hub")
+    require_version(getattr(context, "version", None), "Ray Hub")
     return context
 
 
@@ -172,7 +195,9 @@ def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
 
     get_server_services(str(conf.server.url))
     handle = get_or_create_monitor_hub(conf, create=bool(conf.get("run_metadata")))
-    return MonitorRayClient(handle)
+    client = MonitorRayClient(handle)
+    client.initialize()
+    return client
 
 
 class MonitorRayClient(MonitorClient):
@@ -190,7 +215,16 @@ class MonitorRayClient(MonitorClient):
         self._closed = threading.Event()
         self._waiter: threading.Thread | None = None
         self._compatibility_error: RunError | None = None
-        self._context_checked = False
+        self._initialized = False
+        # Includes service discovery and actor scheduling during initialization.
+        self._timeout = (
+            MonitorServer.SERVICE_DISCOVERY_RETRIES
+            * (
+                MonitorServer.SERVICE_DISCOVERY_TIMEOUT_SECONDS
+                + MonitorServer.SERVICE_DISCOVERY_RETRY_DELAY_SECONDS
+            )
+            + 30
+        )
 
     def _resolve_actor(self) -> bool:
         if self._actor is None:
@@ -202,29 +236,29 @@ class MonitorRayClient(MonitorClient):
                 return False
         return True
 
-    def get_context(self) -> RunContext | None:
+    def initialize(self) -> bool:
+        """Establish and validate the Hub connection before collecting data."""
         if self._compatibility_error is not None:
             raise self._compatibility_error
+        if self._initialized:
+            return True
         if not self._resolve_actor():
-            return None
-        # Includes service discovery and actor scheduling.
-        timeout = (
-            MonitorServer.SERVICE_DISCOVERY_RETRIES
-            * (
-                MonitorServer.SERVICE_DISCOVERY_TIMEOUT_SECONDS
-                + MonitorServer.SERVICE_DISCOVERY_RETRY_DELAY_SECONDS
-            )
-            + 30
-        )
+            self._start_waiter()
+            return False
         try:
-            context = _read_hub_context(
-                self._actor, timeout=timeout, initialize=not self._context_checked
-            )
+            _initialize_hub_connection(self._actor, timeout=self._timeout)
         except RunError as exc:
             self._compatibility_error = exc
             raise
-        self._context_checked = True
-        return context
+        self._initialized = True
+        return True
+
+    def get_context(self) -> RunContext | None:
+        if self._compatibility_error is not None:
+            raise self._compatibility_error
+        if not self._initialized:
+            return None
+        return _read_hub_context(self._actor, timeout=self._timeout)
 
     def apply_event(self, event: dict[str, Any]) -> None:
         """Submit ``MonitorHubActor.apply_event`` on the actor (fire-and-forget; no ``ray.get``).
@@ -240,7 +274,7 @@ class MonitorRayClient(MonitorClient):
                 raise self._compatibility_error
             if self._closed.is_set():
                 raise RunError("Monitor client is closed")
-            if self._context_checked and not self._pending:
+            if self._initialized and not self._pending:
                 self._actor.apply_event.remote(event)
                 return
             if len(self._pending) >= 1024:
@@ -248,17 +282,21 @@ class MonitorRayClient(MonitorClient):
                     "Too many events waiting for configured Run initialization"
                 )
             self._pending.append(event)
-            if self._waiter is None or not self._waiter.is_alive():
-                self._waiter = threading.Thread(
-                    target=self._wait_for_hub, name="insight-events", daemon=True
-                )
-                self._waiter.start()
+            self._start_waiter()
+
+    def _start_waiter(self) -> None:
+        if self._closed.is_set():
+            return
+        if self._waiter is None or not self._waiter.is_alive():
+            self._waiter = threading.Thread(
+                target=self._wait_for_hub, name="insight-events", daemon=True
+            )
+            self._waiter.start()
 
     def _flush_pending(self) -> bool:
         with self._lock:
-            if not self._resolve_actor():
+            if not self.initialize():
                 return False
-            self.get_context()
             while self._pending:
                 self._actor.apply_event.remote(self._pending[0])
                 self._pending.popleft()

@@ -63,7 +63,7 @@ def _wait_for_context() -> None:
     global _pending_probe
     from ray.exceptions import RayActorError
 
-    from ..client.ray_monitor_client import current_job_context
+    from ..client.ray_monitor_client import initialize_current_job_connection
 
     delay = 0.1
     while True:
@@ -72,7 +72,7 @@ def _wait_for_context() -> None:
                 _pending_probe = None
                 return
         try:
-            context = current_job_context()
+            context = initialize_current_job_connection()
             if context:
                 flush_pending_targets(context)
         except (RunError, RayActorError) as exc:
@@ -532,9 +532,11 @@ def update_prometheus_config(
 
             if get_server_services():
                 # Wait for logger initialization; never create a Run from an address.
-                from ..client.ray_monitor_client import current_job_context
+                from ..client.ray_monitor_client import (
+                    initialize_current_job_connection,
+                )
 
-                context = current_job_context()
+                context = initialize_current_job_connection()
                 item: tuple[
                     list[str], str | None, list[Mapping[str, Any] | None] | None
                 ] = (
