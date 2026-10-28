@@ -96,38 +96,14 @@ def _initialize_hub_connection(hub: Any, *, timeout: float) -> RunContext:
 
 
 def get_or_create_monitor_hub(conf: DictConfig, *, create: bool = True) -> Any:
-    """Get or create a job-scoped MonitorHubActor with health check.
-
-    Each Ray job gets its own hub actor named
-    ``MonitorRayActor.NAME_{job_id}``. The actor is not detached, so it
-    cleans up automatically when the job exits.
-
-    Args:
-        conf: Merged trainer monitor config passed to the actor constructor.
-
-    Returns:
-        Ray actor handle for ``MonitorHubActor``.
-
-    Raises:
-        RuntimeError: If Ray is not initialized.
-    """
-
+    """Reuse the current job's Hub; Ray handles concurrent creation if allowed."""
     actor_name = _current_job_actor_name()
     namespace = MonitorRayActor.NAMESPACE
-
     try:
-        handle = ray.get_actor(actor_name, namespace=namespace)
-        logger.info(
-            "[rl-insight] Connected to existing monitor hub actor %r.", actor_name
-        )
-        return handle
+        return ray.get_actor(actor_name, namespace=namespace)
     except ValueError:
         if not create:
             return None
-        logger.info(
-            "[rl-insight] No existing monitor hub actor %r found; creating one.",
-            actor_name,
-        )
     actor_options: dict[str, Any] = {
         "name": actor_name,
         "namespace": namespace,
@@ -139,16 +115,7 @@ def get_or_create_monitor_hub(conf: DictConfig, *, create: bool = True) -> Any:
             "env_vars": {MonitorEnv.SERVER_URL: server_url},
         }
 
-    try:
-        actor_cls = cast(Any, MonitorHubActor)
-        return actor_cls.options(**actor_options).remote(conf)
-    except ValueError:
-        logger.info(
-            "[rl-insight] Monitor hub actor %r was created concurrently; "
-            "connecting to it.",
-            actor_name,
-        )
-        return ray.get_actor(actor_name, namespace=namespace)
+    return cast(Any, MonitorHubActor).options(**actor_options).remote(conf)
 
 
 def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
