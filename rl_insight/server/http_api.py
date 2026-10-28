@@ -25,7 +25,7 @@ from typing import Any, Sequence
 
 import requests
 import uvicorn
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, status
+from fastapi import Body, FastAPI, Header, HTTPException, status
 from omegaconf import DictConfig, OmegaConf
 
 from .. import __version__
@@ -33,10 +33,10 @@ from ..utils.constants import MonitorEnv, MonitorServer, PrometheusScrape
 from ..utils.monitor_config_loader import load_server_config_file
 from ..utils.prometheus_utils import PrometheusTarget, PrometheusTargetStore
 from ..utils.protocol import (
-    CONTEXT_SDK_VERSION_HEADER,
+    SDK_VERSION_HEADER,
     InvalidVersionError,
     RunError,
-    require_context_version,
+    require_version,
 )
 from .network import local_addresses
 
@@ -49,12 +49,10 @@ def server_url() -> str:
 
 
 def get_server_services(base_url: str | None = None) -> dict[str, Any]:
-    """Fetch service endpoints required by the Context feature."""
+    """Initialize the SDK connection and fetch the Server's service endpoints."""
     base_url = (base_url or server_url()).strip().rstrip("/")
     if not base_url:
-        raise RunError(
-            f"Context requires an RL-Insight server URL; set {MonitorEnv.SERVER_URL}"
-        )
+        raise RunError(f"RL-Insight requires a Server URL; set {MonitorEnv.SERVER_URL}")
 
     url = f"{base_url}{MonitorServer.API_PREFIX}/services"
     last_error: requests.RequestException | ValueError | None = None
@@ -62,7 +60,7 @@ def get_server_services(base_url: str | None = None) -> dict[str, Any]:
         try:
             response = requests.get(
                 url,
-                headers={CONTEXT_SDK_VERSION_HEADER: __version__},
+                headers={SDK_VERSION_HEADER: __version__},
                 timeout=MonitorServer.SERVICE_DISCOVERY_TIMEOUT_SECONDS,
             )
             response.raise_for_status()
@@ -73,9 +71,7 @@ def get_server_services(base_url: str | None = None) -> dict[str, Any]:
                 )
         except requests.HTTPError as exc:
             if exc.response is not None and exc.response.status_code in {404, 405}:
-                require_context_version(
-                    None, f"Server (services API unavailable at {url})"
-                )
+                require_version(None, f"Server (services API unavailable at {url})")
             if (
                 exc.response is not None
                 and 400 <= exc.response.status_code < 500
@@ -99,14 +95,14 @@ def get_server_services(base_url: str | None = None) -> dict[str, Any]:
         except (requests.RequestException, ValueError) as exc:
             last_error = exc
         else:
-            require_context_version(data.get("server_version"), "Server")
+            require_version(data.get("server_version"), "Server")
             return data
 
         if attempt + 1 < MonitorServer.SERVICE_DISCOVERY_RETRIES:
             time.sleep(MonitorServer.SERVICE_DISCOVERY_RETRY_DELAY_SECONDS)
 
     raise RunError(
-        f"Cannot verify Context support at {url}: {last_error}", 503
+        f"Cannot initialize the RL-Insight connection at {url}: {last_error}", 503
     ) from last_error
 
 
@@ -115,25 +111,20 @@ def create_app(conf: DictConfig) -> FastAPI:
     app = FastAPI(title="RL-Insight server", version=__version__)
     store = PrometheusTargetStore.from_config(conf)
 
-    def require_context_sdk(
-        client_version: str | None = Header(None, alias=CONTEXT_SDK_VERSION_HEADER),
-    ) -> None:
-        try:
-            require_context_version(client_version, "SDK")
-        except RunError as exc:
-            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
         """Return a lightweight liveness response for process checks."""
         return {"status": "ok"}
 
-    @app.get(
-        f"{MonitorServer.API_PREFIX}/services",
-        dependencies=[Depends(require_context_sdk)],
-    )
-    def services() -> dict[str, Any]:
-        """Expose enabled component ports for trainer-side endpoint discovery."""
+    @app.get(f"{MonitorServer.API_PREFIX}/services")
+    def services(
+        client_version: str | None = Header(None, alias=SDK_VERSION_HEADER),
+    ) -> dict[str, Any]:
+        """Verify the connecting SDK and expose the Server's enabled services."""
+        try:
+            require_version(client_version, "Client")
+        except InvalidVersionError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         return {
             "status": "ok",
             "server_version": __version__,
@@ -154,10 +145,7 @@ def create_app(conf: DictConfig) -> FastAPI:
             ),
         }
 
-    @app.post(
-        f"{MonitorServer.API_PREFIX}/prometheus/targets",
-        dependencies=[Depends(require_context_sdk)],
-    )
+    @app.post(f"{MonitorServer.API_PREFIX}/prometheus/targets")
     def register_prometheus_targets(
         payload: dict[str, Any] = Body(...),
     ) -> dict[str, Any]:

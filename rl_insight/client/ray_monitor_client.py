@@ -29,10 +29,11 @@ from ..collector.ray_monitor_hub import MonitorHubActor
 from ..server.http_api import get_server_services
 from ..utils.constants import MonitorEnv, MonitorRayActor, MonitorServer
 from ..utils.protocol import (
-    CONTEXT_REQUIRED_VERSION,
+    MIN_SUPPORTED_VERSION,
+    InvalidVersionError,
     RunContext,
     RunError,
-    require_context_version,
+    require_version,
 )
 from .base import MonitorClient
 
@@ -65,28 +66,38 @@ def current_job_context() -> RunContext | None:
         return None
 
 
-def _read_hub_context(hub: Any, *, timeout: float) -> RunContext:
-    if not hasattr(hub, "get_context"):
-        require_context_version(None, "Ray Hub (missing get_context)")
+def _read_hub_context(
+    hub: Any, *, timeout: float, initialize: bool = True
+) -> RunContext:
+    if initialize and not hasattr(hub, "connect"):
+        require_version(None, "Ray Hub (initialization API unavailable)")
     try:
-        context = ray.get(hub.get_context.remote(), timeout=timeout)
+        reference = (
+            hub.connect.remote(__version__) if initialize else hub.get_context.remote()
+        )
+        context = ray.get(reference, timeout=timeout)
     except ray.exceptions.ActorUnavailableError:
         # Preserve the caller's retry path for temporary unavailability.
         raise
     except (ray.exceptions.RayActorError, ray.exceptions.RayTaskError) as exc:
+        if isinstance(exc, ray.exceptions.RayTaskError) and isinstance(
+            exc.cause, InvalidVersionError
+        ):
+            raise exc.cause from exc
         if "No module named 'rl_insight.utils.protocol'" in str(exc):
-            require_context_version(None, "Ray worker SDK (missing Context module)")
+            require_version(None, "Ray worker SDK (version protocol unavailable)")
         message = (
-            "Failed to read RL-Insight Context from Ray Hub. "
-            f"The SDK on the driver, Hub and all workers must be >= {CONTEXT_REQUIRED_VERSION}. "
+            "Failed to communicate with the RL-Insight Ray Hub. "
+            f"The SDK on the driver, Hub and all workers must be >= {MIN_SUPPORTED_VERSION}. "
             "Upgrade older SDKs and restart the training job. "
             "See the chained Ray error for the underlying cause."
         )
         logger.error(message)
         raise RunError(message, 502) from exc
     if not isinstance(context, RunContext):
-        require_context_version(None, "Ray Hub (invalid Context)")
-    require_context_version(getattr(context, "version", None), "Ray Hub")
+        raise RunError("Ray Hub returned an invalid Context", 502)
+    if initialize:
+        require_version(getattr(context, "version", None), "Ray Hub")
     return context
 
 
@@ -206,7 +217,9 @@ class MonitorRayClient(MonitorClient):
             + 30
         )
         try:
-            context = _read_hub_context(self._actor, timeout=timeout)
+            context = _read_hub_context(
+                self._actor, timeout=timeout, initialize=not self._context_checked
+            )
         except RunError as exc:
             self._compatibility_error = exc
             raise
@@ -222,7 +235,6 @@ class MonitorRayClient(MonitorClient):
         Note:
             Errors on the hub side are not surfaced here. Ordering follows Ray actor scheduling.
         """
-        event = {**event, "client_version": __version__}
         with self._lock:
             if self._compatibility_error is not None:
                 raise self._compatibility_error

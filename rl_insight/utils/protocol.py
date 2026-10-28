@@ -29,9 +29,9 @@ from .. import __version__
 
 logger = logging.getLogger(__name__)
 
-# This feature's minimum stays fixed when the package version increases.
-CONTEXT_REQUIRED_VERSION = Version("0.4.0")
-CONTEXT_SDK_VERSION_HEADER = "X-RL-Insight-Client-Version"
+# This global minimum stays fixed when the package version increases.
+MIN_SUPPORTED_VERSION = Version("0.4.0")
+SDK_VERSION_HEADER = "X-RL-Insight-Client-Version"
 
 
 class RunError(ValueError):
@@ -41,21 +41,19 @@ class RunError(ValueError):
 
 
 class InvalidVersionError(RunError):
-    """The peer does not meet the Context version requirement."""
+    """The peer does not provide a supported RL-Insight version."""
 
 
-def require_context_version(value: Any, component: str) -> None:
+def require_version(value: Any, component: str) -> None:
     try:
-        supported = (
-            isinstance(value, str) and Version(value) >= CONTEXT_REQUIRED_VERSION
-        )
+        supported = isinstance(value, str) and Version(value) >= MIN_SUPPORTED_VERSION
     except InvalidVersion:
         supported = False
     if not supported:
         message = (
-            f"RL-Insight Context requires {component} >= {CONTEXT_REQUIRED_VERSION}; "
+            f"RL-Insight requires {component} >= {MIN_SUPPORTED_VERSION}; "
             f"received version {value!r}. Upgrade the RL-Insight server and SDK on "
-            f"the driver and all workers to >= {CONTEXT_REQUIRED_VERSION}, "
+            f"the driver and all workers to >= {MIN_SUPPORTED_VERSION}, "
             "then restart the training job."
         )
         logger.error(message)

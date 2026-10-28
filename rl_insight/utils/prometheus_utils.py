@@ -42,7 +42,7 @@ from .constants import (
     prometheus_targets_file_from_config,
 )
 from .protocol import (
-    CONTEXT_SDK_VERSION_HEADER,
+    SDK_VERSION_HEADER,
     InvalidVersionError,
     RunContext,
     RunError,
@@ -596,7 +596,7 @@ def _register_targets(
         response = requests.post(
             url,
             json=payload,
-            headers={CONTEXT_SDK_VERSION_HEADER: __version__},
+            headers={SDK_VERSION_HEADER: __version__},
             timeout=10,
         )
         if 400 <= response.status_code < 500 and response.status_code not in {408, 429}:

@@ -33,7 +33,7 @@ from ..utils import (
     update_prometheus_config,
 )
 from ..utils.constants import MonitorRayActor
-from ..utils.protocol import RunContext, require_context_version
+from ..utils.protocol import RunContext, require_version
 from .base import MonitorCollector
 
 logger = logging.getLogger(__name__)
@@ -109,13 +109,17 @@ class MonitorHubActor(MonitorCollector):
             self._metrics_port,
         )
 
+    def connect(self, client_version: str | None = None) -> RunContext:
+        """Verify the connecting SDK once before it submits monitor events."""
+        require_version(client_version, "Client")
+        return self.get_context()
+
     def apply_event(self, event: dict[str, Any]) -> None:
         """Dispatch one event by ``kind``: counter/gauge/histogram update Prometheus registry, trace exports OTLP.
 
         Args:
             event: Must include ``kind``; metric kinds need ``name``/``value``; trace needs ``start_time_ns``/``end_time_ns``.
         """
-        require_context_version(event.get("client_version"), "SDK")
         self._events_applied += 1
         context = getattr(self, "_context", None)
         if context:

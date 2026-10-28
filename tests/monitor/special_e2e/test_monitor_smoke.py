@@ -34,7 +34,7 @@ from rl_insight import agent_loop_session, trace_span
 from rl_insight.agent_loop import agent_loop_lane_id
 from rl_insight.client.ray_monitor_client import _current_job_actor_name
 from rl_insight.utils.constants import MonitorRayActor
-from rl_insight.utils.protocol import CONTEXT_SDK_VERSION_HEADER
+from rl_insight.utils.protocol import SDK_VERSION_HEADER
 
 pytestmark = pytest.mark.skipif(
     sys.platform not in {"linux", "win32"},
@@ -88,7 +88,7 @@ def monitor_stack() -> Generator[dict[str, str], None, None]:
     os.environ["RL_INSIGHT_SERVER_URL"] = SERVER_URL
     services = _wait_for_json(
         f"{SERVER_URL}/api/v1/services",
-        headers={CONTEXT_SDK_VERSION_HEADER: insight.__version__},
+        headers={SDK_VERSION_HEADER: insight.__version__},
         ready=lambda data: data.get("status") == "ok",
     )
     endpoints = {

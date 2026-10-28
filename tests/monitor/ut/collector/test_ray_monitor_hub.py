@@ -23,7 +23,6 @@ from unittest.mock import MagicMock, call
 import pytest
 from omegaconf import OmegaConf
 
-from rl_insight import __version__
 from rl_insight.collector import ray_monitor_hub as hub_module
 from rl_insight.utils.constants import MonitorEventKind, MonitorRayActor
 from rl_insight.utils.protocol import RunContext
@@ -121,7 +120,7 @@ def test_apply_event_should_dispatch_metric_when_kind_is_supported(
     method: str,
     expected_call: Any,
 ) -> None:
-    hub.apply_event({**event, "client_version": __version__})
+    hub.apply_event(event)
 
     assert hub._events_applied == 1
     assert getattr(hub._registry, method).call_args == expected_call
@@ -139,7 +138,7 @@ def test_apply_event_should_export_trace_when_trace_collection_is_enabled(
         "attributes": {"step": 3, "experiment_name": "same"},
     }
 
-    hub.apply_event({**event, "client_version": __version__})
+    hub.apply_event(event)
 
     hub._trace_collector.record_span.assert_called_once_with(
         "rollout",
@@ -161,7 +160,7 @@ def test_apply_event_should_raise_value_error_when_event_is_invalid(
     hub: Any, event: dict[str, object], message: str
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        hub.apply_event({**event, "client_version": __version__})
+        hub.apply_event(event)
 
 
 def test_get_context_should_describe_identity_and_live_status(hub: Any) -> None:

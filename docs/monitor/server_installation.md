@@ -8,9 +8,7 @@ RL-Insight Monitor needs three services before online monitoring can run:
 | Tempo      | stores and queries RL state traces  | `>= 2.0.0`     | `2.6.1`         |
 | Grafana    | shows dashboards and trace views    | `>= 13.0.0`    | `13.0.0`        |
 
-The Context feature requires RL-Insight server, Hub, and driver/worker SDK versions >= 0.4.0. This minimum stays fixed when the package is upgraded; component versions do not need to match exactly. Upgrade the server and SDK on every training node, then restart the training job. The SDK checks Server and Hub support during initialization or when an early worker first attaches. Missing/invalid versions and missing Context interfaces produce an upgrade error; incompatible calls do not fall back to the old protocol.
-
-SDK HTTP requests carry `X-RL-Insight-Client-Version`; Ray events carry a top-level `client_version`. The services and target-registration APIs return HTTP 409 for unsupported clients, and the Hub rejects unsupported events before processing them. The receiving side also logs the upgrade instructions because older SDKs may swallow HTTP failures or submit Ray events without reading the result; their training process may continue despite rejected monitoring data. Health checks do not require SDK version metadata. Transient connection failures retain their retry behavior.
+The SDK checks Server and Hub compatibility during initialization. Server, Hub and SDK versions must be at least 0.4.0; this minimum stays fixed when the package version increases. A failed check raises `InvalidVersionError` with upgrade instructions. Restart the training job after upgrading affected components.
 
 Choose one of the three approaches below depending on your network environment. To run the same stack in a container instead of installing services on the host, see the **Run with Docker** section below.
 

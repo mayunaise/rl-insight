@@ -122,6 +122,5 @@ def test_apply_event_should_submit_without_waiting_when_hub_is_verified(
 
     client.apply_event(event)
 
-    actor.apply_event.remote.assert_called_once_with(
-        {**event, "client_version": __version__}
-    )
+    actor.connect.remote.assert_called_once_with(__version__)
+    actor.apply_event.remote.assert_called_once_with(event)

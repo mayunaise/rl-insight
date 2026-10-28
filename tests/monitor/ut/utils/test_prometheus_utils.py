@@ -27,7 +27,7 @@ from prometheus_client import CollectorRegistry, Gauge, make_wsgi_app
 
 from rl_insight import __version__
 from rl_insight.utils import prometheus_utils as prometheus_module
-from rl_insight.utils.protocol import CONTEXT_SDK_VERSION_HEADER, RunContext
+from rl_insight.utils.protocol import SDK_VERSION_HEADER, RunContext
 
 
 def _register_target_in_process(
@@ -233,7 +233,7 @@ def test_update_prometheus_config_should_send_normalized_targets_when_server_is_
                 },
             ],
         },
-        headers={CONTEXT_SDK_VERSION_HEADER: __version__},
+        headers={SDK_VERSION_HEADER: __version__},
         timeout=10,
     )
     response.raise_for_status.assert_called_once_with()
