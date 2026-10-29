@@ -103,7 +103,6 @@ class LocalServiceRuntime:
         dependencies: DependencyManager | None = None,
     ):
         self.conf = conf
-        self._fixed_metrics_port = OmegaConf.select(conf, "server.metrics_port")
         self.install_root = install_root.resolve()
         self.dependencies = dependencies or DependencyManager(conf, self.install_root)
         self.state_file = _state_file_from_config(self.conf)
@@ -161,11 +160,6 @@ class LocalServiceRuntime:
     def _assign_ports(self) -> None:
         """Plan distinct ports, reserving them together until allocation finishes."""
         ports = {key: service for service, (key, _) in _HEALTH_ENDPOINTS.items()}
-        metrics_port = OmegaConf.select(self.conf, "server.metrics_port")
-        if metrics_port is not None and (
-            metrics_port == 0 or metrics_port != self.conf.server.port
-        ):
-            ports = {"server.metrics_port": "rl-insight-server", **ports}
         ports["otel.otel_port"] = "tempo"
         if OmegaConf.select(self.conf, "tempo.enable", default=True):
             tempo = yaml.safe_load(
@@ -210,14 +204,6 @@ class LocalServiceRuntime:
                             if exc.errno not in (errno.EADDRINUSE, errno.EACCES):
                                 raise RuntimeError(
                                     f"Cannot allocate {key}: {exc}"
-                                ) from exc
-                            if self._fixed_metrics_port and (
-                                key == "server.metrics_port"
-                                or key == "server.port"
-                                and port == self._fixed_metrics_port
-                            ):
-                                raise RuntimeError(
-                                    f"Configured metrics port {self._fixed_metrics_port} is unavailable"
                                 ) from exc
                             port = 0
                             continue
@@ -562,12 +548,16 @@ def _render_prometheus_config(conf: DictConfig, runtime_dir: Path) -> Path:
                 "prometheus.remote_write must be a list of destinations with url"
             )
     if prometheus_agent_enabled(conf):
-        if not _server_enabled(conf) or any(
-            service_enabled(conf, name) for name in ("tempo", "grafana")
+        endpoint = str(OmegaConf.select(conf, "prometheus.metrics_endpoint") or "")
+        from urllib.parse import urlsplit
+
+        metrics_target = urlsplit(endpoint)
+        if (
+            metrics_target.scheme != "http"
+            or not metrics_target.hostname
+            or not metrics_target.port
         ):
-            raise ValueError(
-                "Task forwarding requires the collector and disabled Tempo/Grafana"
-            )
+            raise ValueError("Prometheus Agent requires a bound metrics endpoint")
         data = {
             "global": {
                 "scrape_interval": OmegaConf.select(
@@ -588,16 +578,7 @@ def _render_prometheus_config(conf: DictConfig, runtime_dir: Path) -> Path:
                     "job_name": "rl-insight-task",
                     "honor_labels": True,
                     "metrics_path": "/metrics",
-                    "static_configs": [
-                        {
-                            "targets": [
-                                format_host_port(
-                                    _loopback_host(),
-                                    conf.server.get("metrics_port", conf.server.port),
-                                )
-                            ]
-                        }
-                    ],
+                    "static_configs": [{"targets": [metrics_target.netloc]}],
                 }
             ],
             "remote_write": remote_write,

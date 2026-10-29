@@ -20,11 +20,15 @@ import logging
 import hashlib
 import json
 import os
+from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, Mapping
-from urllib.parse import urlsplit
+from typing import Any, Mapping, Optional
 
 from omegaconf import DictConfig, OmegaConf
+from omegaconf.errors import OmegaConfBaseException
+
+from ..server.catalog import SERVICE_NAMES
+from ..server.network import normalize_http_url
 
 from .constants import MonitorBackend, MonitorDefaults, MonitorEnv, MonitorPaths
 from .protocol import metric_labels
@@ -43,6 +47,50 @@ _TRAINING_MONITOR_DEFAULTS = OmegaConf.create(
         },
     }
 )
+
+
+@dataclass
+class _TaskServer:
+    port: Optional[int] = None
+    namespace: str = MonitorDefaults.NAMESPACE
+    url: str = ""
+    endpoint_ttl: float = 45.0
+
+
+@dataclass
+class _TaskMetrics:
+    pull: bool = False
+    port: Optional[int] = None
+    remote_write: list[dict[str, Any]] = field(default_factory=list)
+    scrape_interval: str = "10s"
+    scrape_timeout: str = "10s"
+    binary_path: str = ""
+    data_dir: Optional[str] = None
+
+
+@dataclass
+class _TaskTraces:
+    endpoint: str = ""
+    headers: dict[str, Any] = field(default_factory=dict)
+    service_name: str = ""
+
+
+@dataclass
+class _TaskConfig:
+    enabled: bool = True
+    server: _TaskServer = field(default_factory=_TaskServer)
+    labels: dict[str, Any] = field(default_factory=dict)
+    metrics: _TaskMetrics = field(default_factory=_TaskMetrics)
+    traces: _TaskTraces = field(default_factory=_TaskTraces)
+    sinks: list[dict[str, Any]] = field(default_factory=list)
+
+
+_TASK_SCHEMA = OmegaConf.structured(_TaskConfig)
+# server/labels also belong to legacy runtime configs; only other public fields
+# distinguish a bare task config. Keep this compatibility rule in one place.
+_TASK_SELECTORS = _TASK_SCHEMA.keys() - {"server", "labels"}
+
+
 __all__ = [
     "load_monitor_config",
     "load_server_config_file",
@@ -102,47 +150,9 @@ def load_monitor_config(
     Returns:
         Fully merged config with environment variable overrides applied.
     """
-    if config is not None:
-        source = config if OmegaConf.is_config(config) else OmegaConf.create(config)
-        node = source.get("rl_insight", source)
-        if isinstance(node, DictConfig) and (
-            "rl_insight" in source
-            or any(key in node for key in ("enabled", "metrics", "traces", "sinks"))
-        ):
-            if os.environ.get(MonitorEnv.CONFIG_PATH):
-                raise ValueError(
-                    "Training configuration conflicts with RL_INSIGHT_CONFIG"
-                )
-            expanded = expand_task_config(
-                {"rl_insight": node}, runtime_dir=MonitorPaths.STATE_ROOT / "tasks"
-            )
-            if expanded is None:
-                return OmegaConf.merge(_copy_defaults(), {"enabled": False})
-            inherited_url = (
-                os.environ.get(MonitorEnv.SERVER_URL, "").strip().rstrip("/")
-            )
-            if inherited_url and inherited_url != str(expanded.server.url).rstrip("/"):
-                raise ValueError(
-                    "Server URL environment conflicts with training configuration"
-                )
-            if os.environ.get(MonitorEnv.SERVER_BACKEND):
-                raise ValueError("Training configuration selects its own outputs")
-            return OmegaConf.merge(
-                _copy_defaults(),
-                {
-                    "task_options": OmegaConf.to_container(node, resolve=True),
-                    "task_signature": hashlib.sha256(
-                        json.dumps(
-                            OmegaConf.to_container(node, resolve=True), sort_keys=True
-                        ).encode()
-                    ).hexdigest(),
-                    "labels": expanded.labels,
-                    "retain_services": any(
-                        expanded[name].enable
-                        for name in ("prometheus", "tempo", "grafana")
-                    ),
-                },
-            )
+    node = _task_node(config)
+    if node is not None:
+        return _load_task_config(node)
     merged = _merge_external_config(_copy_defaults())
 
     if config is not None:
@@ -188,24 +198,70 @@ def load_server_config_file(config_path: str | Path | None = None) -> DictConfig
     return conf
 
 
-def _http_url(value: Any, field: str) -> str:
+def _task_node(config) -> DictConfig | None:
+    """Select the public subtree without resolving unrelated framework fields."""
+    if config is None:
+        return None
+    source = config if OmegaConf.is_config(config) else OmegaConf.create(config)
+    if "rl_insight" in source:
+        node = source.rl_insight
+        if not isinstance(node, DictConfig):
+            raise ValueError("rl_insight must be an object")
+        return node
+    return source if _TASK_SELECTORS.intersection(source.keys()) else None
+
+
+def _provided_options(conf, supplied):
+    """Normalize declared fields, preserving omitted options and opaque driver maps."""
+    if is_dataclass(OmegaConf.get_type(conf)):
+        return {
+            key: _provided_options(conf[key], value) for key, value in supplied.items()
+        }
+    return (
+        OmegaConf.to_container(conf, resolve=True)
+        if OmegaConf.is_config(conf)
+        else conf
+    )
+
+
+def _task_options(node: DictConfig) -> dict[str, Any] | None:
+    if node.get("enabled", True) is False:
+        return None
     try:
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError
-        parsed = urlsplit(value.strip())
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
-            or parsed.username
-            or parsed.password
-            or parsed.fragment
-            or any(c.isspace() for c in value)
-            or (parsed.port is not None and not 1 <= parsed.port <= 65535)
-        ):
-            raise ValueError
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field} requires a valid HTTP(S) URL") from exc
-    return value.strip().rstrip("/")
+        supplied = OmegaConf.to_container(node, resolve=True, throw_on_missing=True)
+        validated = OmegaConf.merge(_TASK_SCHEMA, supplied)
+        if not validated.enabled:
+            return None
+        return _provided_options(validated, supplied)
+    except OmegaConfBaseException as exc:
+        raise ValueError(f"Invalid rl_insight configuration: {exc}") from exc
+
+
+def _load_task_config(node: DictConfig) -> DictConfig:
+    if os.environ.get(MonitorEnv.CONFIG_PATH):
+        raise ValueError("Training configuration conflicts with RL_INSIGHT_CONFIG")
+    options = _task_options(node)
+    if options is None:
+        return OmegaConf.merge(_copy_defaults(), {"enabled": False})
+    expanded = _expand_task_options(
+        options, runtime_dir=MonitorPaths.STATE_ROOT / "tasks"
+    )
+    inherited_url = os.environ.get(MonitorEnv.SERVER_URL, "").strip().rstrip("/")
+    if inherited_url and inherited_url != str(expanded.server.url).rstrip("/"):
+        raise ValueError("Server URL environment conflicts with training configuration")
+    if os.environ.get(MonitorEnv.SERVER_BACKEND):
+        raise ValueError("Training configuration selects its own outputs")
+    return OmegaConf.merge(
+        _copy_defaults(),
+        {
+            "task_options": options,
+            "task_signature": hashlib.sha256(
+                json.dumps(options, sort_keys=True).encode()
+            ).hexdigest(),
+            "labels": expanded.labels,
+            "retain_services": any(expanded[name].enable for name in SERVICE_NAMES),
+        },
+    )
 
 
 def expand_task_config(
@@ -213,68 +269,51 @@ def expand_task_config(
     *,
     runtime_dir: str | Path,
 ) -> DictConfig | None:
-    """Expand only a task's ``rl_insight`` subtree into existing service/SDK config.
-
-    The caller supplies a composed task configuration and deployment context.
-    This function does not launch services or evaluate unrelated framework keys.
-    """
+    """Project public monitoring options onto the existing service template."""
     source = config if OmegaConf.is_config(config) else OmegaConf.create(config)
     node = OmegaConf.select(source, "rl_insight")
     if node is None:
         return None
     if not isinstance(node, DictConfig):
         raise ValueError("rl_insight must be an object")
-    enabled = node.get("enabled", True)
-    if not isinstance(enabled, bool):
-        raise ValueError("rl_insight.enabled must be boolean")
-    if not enabled:
-        return None
-    try:
-        options = OmegaConf.to_container(node, resolve=True, throw_on_missing=True)
-    except Exception as exc:
-        raise ValueError(
-            "Cannot resolve rl_insight configuration; check required environment variables"
-        ) from exc
-    if not isinstance(options, dict):
-        raise ValueError("rl_insight must be an object")
-    if set(options) - {"enabled", "metrics", "traces", "sinks", "labels", "server"}:
-        raise ValueError("Unknown rl_insight configuration field")
-    for key in ("metrics", "traces", "labels", "server"):
-        if key in options and not isinstance(options[key], dict):
-            raise ValueError(f"rl_insight.{key} must be an object")
-    labels = metric_labels(options.get("labels", {}))
-    settings = options.get("server", {})
-    if set(settings) - {"port", "namespace", "endpoint_ttl", "url"}:
-        raise ValueError(
-            "rl_insight.server accepts port, namespace, endpoint_ttl and url only"
-        )
+    options = _task_options(node)
+    return (
+        _expand_task_options(options, runtime_dir=runtime_dir)
+        if options is not None
+        else None
+    )
+
+
+def _expand_task_options(
+    options: dict[str, Any], *, runtime_dir: str | Path
+) -> DictConfig:
+    defaults = OmegaConf.to_container(_TASK_SCHEMA.server)
+    settings = {
+        **{key: value for key, value in defaults.items() if value is not None},
+        **options.get("server", {}),
+    }
     root = Path(runtime_dir).expanduser().resolve()
-    conf = load_server_config_file()
     conf = OmegaConf.merge(
-        conf,
+        load_server_config_file(),
         {
             "server": {
-                "namespace": MonitorDefaults.NAMESPACE,
+                **settings,
                 "runtime_dir": str(root / "services"),
                 "state_file": str(root / "state.json"),
                 "data_dir": str(root / "data"),
                 "log_dir": str(root / "logs"),
-                "endpoint_ttl": 45,
-                **settings,
-            }
+            },
         },
     )
     if type(conf.server.port) is not int or not 0 <= conf.server.port <= 65535:
         raise ValueError("server.port must be an integer from 0 to 65535")
-    if (
-        not isinstance(conf.server.endpoint_ttl, (int, float))
-        or not 1 <= conf.server.endpoint_ttl <= 3600
-    ):
+    if not 1 <= conf.server.endpoint_ttl <= 3600:
         raise ValueError("server.endpoint_ttl must be between 1 and 3600 seconds")
-    selected_url = settings.get("url")
-    conf.server.url = _http_url(selected_url, "server_url") if selected_url else ""
-    conf.labels = labels
-    if any(key in options for key in ("metrics", "traces", "sinks")):
+    conf.server.url = (
+        normalize_http_url(settings["url"], "server.url") if settings["url"] else ""
+    )
+    conf.labels = metric_labels(options.get("labels", {}))
+    if options.keys() & (_TASK_SELECTORS - {"enabled"}):
         from ..client.push.client import configure_outputs
 
         return configure_outputs(conf, options)

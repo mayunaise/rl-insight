@@ -18,9 +18,45 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any
 from urllib.parse import urlparse
+
+
+def normalize_http_url(value: Any, field: str) -> str:
+    """Validate an HTTP endpoint before constructing clients or starting services."""
+    try:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError
+        parsed = urlparse(value.strip())
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.fragment
+            or any(c.isspace() for c in value)
+            or (parsed.port is not None and not 1 <= parsed.port <= 65535)
+        ):
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} requires a valid HTTP(S) URL") from exc
+    return value.strip().rstrip("/")
+
+
+def normalize_http_headers(value: Any, field: str) -> dict[str, str]:
+    """Normalize scalar header values, rejecting embedded HTTP line breaks."""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or any(
+        not isinstance(key, str)
+        or not isinstance(item, (str, int, float, bool))
+        or any(c in key + str(item) for c in "\r\n")
+        for key, item in value.items()
+    ):
+        raise ValueError(f"{field} must contain scalar HTTP header values")
+    return {key: str(item) for key, item in value.items()}
 
 
 @lru_cache(maxsize=1)

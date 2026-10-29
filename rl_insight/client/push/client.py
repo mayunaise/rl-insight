@@ -22,13 +22,14 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from ...utils.constants import MonitorEventKind
-from ...utils.monitor_config_loader import _http_url
+from ...server.catalog import SERVICE_NAMES
+from ...server.network import normalize_http_headers, normalize_http_url
 from ...utils.protocol import metric_labels
 from ..base import MonitorClient
-from .driver import build_sink
+from .driver import build_sink, parse_sink_driver
 from .poller import PrometheusPoller, set_active_registry
 from .sinks.base import PushSink
 from .tags import collect_sink_tags
@@ -106,6 +107,17 @@ class PushMonitorClient(MonitorClient):
             self._route_trace(event)
         else:
             self._route_metric(kind, event)
+
+    @property
+    def metrics_endpoint(self) -> str:
+        return next(
+            (
+                b.sink.metrics_endpoint
+                for b in self._bound
+                if hasattr(b.sink, "metrics_endpoint")
+            ),
+            "",
+        )
 
     def register_metrics(self, addresses, job, labels) -> bool:
         from .poller import get_active_registry
@@ -223,7 +235,16 @@ def _streams(sink_conf: Any) -> frozenset[str]:
     raw = OmegaConf.select(sink_conf, "streams")
     if raw is None:
         return frozenset(DEFAULT_STREAMS)
-    return frozenset(str(item) for item in raw)
+    if not isinstance(raw, (list, tuple, ListConfig)):
+        raise ValueError("Sink streams must be a list")
+    streams = frozenset(str(item) for item in raw)
+    if (
+        not streams
+        or len(streams) != len(raw)
+        or not streams <= {STREAM_METRIC, STREAM_TRACE, STREAM_ROLLOUT}
+    ):
+        raise ValueError("Invalid sink streams")
+    return streams
 
 
 def _select_or(conf: Any, key: str, default: str) -> str:
@@ -408,32 +429,25 @@ _OTLP_SINK = "rl_insight.client.push.sinks.otlp:create_sink"
 
 
 def _task_sinks(raw: Any, labels: dict[str, str]) -> list[dict[str, Any]]:
-    """Validate routing/identity; leave driver-specific options to its factory."""
+    """Normalize only shared routing and identity; leave driver options opaque."""
     if not isinstance(raw, list) or not raw:
         raise ValueError("sinks requires a non-empty list")
     names, configurations = set(), set()
-    destinations: dict[tuple[str, str], set[str]] = {}
     for sink in raw:
         if not isinstance(sink, dict):
             raise ValueError("Each sink must be an object")
-        driver = sink.get("driver")
-        if (
-            not isinstance(driver, str)
-            or ":" not in driver
-            or any(not part.strip() for part in driver.split(":", 1))
+        module, factory = parse_sink_driver(sink.get("driver"))
+        sink["driver"] = f"{module}:{factory}"
+        sink["streams"] = sorted(_streams(OmegaConf.create(sink)))
+        supplied = metric_labels(sink.get("labels", {}))
+        if any(
+            key in supplied and supplied[key] != value for key, value in labels.items()
         ):
-            raise ValueError("Sink driver requires package.module:factory")
-        name = sink.get("name", driver)
-        streams = sink.get("streams", ["metric", "trace"])
-        if (
-            not isinstance(streams, list)
-            or not streams
-            or any(item not in ("metric", "trace", "rollout") for item in streams)
-            or len(set(streams)) != len(streams)
-        ):
-            raise ValueError("Sink streams must contain metric, trace or rollout")
+            raise ValueError("Sink labels conflict with task identity")
+        sink["labels"] = {**supplied, **labels}
+        name = sink.get("name", sink["driver"])
         fingerprint = json.dumps(
-            {k: v for k, v in sink.items() if k != "name"}, sort_keys=True
+            {key: value for key, value in sink.items() if key != "name"}, sort_keys=True
         )
         if (
             not isinstance(name, str)
@@ -444,24 +458,6 @@ def _task_sinks(raw: Any, labels: dict[str, str]) -> list[dict[str, Any]]:
             raise ValueError("Duplicate sink configuration or name")
         names.add(name)
         configurations.add(fingerprint)
-        if driver in (_PROMETHEUS_SINK, _OTLP_SINK):
-            destination = ""
-            if driver == _OTLP_SINK:
-                destination = _http_url(sink.get("endpoint"), "sinks.endpoint")
-                sink["endpoint"] = destination
-            key = (driver, destination)
-            previous = destinations.setdefault(key, set())
-            if previous and (
-                driver == _PROMETHEUS_SINK or previous.intersection(streams)
-            ):
-                raise ValueError("Duplicate sink output destination")
-            previous.update(streams)
-        supplied = metric_labels(sink.get("labels", {}))
-        if any(
-            key in supplied and supplied[key] != value for key, value in labels.items()
-        ):
-            raise ValueError("Sink labels conflict with task identity")
-        sink["labels"] = {**supplied, **labels}
     return raw
 
 
@@ -474,30 +470,20 @@ def configure_outputs(conf: DictConfig, options: dict[str, Any]) -> DictConfig:
     sinks = _task_sinks(options["sinks"], labels) if advanced else []
     metrics = options.get("metrics", {})
     traces = options.get("traces", {})
-    if set(metrics) - {
-        "pull",
-        "port",
-        "remote_write",
-        "scrape_interval",
-        "scrape_timeout",
-        "binary_path",
-        "data_dir",
-    }:
-        raise ValueError("Unknown rl_insight.metrics field")
-    if set(traces) - {"endpoint", "headers", "service_name"}:
-        raise ValueError("Unknown rl_insight.traces field")
     pull = metrics.get("pull", False)
-    if not isinstance(pull, bool):
-        raise ValueError("rl_insight.metrics.pull must be boolean")
     destinations = metrics.get("remote_write", [])
     if "remote_write" in metrics and (
         not isinstance(destinations, list) or not destinations
     ):
         raise ValueError("remote_write requires a non-empty destination list")
     for destination in destinations:
-        if not isinstance(destination, dict):
-            raise ValueError("remote_write destinations must be objects")
-        _http_url(destination.get("url"), "metrics.remote_write.url")
+        destination["url"] = normalize_http_url(
+            destination.get("url"), "metrics.remote_write.url"
+        )
+        if "headers" in destination:
+            destination["headers"] = normalize_http_headers(
+                destination["headers"], "metrics.remote_write.headers"
+            )
     if pull and destinations:
         raise ValueError("Choose metrics.pull or metrics.remote_write")
     has_metrics = (
@@ -508,48 +494,51 @@ def configure_outputs(conf: DictConfig, options: dict[str, Any]) -> DictConfig:
     if "metrics" in options and not has_metrics:
         raise ValueError("metrics requires pull=true or remote_write destinations")
     if "traces" in options:
-        traces["endpoint"] = _http_url(traces.get("endpoint"), "traces.endpoint")
-        headers = traces.get("headers", {})
-        if not isinstance(headers, dict) or any(
-            not isinstance(k, str)
-            or not isinstance(v, (str, int, float, bool))
-            or any(c in k + str(v) for c in "\r\n")
-            for k, v in headers.items()
-        ):
-            raise ValueError("traces.headers must contain scalar HTTP header values")
+        traces["endpoint"] = normalize_http_url(
+            traces.get("endpoint"), "traces.endpoint"
+        )
+        traces["headers"] = normalize_http_headers(
+            traces.get("headers"), "traces.headers"
+        )
+    if has_metrics:
+        conf.server.metrics_port = conf.server.get("metrics_port", conf.server.port)
     if "port" in metrics:
         if type(metrics["port"]) is not int or not 0 <= metrics["port"] <= 65535:
             raise ValueError("metrics.port must be an integer from 0 to 65535")
         conf.server.metrics_port = metrics["port"]
-    external = advanced or has_metrics or bool(traces)
-    conf.server.backend = "push" if external else "local"
-    conf.server.enable = has_metrics or not external
-    conf.labels = labels
-    if not external:
-        return conf
-    for name in ("prometheus", "tempo", "grafana"):
+    conf.server.backend = "push"
+    conf.server.enable = False
+    if conf.server.url:
+        raise ValueError(
+            "server.url connects bundled monitoring; external outputs use sink endpoints"
+        )
+    for name in SERVICE_NAMES:
         conf[name].enable = False
     conf.prometheus.prometheus_port = 0
-    for option in ("scrape_interval", "scrape_timeout", "binary_path", "data_dir"):
-        if option in metrics:
-            conf.prometheus[option] = metrics[option]
-    for sink in sinks:
-        if sink["driver"] == _PROMETHEUS_SINK:
-            if sink.get("server_url", conf.server.url) != conf.server.url:
-                raise ValueError("Prometheus sink server_url conflicts with server.url")
-            sink["server_url"] = "${server.url}"
-            sink.setdefault("advertise_host", "${oc.env:POD_IP,null}")
+    # Public control fields are consumed above; other declared metric options
+    # already use the existing Prometheus service config names.
+    conf.prometheus = OmegaConf.merge(
+        conf.prometheus,
+        {
+            key: value
+            for key, value in metrics.items()
+            if key not in {"pull", "port", "remote_write"}
+        },
+    )
     if has_metrics and not advanced:
         sinks.append(
             {
                 "name": "prometheus",
                 "driver": _PROMETHEUS_SINK,
                 "streams": ["metric"],
-                "server_url": "${server.url}",
-                "advertise_host": "${oc.env:POD_IP,null}",
                 "labels": labels,
             }
         )
+    for sink in sinks:
+        if sink["driver"] == _PROMETHEUS_SINK:
+            sink.setdefault("port", conf.server.metrics_port)
+            sink.setdefault("advertise_host", "${oc.env:POD_IP,null}")
+            sink.setdefault("drain_seconds", conf.server.endpoint_ttl)
     if destinations:
         conf.prometheus.remote_write = destinations
         conf.prometheus.external_labels = labels

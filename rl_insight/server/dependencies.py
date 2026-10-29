@@ -73,15 +73,6 @@ class MissingDependencyError(RuntimeError):
         self.missing = list(missing)
 
 
-def task_collector_enabled(conf: DictConfig) -> bool:
-    return OmegaConf.select(
-        conf, "server.backend", default="local"
-    ) == "push" and not any(
-        bool(OmegaConf.select(conf, f"{name}.enable", default=True))
-        for name in ("prometheus", "tempo", "grafana")
-    )
-
-
 def prometheus_agent_enabled(conf: DictConfig) -> bool:
     """A configured remote-write destination enables forwarding without a TSDB."""
     return not bool(OmegaConf.select(conf, "prometheus.enable", default=True)) and bool(

@@ -605,7 +605,7 @@ def _register_targets(
     *,
     identity_in_metrics: bool = False,
 ) -> bool:
-    """Register managed targets or publish task-only targets with a renewable TTL."""
+    """Register native targets through the active Hub or bundled server."""
     if context is None:
         from ..client.ray_monitor_client import register_job_metrics
 

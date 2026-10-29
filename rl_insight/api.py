@@ -205,12 +205,7 @@ def _client_initialized() -> bool:
 
 
 def finish() -> None:
-    """Clear in-process monitor state so further emits are no-ops.
-
-    Asks the active client to release resources (stop pollers, flush sinks)
-    when it supports ``close``. Does not stop the hub HTTP server or kill the
-    detached Ray actor.
-    """
+    """Close this client's owned resources and reset local monitoring state."""
     global _STATE
     client = _STATE.client
     if client is not None and hasattr(client, "close"):

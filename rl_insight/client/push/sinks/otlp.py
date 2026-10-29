@@ -32,6 +32,8 @@ from typing import Any, Mapping
 
 from omegaconf import OmegaConf
 
+from ....server.network import normalize_http_headers, normalize_http_url
+
 from .base import PushSink
 
 # OTLP attribute values: scalars or homogeneous sequences of scalars.
@@ -123,17 +125,11 @@ class OtlpSpanSink(PushSink):
 
 def create_sink(conf: Any) -> OtlpSpanSink:
     """Dotted-path factory; reads the OTLP endpoint from the sink config node."""
-    endpoint = str(OmegaConf.select(conf, "endpoint") or "").strip()
-    if not endpoint:
-        raise ValueError(
-            "OTLP span sink requires a full traces 'endpoint' "
-            "(e.g. http://collector:4318/v1/traces)"
-        )
+    endpoint = normalize_http_url(OmegaConf.select(conf, "endpoint"), "OTLP endpoint")
     service_name = str(OmegaConf.select(conf, "service_name") or _DEFAULT_SERVICE_NAME)
     strip_raw = OmegaConf.select(conf, "strip_name_prefix")
     strip_prefix = _DEFAULT_STRIP_PREFIX if strip_raw is None else str(strip_raw)
-    headers_conf = OmegaConf.select(conf, "headers")
-    headers = {str(k): str(v) for k, v in dict(headers_conf or {}).items()}
+    headers = normalize_http_headers(OmegaConf.select(conf, "headers"), "OTLP headers")
     return OtlpSpanSink(
         endpoint,
         service_name=service_name,

@@ -36,6 +36,18 @@ logger.setLevel(logging.WARNING)
 SinkFactory = Callable[[Any], "PushSink | None"]
 
 
+def parse_sink_driver(dotted_path: Any) -> tuple[str, str]:
+    """Validate the factory path without importing optional driver dependencies."""
+    if not isinstance(dotted_path, str):
+        raise ValueError("Sink driver requires 'package.module:factory'")
+    module, separator, name = dotted_path.partition(":")
+    if not separator or not module.strip() or not name.strip():
+        raise ValueError(
+            f"Invalid sink driver {dotted_path!r}; expected 'package.module:factory'"
+        )
+    return module.strip(), name.strip()
+
+
 def load_sink_factory(dotted_path: str) -> SinkFactory:
     """Resolve ``"pkg.module:attr"`` to a callable factory.
 
@@ -49,14 +61,10 @@ def load_sink_factory(dotted_path: str) -> SinkFactory:
         ValueError: Malformed path (missing module, colon, or attribute).
         ImportError: Module cannot be imported or attribute is missing.
     """
-    module_path, separator, attr_path = str(dotted_path).partition(":")
-    if not separator or not module_path.strip() or not attr_path.strip():
-        raise ValueError(
-            f"Invalid sink driver {dotted_path!r}; expected 'package.module:factory'"
-        )
-    module = importlib.import_module(module_path.strip())
+    module_path, attr_path = parse_sink_driver(dotted_path)
+    module = importlib.import_module(module_path)
     try:
-        factory = getattr(module, attr_path.strip())
+        factory = getattr(module, attr_path)
     except AttributeError as exc:
         raise ImportError(
             f"Sink driver module {module_path!r} has no attribute {attr_path!r}"

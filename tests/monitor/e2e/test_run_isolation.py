@@ -28,7 +28,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
-from uuid import uuid4
 
 import pytest
 import requests
@@ -314,15 +313,13 @@ finally:
 @pytest.mark.parametrize("runtime", ["ray", "direct", "ray-abrupt"])
 def test_sdk_starts_services_from_training_configuration(stack, tmp_path, runtime):
     """Training config covers SDK/native metrics, tenant traces and owned cleanup."""
-    script = r"""import sys, time
+    script = r"""import sys, time, socket
 import ray, requests
 import rl_insight as monitor
 from omegaconf import OmegaConf
 from prometheus_client import CollectorRegistry, Gauge, Histogram, start_http_server
 from prometheus_client.parser import text_string_to_metric_families
 from urllib.parse import urlsplit
-from rl_insight import __version__
-from rl_insight.utils.protocol import SDK_VERSION_HEADER
 
 config = OmegaConf.load(sys.argv[1])
 runtime = sys.argv[2]
@@ -341,9 +338,21 @@ if is_ray:
     early = EarlyWorker.remote()
     ray.get(early.start.remote())
 try:
+    if not is_ray:
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            conflicting = OmegaConf.create(OmegaConf.to_container(config.trainer.rl_insight, resolve=True))
+            conflicting.sinks[0].port = occupied.getsockname()[1]
+            conflicting.sinks[0].listen_host = "127.0.0.1"
+            try:
+                monitor.init(config=conflicting)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("occupied metrics port must fail even when Tempo starts")
     monitor.init(project="sdk-config", experiment_name="external", config=config.trainer.rl_insight)
     assert monitor.api._STATE.enabled and monitor.get_context() is None
-    url = monitor.api._STATE.conf.server.url
+    metrics_url = monitor.api._STATE.conf.server.metrics_endpoint
     def worker(rank="0"):
         if is_ray:
             monitor.init()
@@ -366,15 +375,9 @@ try:
         ray.get([run_worker.remote(str(rank)) for rank in range(2)])
     else:
         worker()
-    headers = {SDK_VERSION_HEADER: __version__}
-    assert requests.get(url+"/api/v1/services", headers={SDK_VERSION_HEADER:"0.3.0"}, timeout=3).status_code == 409
-    services = requests.get(url+"/api/v1/services", headers=headers, timeout=3).json()
-    port = services["metrics_port"]
-    expected = config.trainer.rl_insight.get("metrics", {}).get("port", urlsplit(url).port)
-    assert port == expected
-    metrics_url = f"http://{urlsplit(url).hostname}:{port}"
-    if port != urlsplit(url).port:
-        assert requests.get(metrics_url+"/api/v1/services", timeout=3).status_code == 404
+    port = urlsplit(metrics_url).port
+    expected = config.trainer.rl_insight.get("metrics", {}).get("port", config.trainer.rl_insight.server.port)
+    assert port == expected or expected == 0
     required = ["native_sdk_value", "rl_insight_monitor_config_requests_total"]
     if is_ray:
         required += ["native_before_init", "rl_insight_monitor_early_sdk_events_total"]
@@ -402,10 +405,10 @@ try:
     else:
         monitor.finish()
     deadline = time.monotonic()+20
-    for endpoint in {url, metrics_url}:
+    for endpoint in {metrics_url}:
         while True:
             try:
-                if not requests.get(endpoint+"/healthz", timeout=1).ok:
+                if not requests.get(endpoint+"/metrics", timeout=1).ok:
                     break
             except requests.RequestException:
                 break
@@ -470,73 +473,62 @@ finally:
         )
 
 
-def test_task_collector_publishers_recover_without_minting_an_identity():
-    """A restarted task proxy must rediscover live exporters through their leases."""
-    from urllib.parse import urlsplit
+def test_prometheus_sink_exposes_isolated_metrics_without_blocking_events():
+    """A slow native target must not block SDK updates or another task's registry."""
+    import asyncio
+    from fastapi.responses import Response
+    from rl_insight.client.push.sinks.prometheus import create_sink
 
-    from rl_insight.client.push.sinks.prometheus import PrometheusSink
-    from rl_insight.client.push.poller import set_active_registry
-    from rl_insight.utils.prometheus_utils import update_prometheus_config
-    from prometheus_client import CollectorRegistry, Gauge, start_http_server
+    entered = threading.Event()
+    slow = FastAPI()
 
-    conf = OmegaConf.create(
-        {
-            "prometheus": {"enable": False},
-            "tempo": {"enable": False},
-            "grafana": {"enable": False},
-            "server": {"backend": "push", "endpoint_ttl": 1},
-        }
-    )
-    service = serve(create_app(conf))
-    url = service.__enter__()
-    sink = None
-    native_registry = CollectorRegistry()
-    Gauge("native_recovered", "Recovery", registry=native_registry).set(9)
-    native, native_thread = start_http_server(
-        0, addr="127.0.0.1", registry=native_registry
-    )
-    try:
-        sink = PrometheusSink(url, listen_host="127.0.0.1", advertise_host="127.0.0.1")
-        set_active_registry(sink.target_registry)
-        sink.emit_store("worker_value", 7, {})
-        assert "worker_value" in requests.get(url + "/metrics", timeout=3).text
-        service.__exit__(None, None, None)
-        # Registration while the proxy is unavailable must not interrupt training.
-        update_prometheus_config([f"127.0.0.1:{native.server_port}"], job_name="native")
-        service = serve(create_app(conf), urlsplit(url).port)
-        assert service.__enter__() == url
-        deadline = time.monotonic() + 6
-        while True:
-            metrics = requests.get(url + "/metrics", timeout=3).text
-            if "worker_value" in metrics and "native_recovered" in metrics:
-                break
-            assert time.monotonic() < deadline
-            time.sleep(0.05)
-        assert "run_id=" not in requests.get(url + "/metrics", timeout=3).text
-        competing = requests.post(
-            url + "/api/v1/prometheus/targets",
-            json={
-                "publisher_id": uuid4().hex,
-                "targets": [{"target": f"127.0.0.1:{native.server_port}"}],
-            },
-            timeout=3,
-        )
-        assert competing.status_code == 409
-        sink.close()
-        sink = None
-        final = requests.get(url + "/metrics", timeout=3).text
-        assert "worker_value" in final and "native_recovered" in final
-        time.sleep(1.1)
-        expired = requests.get(url + "/metrics", timeout=3).text
-        assert "worker_value" not in expired and "native_recovered" not in expired
-    finally:
-        set_active_registry(None)
-        if sink is not None:
-            sink.close()
-        service.__exit__(None, None, None)
-        native.shutdown()
-        native.server_close()
-        native_thread.join(5)
+    @slow.get("/metrics")
+    async def metrics():
+        entered.set()
+        await asyncio.sleep(0.8)
+        return Response("native_slow 3\n")
+
+    with serve(slow) as native_url:
+        sinks = []
+        try:
+            for task in ["first", "second"]:
+                sink = create_sink(
+                    OmegaConf.create(
+                        {
+                            "port": 0,
+                            "listen_host": "127.0.0.1",
+                            "scrape_timeout": 0.2,
+                            "labels": {"task_id": task},
+                        }
+                    )
+                )
+                sinks.append(sink)
+                sink.emit_store("isolated_value", 7 if task == "first" else 9, {})
+            first, second = sinks
+            first.target_registry.set_targets([urlsplit(native_url).netloc])
+            responses = []
+            request = threading.Thread(
+                target=lambda: responses.append(
+                    requests.get(first.metrics_endpoint, timeout=3)
+                )
+            )
+            request.start()
+            assert entered.wait(2)
+            started = time.monotonic()
+            first.emit_store("live_updates", 11, {})
+            assert time.monotonic() - started < 0.2
+            request.join(2)
+            assert not request.is_alive() and responses[0].ok
+            assert 'task_id="first"' in responses[0].text
+            assert 'task_id="second"' not in responses[0].text
+            assert "native_slow" not in responses[0].text
+            assert (
+                'task_id="second"'
+                in requests.get(second.metrics_endpoint, timeout=3).text
+            )
+        finally:
+            for sink in sinks:
+                sink.close()
 
 
 @pytest.mark.skipif(
@@ -544,53 +536,18 @@ def test_task_collector_publishers_recover_without_minting_an_identity():
     reason="Set RL_INSIGHT_PROMETHEUS_BINARY to test real Agent remote write",
 )
 @pytest.mark.parametrize("ipv6", [False, True])
-def test_task_collector_remote_writes_to_real_prometheus(tmp_path, monkeypatch, ipv6):
-    """Native Agent sends the same SDK/native samples as the pull entry."""
+def test_sink_remote_writes_to_real_prometheus(tmp_path, monkeypatch, ipv6):
+    """SDK starts only an Agent; the sink exposes SDK/native samples directly."""
+    import rl_insight as monitor
     from prometheus_client import CollectorRegistry, Histogram, start_http_server
 
     binary = Path(os.environ["RL_INSIGHT_PROMETHEUS_BINARY"]).resolve()
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
-        receiver_port = sock.getsockname()[1]
-    receiver_url = f"http://127.0.0.1:{receiver_port}"
-    receiver_config = tmp_path / "receiver.yaml"
-    receiver_config.write_text("global: {scrape_interval: 1s}\nscrape_configs: []\n")
-    config = tmp_path / "monitor.yaml"
-    from rl_insight.utils.monitor_config_loader import expand_task_config
-
-    generated = expand_task_config(
-        {
-            "rl_insight": {
-                "server": {"port": 0, "endpoint_ttl": 5},
-                "labels": {"task_id": "platform-task", "platform": "test"},
-                "metrics": {
-                    "port": 0,
-                    "binary_path": str(binary),
-                    "scrape_interval": "1s",
-                    "scrape_timeout": "1s",
-                    "remote_write": [
-                        {
-                            "url": receiver_url + "/api/v1/write",
-                            "headers": {"X-Scope-OrgID": "tenant-test"},
-                            "queue_config": {
-                                "batch_send_deadline": "200ms",
-                                "min_backoff": "100ms",
-                                "max_backoff": "1s",
-                            },
-                        }
-                    ],
-                },
-            }
-        },
-        runtime_dir=tmp_path,
-    )
-    generated.server.install_dir = str(tmp_path / "services")
-    generated.server.runtime_dir = str(tmp_path / "runtime")
-    del generated.server.data_dir
-    generated.prometheus.min_version = None
-    OmegaConf.save(generated, config)
-    cli = [sys.executable, "-m", "rl_insight", "server"]
-    cli_env = dict(os.environ)
+        port = sock.getsockname()[1]
+    receiver_url = f"http://127.0.0.1:{port}"
+    config = tmp_path / "receiver.yaml"
+    config.write_text("global: {scrape_interval: 1s}\nscrape_configs: []\n")
     registry = CollectorRegistry()
     latency = Histogram(
         "native_push_latency_seconds", "Latency", buckets=[1, 3], registry=registry
@@ -598,87 +555,108 @@ def test_task_collector_remote_writes_to_real_prometheus(tmp_path, monkeypatch, 
     latency.observe(0.5)
     latency.observe(2)
     native, native_thread = start_http_server(0, addr="127.0.0.1", registry=registry)
-    sink = None
     log = (tmp_path / "receiver.log").open("w")
     receiver = subprocess.Popen(
         [
             str(binary),
-            f"--config.file={receiver_config}",
-            f"--web.listen-address=127.0.0.1:{receiver_port}",
+            f"--config.file={config}",
+            f"--web.listen-address=127.0.0.1:{port}",
             f"--storage.tsdb.path={tmp_path / 'receiver-data'}",
             "--web.enable-remote-write-receiver",
         ],
         stdout=log,
         stderr=subprocess.STDOUT,
     )
+    session = requests.Session()
+    session.trust_env = False
 
-    def wait_for(call, timeout=25):
-        deadline = time.monotonic() + timeout
+    def wait_for(call):
+        deadline = time.monotonic() + 20
         while True:
             try:
-                result = call()
-                if result:
-                    return result
+                value = call()
+                if value:
+                    return value
             except requests.RequestException:
                 pass
             assert receiver.poll() is None, (tmp_path / "receiver.log").read_text()
-            assert time.monotonic() < deadline, list(
-                (tmp_path / "services/logs").glob("*")
-            )
+            assert time.monotonic() < deadline
             time.sleep(0.1)
 
     def query(expression):
-        response = requests.get(
+        response = session.get(
             receiver_url + "/api/v1/query", params={"query": expression}, timeout=3
         )
         response.raise_for_status()
         return response.json()["data"]["result"]
 
     try:
-        wait_for(lambda: requests.get(receiver_url + "/-/ready", timeout=1).ok)
-        started = subprocess.run(
-            cli + ["start", "--config", str(config), "--detach", "--auto-port"],
-            capture_output=True,
-            text=True,
-            timeout=35,
-            env=cli_env,
-        )
-        assert started.returncode == 0, started.stdout + started.stderr
-        state = json.loads((tmp_path / "state.json").read_text())
-        assert {s["name"] for s in state["services"]} == {
-            "prometheus",
-            "rl-insight-server",
-        }
-        agent = next(s for s in state["services"] if s["name"] == "prometheus")
-        assert any(a in {"--agent", "--enable-feature=agent"} for a in agent["command"])
-        assert not any("--storage.tsdb" in a for a in agent["command"])
-        assert any("--storage.agent.path" in a for a in agent["command"])
-        runtime = OmegaConf.load(tmp_path / "runtime/server.yaml")
-        host = "127.0.0.1"
-        url = f"http://{host}:{runtime.server.port}"
-        assert runtime.server.metrics_port != runtime.server.port
-        scrape = OmegaConf.load(tmp_path / "runtime/prometheus.yml")
-        assert scrape.scrape_configs[0].static_configs[0].targets == [
-            f"{host}:{runtime.server.metrics_port}"
-        ]
-        from rl_insight.client.push.sinks.prometheus import create_sink
-
+        wait_for(lambda: session.get(receiver_url + "/-/ready", timeout=1).ok)
         monkeypatch.setenv("POD_IP", "::1" if ipv6 else "127.0.0.1")
-        sink = create_sink(
-            OmegaConf.create({"server_url": url, "advertise_host": "${oc.env:POD_IP}"})
-        )
-        sink.emit_store("sdk_push_loss", 0.25, {"rank": "0"})
-        sink.emit_counter("sdk_push_requests", 3, {})
-        sink.target_registry.set_targets(
+        options = {
+            "server": {"port": 0, "endpoint_ttl": 2},
+            "labels": {"task_id": "platform-task"},
+            "metrics": {
+                "port": 0,
+                "binary_path": str(binary),
+                "scrape_interval": "1s",
+                "scrape_timeout": "1s",
+                "remote_write": [
+                    {
+                        "url": receiver_url + "/api/v1/write",
+                        "headers": {"X-Scope-OrgID": "tenant-test"},
+                        "queue_config": {"batch_send_deadline": "200ms"},
+                    }
+                ],
+            },
+        }
+        if not ipv6:
+            with socket.socket() as reserve:
+                reserve.bind(("127.0.0.1", 0))
+                failed_port = reserve.getsockname()[1]
+            invalid = OmegaConf.merge(
+                options, {"metrics": {"port": failed_port, "scrape_interval": "1ms"}}
+            )
+            with pytest.raises(RuntimeError):
+                monitor.init(config=invalid)
+            with socket.socket() as probe:
+                assert probe.connect_ex(("127.0.0.1", failed_port)) != 0, (
+                    "failed Agent startup left its metrics listener running"
+                )
+        monitor.init(project="platform", experiment_name="push", config=options)
+        monitor.metric_gauge("sdk_push_loss", 0.25, rank="0")
+        monitor.metric_count("sdk_push_requests", 3)
+        monitor.update_prometheus_config(
             [f"127.0.0.1:{native.server_port}"], job_name="native"
         )
-        assert "sdk_push_loss" in requests.get(url + "/metrics", timeout=3).text
-        stored = wait_for(lambda: query('sdk_push_loss{task_id="platform-task"}'))
-        assert float(stored[0]["value"][1]) == 0.25
-        assert stored[0]["metric"]["platform"] == "test"
-        assert not query('sdk_push_loss{task_id="another-task"}')
+        endpoint = monitor.api._STATE.conf.server.metrics_endpoint
         assert (
-            float(wait_for(lambda: query("sdk_push_requests_total"))[0]["value"][1])
+            "rl_insight_monitor_sdk_push_loss" in session.get(endpoint, timeout=3).text
+        )
+        owner = monitor.api._STATE.client._owner
+        state = json.loads(Path(owner.conf.server.state_file).read_text())
+        assert [service["name"] for service in state["services"]] == ["prometheus"]
+        assert any(
+            "storage.agent.path" in arg for arg in state["services"][0]["command"]
+        )
+        rendered = OmegaConf.load(
+            Path(owner.conf.server.runtime_dir) / "prometheus.yml"
+        )
+        assert rendered.scrape_configs[0].static_configs[0].targets == [
+            urlsplit(endpoint).netloc
+        ]
+        assert rendered.remote_write[0].headers["X-Scope-OrgID"] == "tenant-test"
+        stored = wait_for(
+            lambda: query('rl_insight_monitor_sdk_push_loss{task_id="platform-task"}')
+        )
+        assert float(stored[0]["value"][1]) == 0.25
+        assert not query('rl_insight_monitor_sdk_push_loss{task_id="another-task"}')
+        assert (
+            float(
+                wait_for(lambda: query("rl_insight_monitor_sdk_push_requests_total"))[
+                    0
+                ]["value"][1]
+            )
             == 3
         )
         assert (
@@ -694,26 +672,25 @@ def test_task_collector_remote_writes_to_real_prometheus(tmp_path, monkeypatch, 
             float(query('native_push_latency_seconds_bucket{le="1.0"}')[0]["value"][1])
             == 1
         )
-        assert scrape.remote_write[0].headers["X-Scope-OrgID"] == "tenant-test"
-        sink.emit_store("sdk_push_final", 17, {})
-        sink.close()
-        sink = None
-        assert float(wait_for(lambda: query("sdk_push_final"))[0]["value"][1]) == 17
-        assert list((tmp_path / "runtime/prometheus/agent").rglob("wal"))
-    finally:
-        if sink is not None:
-            sink.close()
-        stopped = subprocess.run(
-            cli + ["stop", "--config", str(config)],
-            capture_output=True,
-            text=True,
-            timeout=25,
-            env=cli_env,
+        monitor.metric_gauge("sdk_push_final", 17)
+        monitor.finish()
+        assert (
+            float(
+                wait_for(
+                    lambda: query(
+                        "max_over_time(rl_insight_monitor_sdk_push_final[1m])"
+                    )
+                )[0]["value"][1]
+            )
+            == 17
         )
+        assert not Path(owner.conf.server.state_file).exists()
+    finally:
+        monitor.finish()
         native.shutdown()
         native.server_close()
         native_thread.join(5)
         receiver.terminate()
-        receiver.wait(10)
+        receiver.wait(timeout=10)
         log.close()
-        assert stopped.returncode == 0, stopped.stdout + stopped.stderr
+        session.close()

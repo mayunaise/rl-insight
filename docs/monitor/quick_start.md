@@ -207,10 +207,12 @@ If metrics do not appear, check that the monitor hub process is reachable from P
 
 ## Configure monitoring from a training task
 
-When the framework already passes its monitoring configuration to
-`rl_insight.init(config=...)`, keep the normal training command and put these
-options in that configuration. For example, an existing verl logger integration
-uses `trainer.rl_insight`:
+Keep the normal training command. The framework must already pass its monitoring
+configuration to `rl_insight.init(config=...)`; for example, an existing verl
+logger integration uses `trainer.rl_insight`.
+
+To start the bundled backend, install its binaries with
+`rl-insight server install`, then configure:
 
 ```yaml
 trainer:
@@ -219,22 +221,15 @@ trainer:
     enabled: true
 ```
 
-The SDK starts the bundled stack using its default template. With Ray, one Hub
-on the head node owns initialization and workers reuse its resolved configuration.
-Install the bundled service binaries first with `rl-insight server install`.
-To connect an existing stack on another machine, add
-`server: {url: "http://monitoring-host:18080"}` under `rl_insight`; it must already
-be running and reachable. Select the execution in the dashboard's existing
-Experiment selector.
+To use an existing bundled server, add
+`server: {url: "http://monitoring-host:18080"}` under `rl_insight`.
 
-For external Prometheus Pull and Tempo, configure their outputs instead:
+For external Prometheus Pull and Tempo:
 
 ```yaml
 trainer:
   logger: [console, rl_insight]
   rl_insight:
-    server:
-      port: 18080
     metrics:
       pull: true
       port: 18480
@@ -246,41 +241,27 @@ trainer:
       task_id: ${oc.env:PLATFORM_TASK_ID}
 ```
 
-The SDK starts a task collector without Prometheus/Tempo/Grafana storage services.
-The platform scrapes `http://<head-pod-ip>:18480/metrics`; SDK metrics and registered
-native exporters share that endpoint. Original exporter histogram buckets are
-preserved. Tempo receives OTLP/HTTP spans with the configured headers. The
-platform supplies `task_id` through the configured labels.
+The platform scrapes `http://<head-node-ip>:18480/metrics`. Use the environment
+variables supplied by your platform; `labels` is optional. The platform must
+already be able to discover and reach the endpoint.
 
-`metrics.port` inherits the actual `server.port` when omitted. A different value
-adds a metrics/health-only listener in the same process; explicit `0` allocates a
-port dynamically. An occupied explicit nonzero metrics port fails startup.
-Tasks sharing a host network need different ports. The platform must discover
-and reach this endpoint using its existing scrape conventions; training YAML
-cannot create Kubernetes discovery resources.
-
-For an external remote-write receiver, replace the `metrics` block above:
+For remote_write, replace the `metrics` block:
 
 ```yaml
 metrics:
+  port: 0
   remote_write:
     - url: ${oc.env:PROMETHEUS_REMOTE_WRITE_URL}
       headers:
         X-Scope-OrgID: ${oc.env:PLATFORM_TENANT_ID}
 ```
 
-A native Prometheus Agent scrapes the collector and handles WAL, batching and
-retries. It requires Prometheus >= 2.32.0 and starts without the bundled TSDB,
-Tempo or Grafana. `pull` and `remote_write` are exclusive output choices.
+remote_write requires Prometheus >= 2.32.0 installed for the SDK to start its
+forwarding Agent. Choose either `pull` or `remote_write`.
 
-Advanced users may replace `metrics`/`traces` with an exclusive `sinks` list in
-the same task configuration. Each entry uses the existing `driver`, `streams`,
-`metric_mapping`, `tags_from_env` and driver-specific options. A Prometheus sink
-uses `rl_insight.client.push.sinks.prometheus:create_sink`; an OTLP sink uses
-`rl_insight.client.push.sinks.otlp:create_sink`. Duplicate outputs and conflicting
-identity labels are rejected. Raw Prometheus outputs cannot be combined with
-`push.rollout.metrics` translation rules, including the optional distribution
-rules; translation-only sinks retain their existing behavior.
+`metrics.port` defaults to `server.port` (18080); `0` selects an available port
+and logs the endpoint. Pull requires a port the platform can discover. Tasks
+sharing a host network need different ports or dynamic allocation.
 
-The SDK stops its task collector and Agent after training. Existing external
-services and bundled storage remain available for historical inspection.
+For custom outputs, use `sinks` with the existing sink driver options instead
+of `metrics`/`traces`.

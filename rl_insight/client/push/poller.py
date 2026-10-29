@@ -45,15 +45,16 @@ class Target:
 
     address: str
     labels: dict[str, str] = field(default_factory=dict)
+    job_name: str | None = None
 
 
 class TargetRegistry:
     """Process-local, de-duplicated set of rollout scrape targets."""
 
-    def __init__(self, on_update: Callable[[Target], None] | None = None) -> None:
+    def __init__(self) -> None:
         self._targets: dict[str, dict[str, str]] = {}
+        self._jobs: dict[str, str | None] = {}
         self._lock = threading.Lock()
-        self._on_update = on_update
 
     def set_targets(
         self,
@@ -66,22 +67,23 @@ class TargetRegistry:
         per_target = list(labels) if labels is not None else [None] * len(addresses)
         for address, target_labels in zip(addresses, per_target):
             values = {str(k): str(v) for k, v in (target_labels or {}).items()}
-            if self._on_update is not None:
-                if job_name:
-                    values.setdefault("job", job_name)
-                self._on_update(Target(str(address), values))
             with self._lock:
                 self._targets[str(address)] = values
+                self._jobs[str(address)] = job_name
 
     def snapshot(self) -> list[Target]:
         with self._lock:
             return [
-                Target(address=address, labels=dict(labels))
+                Target(
+                    address=address,
+                    labels=dict(labels),
+                    job_name=self._jobs.get(address),
+                )
                 for address, labels in sorted(self._targets.items())
             ]
 
 
-def _http_fetch_metrics(address: str) -> str:
+def _http_fetch_metrics(address: str, *, timeout: float = 5) -> str:
     """Fetch Prometheus text exposition from ``host:port`` via localhost-safe HTTP."""
     url = address.strip()
     if not url.startswith("http://") and not url.startswith("https://"):
@@ -92,7 +94,7 @@ def _http_fetch_metrics(address: str) -> str:
     session = requests.Session()
     session.trust_env = False  # bypass proxy for engine endpoints on localhost
     try:
-        response = session.get(url, timeout=5)
+        response = session.get(url, timeout=timeout)
         response.raise_for_status()
         return response.text
     finally:

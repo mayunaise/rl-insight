@@ -25,6 +25,7 @@ import sys
 import time
 from uuid import uuid4
 from pathlib import Path
+from urllib.parse import urlsplit
 from typing import Any
 
 import psutil
@@ -172,12 +173,30 @@ class SDKServices:
             raise RuntimeError(
                 "Bundled SDK monitoring requires an initialized Ray runtime"
             )
-        self.session = requests.Session()
-        self.session.trust_env = False
+        self.sdk_config = OmegaConf.create(
+            {
+                "server": {
+                    "backend": "push" if self.external else "ray",
+                    "namespace": self.conf.server.namespace,
+                    "url": self.conf.server.url,
+                },
+                "labels": self.conf.labels,
+                "endpoint_ttl": self.conf.server.endpoint_ttl,
+            }
+        )
+        if self.external:
+            self.sdk_config.push = self.conf.push
+            atexit.register(self.close)
+            return
         try:
-            with runtime_lock(
-                MonitorPaths.STATE_ROOT / ("sdk-start-" + str(self.conf.server.port))
+            with (
+                requests.Session() as session,
+                runtime_lock(
+                    MonitorPaths.STATE_ROOT
+                    / ("sdk-start-" + str(self.conf.server.port))
+                ),
             ):
+                session.trust_env = False
                 if self.conf.server.enable:
                     url = str(self.conf.server.url)
                     address = local_addresses()
@@ -186,7 +205,7 @@ class SDKServices:
                         "http://" + format_host_port(host, self.conf.server.port)
                     )
                     try:
-                        response = self.session.get(
+                        response = session.get(
                             candidate + "/api/v1/services",
                             headers={SDK_VERSION_HEADER: __version__},
                             timeout=2,
@@ -201,122 +220,81 @@ class SDKServices:
                         services = None
                     if services is not None:
                         require_version(services.get("server_version"), "Server")
-                        compatible = (
-                            (
-                                services.get("task_metrics_path") == "/metrics"
-                                and type(services.get("metrics_port")) is int
-                                and 1 <= services["metrics_port"] <= 65535
-                                and services.get("labels", {}) == dict(self.conf.labels)
-                            )
-                            if self.external
-                            else services.get("task_metrics_path") is None
-                        )
-                        if not compatible or OmegaConf.select(
-                            self.conf, "prometheus.remote_write"
-                        ):
-                            raise ValueError(
-                                "Existing service conflicts with task outputs"
-                            )
-                        metrics_port = services.get("metrics_port")
-                        requested_port = OmegaConf.select(
-                            self.conf, "server.metrics_port"
-                        )
-                        if requested_port and requested_port != metrics_port:
-                            raise ValueError(
-                                "Existing service conflicts with metrics.port"
-                            )
                         self.conf.server.url = candidate
                     else:
                         root.mkdir(parents=True, mode=0o700)
-                        if not self.external:
-                            # A new private Grafana database uses its bootstrap credentials.
-                            self.conf.grafana.username = os.environ.get(
-                                "GF_SECURITY_ADMIN_USER", "admin"
-                            )
-                            self.conf.grafana.password = os.environ.get(
-                                "GF_SECURITY_ADMIN_PASSWORD", "admin"
-                            )
+                        self.conf.grafana.username = os.environ.get(
+                            "GF_SECURITY_ADMIN_USER", "admin"
+                        )
+                        self.conf.grafana.password = os.environ.get(
+                            "GF_SECURITY_ADMIN_PASSWORD", "admin"
+                        )
                         self.manager = ServerServiceManager(self.conf)
                         ServerConfigValidator().validate_start(self.conf)
                         self.stack = self.manager.start(
                             detach=True,
                             attach_logs=False,
-                            auto_port=(
-                                not self.external
-                                or self.conf.server.port == 0
-                                or OmegaConf.select(self.conf, "server.metrics_port")
-                                == 0
-                            ),
+                            auto_port=True,
                         )
                         self.conf.server.url = "http://" + format_host_port(
                             host, self.conf.server.port
                         )
-                        deadline = time.monotonic() + 60
-                        while True:
-                            if any(
-                                s.process.poll() is not None
-                                for s in self.stack.services
-                            ):
-                                raise RuntimeError(
-                                    "A monitoring service exited during startup"
-                                )
-                            try:
-                                if self.session.get(
-                                    self.conf.server.url + "/healthz", timeout=1
-                                ).ok:
-                                    break
-                            except requests.RequestException:
-                                pass
-                            if time.monotonic() >= deadline:
-                                raise TimeoutError("SDK monitoring startup timed out")
-                            time.sleep(0.1)
                         logging.getLogger(__name__).warning(
                             "[rl-insight] SDK services ready: %s; config: %s",
                             self.conf.server.url,
                             root / "services/server.yaml",
                         )
-            self.sdk_config = OmegaConf.merge(
-                {
-                    "server": {
-                        "backend": "push" if self.external else "ray",
-                        "namespace": self.conf.server.namespace,
-                        "url": self.conf.server.url,
-                    },
-                    "labels": self.conf.labels,
-                    "endpoint_ttl": self.conf.server.endpoint_ttl,
-                },
-                {"push": self.conf.push} if self.external else {},
-            )
-            if self.stack and self.external:
-                owner = psutil.Process()
-                metadata = {
-                    "owner": [owner.pid, owner.create_time()],
-                    "services": [
-                        [s.process.pid, psutil.Process(s.process.pid).create_time()]
-                        for s in self.stack.services
-                    ],
-                    "state_file": str(self.stack.state_file),
-                    "grace": min(60, float(self.conf.server.endpoint_ttl)),
-                }
-                with (root / "logs/watchdog.log").open("ab") as log:
-                    self.watcher = subprocess.Popen(
-                        [
-                            sys.executable,
-                            "-c",
-                            "from rl_insight.server.services import _watch_sdk_services;import sys;_watch_sdk_services(sys.argv[1])",
-                            json.dumps(metadata),
-                        ],
-                        stdin=subprocess.DEVNULL,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        start_new_session=os.name == "posix",
-                    )
+            self.sdk_config.server.url = self.conf.server.url
             atexit.register(self.close)
         except BaseException:
             if self.stack:
                 self.manager.stop()
-            self.session.close()
             raise
+
+    def start_forwarder(self, endpoint):
+        """Start the existing Agent only after its sink has bound an actual port."""
+        if not self.external:
+            return
+        if (
+            OmegaConf.select(self.conf, "server.metrics_port") is not None
+            and not endpoint
+        ):
+            raise ValueError("Configured Prometheus metrics endpoint did not start")
+        self.sdk_config.server.metrics_endpoint = endpoint
+        if prometheus_agent_enabled(self.conf):
+            self.conf.prometheus.metrics_endpoint = endpoint
+            self.conf.server.metrics_port = urlsplit(endpoint).port
+            self.manager = ServerServiceManager(self.conf)
+            self.stack = self.manager.start(
+                detach=True, attach_logs=False, auto_port=True
+            )
+            owner = psutil.Process()
+            metadata = {
+                "owner": [owner.pid, owner.create_time()],
+                "services": [
+                    [s.process.pid, psutil.Process(s.process.pid).create_time()]
+                    for s in self.stack.services
+                ],
+                "state_file": str(self.stack.state_file),
+            }
+            root = Path(self.conf.server.log_dir)
+            with (root / "watchdog.log").open("ab") as log:
+                self.watcher = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        "from rl_insight.server.services import _watch_sdk_services;import sys;_watch_sdk_services(sys.argv[1])",
+                        json.dumps(metadata),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=os.name == "posix",
+                )
+        if endpoint:
+            logging.getLogger(__name__).warning(
+                "[rl-insight] SDK metrics ready: %s", endpoint
+            )
 
     def prepare_collector(self, conf):
         """Resolve one job's backend and expose credential-free worker config."""
@@ -337,6 +315,12 @@ class SDKServices:
             delegate = create_monitor_client(resolved)
             if delegate is None:
                 raise RuntimeError("No monitoring client was created for task outputs")
+            try:
+                self.start_forwarder(getattr(delegate, "metrics_endpoint", ""))
+            except BaseException:
+                delegate.close()
+                raise
+            resolved.server.metrics_endpoint = self.sdk_config.server.metrics_endpoint
             resolved.server.backend = "ray"
             resolved.pop("push", None)
         resolved.collector_backend = backend
@@ -351,16 +335,12 @@ class SDKServices:
         atexit.unregister(self.close)
         try:
             if self.stack and (self.external or failed):
-                # Revoked exporters retain a final snapshot for one endpoint TTL.
-                if not failed:
-                    time.sleep(float(self.conf.server.endpoint_ttl))
                 self.manager.stop()
             # Full storage/query backends remain available for historical dashboards.
         finally:
             if self.watcher is not None:
                 self.watcher.terminate()
                 self.watcher.wait(timeout=5)
-            self.session.close()
 
 
 def _watch_sdk_services(raw):
@@ -382,7 +362,6 @@ def _watch_sdk_services(raw):
 
     while process(metadata["owner"]) is not None:
         time.sleep(0.5)
-    time.sleep(metadata["grace"])
     children = [
         p for identity in metadata["services"] if (p := process(identity)) is not None
     ]

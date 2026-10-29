@@ -85,6 +85,7 @@ def create_monitor_client(conf: DictConfig) -> MonitorClient | None:
     if conf.get("enabled") is False:
         return None
     owner = None
+    client = None
     ray = sys.modules.get("ray")
     try:
         if conf.get("task_options") is not None and not (ray and ray.is_initialized()):
@@ -109,11 +110,18 @@ def create_monitor_client(conf: DictConfig) -> MonitorClient | None:
         if owner is not None:
             if client is None:
                 raise RuntimeError("No monitoring client was created for task outputs")
+            endpoint = getattr(client, "metrics_endpoint", "")
+            owner.start_forwarder(endpoint)
+            conf.server.metrics_endpoint = endpoint
             return _OwnedClient(client, owner, conf)
         return client
     except BaseException:
-        if owner is not None:
-            owner.close(failed=True)
+        try:
+            if client is not None:
+                client.close()
+        finally:
+            if owner is not None:
+                owner.close(failed=True)
         raise
 
 
