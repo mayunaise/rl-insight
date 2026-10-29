@@ -23,7 +23,7 @@ from typing import Any
 import ray
 from omegaconf import DictConfig
 
-from ..server.http_api import get_server_services
+from ..server.http_api import initialize_server_connection
 from ..server.network import format_host_port, service_url_from_server_url
 from ..utils import (
     MetricRegistry,
@@ -65,7 +65,7 @@ class MonitorHubActor(MonitorCollector):
             str(metadata.get("experiment_name", "unnamed")),
             str(conf.server.url),
         )
-        services = get_server_services()
+        services = initialize_server_connection()
         self._services = services
         trace_endpoint = service_url_from_server_url(
             str(self._conf.server.url),
@@ -121,16 +121,11 @@ class MonitorHubActor(MonitorCollector):
             event: Must include ``kind``; metric kinds need ``name``/``value``; trace needs ``start_time_ns``/``end_time_ns``.
         """
         self._events_applied += 1
-        context = getattr(self, "_context", None)
-        if context:
-            event = dict(event)
-            field = (
-                "attributes"
-                if event.get("kind") == MonitorEventKind.TRACE
-                else "labels"
-            )
-            labels = dict(event.get(field) or {})
-            event[field] = context.labels(labels)
+        event = dict(event)
+        field = (
+            "attributes" if event.get("kind") == MonitorEventKind.TRACE else "labels"
+        )
+        event[field] = self._context.labels(event.get(field))
         try:
             kind = event["kind"]
         except KeyError as e:

@@ -32,7 +32,6 @@ import yaml
 from omegaconf import DictConfig, OmegaConf
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
-from .. import __version__
 from ..server.network import format_host_port, local_addresses
 from .constants import (
     MonitorBackend,
@@ -41,12 +40,7 @@ from .constants import (
     PrometheusScrape,
     prometheus_targets_file_from_config,
 )
-from .protocol import (
-    SDK_VERSION_HEADER,
-    InvalidVersionError,
-    RunContext,
-    RunError,
-)
+from .protocol import RunContext, RunError
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.WARNING)
@@ -530,38 +524,36 @@ def update_prometheus_config(
 
     if context is None:
         if not initialized:
-            from ..server.http_api import get_server_services
+            from ..server.http_api import initialize_server_connection
 
-            if get_server_services():
-                # Wait for logger initialization; never create a Run from an address.
-                from ..client.ray_monitor_client import (
-                    initialize_current_job_connection,
-                )
+            initialize_server_connection()
+            # Wait for logger initialization; never create a Run from an address.
+            from ..client.ray_monitor_client import initialize_current_job_connection
 
-                context = initialize_current_job_connection()
-                item: tuple[
-                    list[str], str | None, list[Mapping[str, Any] | None] | None
-                ] = (
-                    list(server_addresses),
-                    job_name,
-                    [dict(x) if x else None for x in labels] if labels else None,
-                )
-                if context is None:
-                    with _pending_lock:
-                        if item not in _pending_targets:
-                            if len(_pending_targets) >= 64:
-                                raise ValueError(
-                                    "Too many targets waiting for Run initialization"
-                                )
-                            _pending_targets.append(item)
-                        if _pending_probe is None or not _pending_probe.is_alive():
-                            _pending_probe = threading.Thread(
-                                target=_wait_for_context,
-                                name="insight-context",
-                                daemon=True,
+            context = initialize_current_job_connection()
+            item: tuple[
+                list[str], str | None, list[Mapping[str, Any] | None] | None
+            ] = (
+                list(server_addresses),
+                job_name,
+                [dict(x) if x else None for x in labels] if labels else None,
+            )
+            if context is None:
+                with _pending_lock:
+                    if item not in _pending_targets:
+                        if len(_pending_targets) >= 64:
+                            raise ValueError(
+                                "Too many targets waiting for Run initialization"
                             )
-                            _pending_probe.start()
-                    return
+                        _pending_targets.append(item)
+                    if _pending_probe is None or not _pending_probe.is_alive():
+                        _pending_probe = threading.Thread(
+                            target=_wait_for_context,
+                            name="insight-context",
+                            daemon=True,
+                        )
+                        _pending_probe.start()
+                return
 
     _register_targets(
         server_addresses,
@@ -600,14 +592,10 @@ def _register_targets(
         response = requests.post(
             url,
             json=payload,
-            headers={SDK_VERSION_HEADER: __version__},
             timeout=10,
         )
         if 400 <= response.status_code < 500 and response.status_code not in {408, 429}:
-            error_type = (
-                InvalidVersionError if response.status_code == 409 else RunError
-            )
-            raise error_type(
+            raise RunError(
                 "Target registration rejected: " + response.text[:512],
                 response.status_code,
             )

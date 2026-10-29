@@ -26,7 +26,7 @@ from omegaconf import DictConfig
 
 from .. import __version__
 from ..collector.ray_monitor_hub import MonitorHubActor
-from ..server.http_api import get_server_services
+from ..server.http_api import initialize_server_connection
 from ..utils.constants import MonitorEnv, MonitorRayActor, MonitorServer
 from ..utils.protocol import (
     MIN_SUPPORTED_VERSION,
@@ -46,8 +46,7 @@ __all__ = ["MonitorRayClient", "create_ray_monitor_client", "get_or_create_monit
 def _current_job_actor_name() -> str:
     """Return a hub actor name scoped to the current Ray job."""
     job_id = ray.get_runtime_context().get_job_id()
-    job_id_str = job_id if isinstance(job_id, str) else job_id.hex()
-    return f"{MonitorRayActor.NAME}_{job_id_str}"
+    return f"{MonitorRayActor.NAME}_{job_id}"
 
 
 def initialize_current_job_connection() -> RunContext | None:
@@ -131,7 +130,7 @@ def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
         logger.warning("[rl-insight] Ray is not initialized; monitoring is disabled.")
         return None
 
-    get_server_services(str(conf.server.url))
+    initialize_server_connection(str(conf.server.url))
     handle = get_or_create_monitor_hub(conf, create=bool(conf.get("run_metadata")))
     client = MonitorRayClient(handle)
     if not client.initialize():
@@ -193,15 +192,7 @@ class MonitorRayClient(MonitorClient):
             raise self._compatibility_error
         if not self._initialized:
             return None
-        try:
-            context = ray.get(self._actor.get_context.remote(), timeout=self._timeout)
-        except ray.exceptions.ActorUnavailableError:
-            raise
-        except (ray.exceptions.RayActorError, ray.exceptions.RayTaskError) as exc:
-            raise RunError("Failed to read the Ray Hub Context", 502) from exc
-        if not isinstance(context, RunContext):
-            raise RunError("Ray Hub returned an invalid Context", 502)
-        return context
+        return ray.get(self._actor.get_context.remote(), timeout=self._timeout)
 
     def apply_event(self, event: dict[str, Any]) -> None:
         """Submit ``MonitorHubActor.apply_event`` on the actor (fire-and-forget; no ``ray.get``).

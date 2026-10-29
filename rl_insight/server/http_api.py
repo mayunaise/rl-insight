@@ -49,7 +49,7 @@ def server_url() -> str:
 
 
 def get_server_services(base_url: str | None = None) -> dict[str, Any]:
-    """Initialize the SDK connection and fetch the Server's service endpoints."""
+    """Fetch the Server's service endpoints, retrying transient failures."""
     base_url = (base_url or server_url()).strip().rstrip("/")
     if not base_url:
         raise RunError(f"RL-Insight requires a Server URL; set {MonitorEnv.SERVER_URL}")
@@ -70,40 +70,41 @@ def get_server_services(base_url: str | None = None) -> dict[str, Any]:
                     f"services response must be an object, got {type(data).__name__}"
                 )
         except requests.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code in {404, 405}:
-                require_version(None, f"Server (services API unavailable at {url})")
             if (
                 exc.response is not None
                 and 400 <= exc.response.status_code < 500
                 and exc.response.status_code not in {408, 429}
             ):
-                detail = exc.response.text[:512]
-                try:
-                    body = exc.response.json()
-                    if isinstance(body, dict):
-                        detail = str(body.get("detail") or detail)
-                except ValueError:
-                    pass
-                error_type = (
-                    InvalidVersionError if exc.response.status_code == 409 else RunError
-                )
-                raise error_type(
-                    f"RL-Insight service discovery rejected: {detail}",
+                raise RunError(
+                    f"RL-Insight service discovery rejected at {url}: {exc.response.text[:512]}",
                     exc.response.status_code,
                 ) from exc
             last_error = exc
         except (requests.RequestException, ValueError) as exc:
             last_error = exc
         else:
-            require_version(data.get("server_version"), "Server")
             return data
 
         if attempt + 1 < MonitorServer.SERVICE_DISCOVERY_RETRIES:
             time.sleep(MonitorServer.SERVICE_DISCOVERY_RETRY_DELAY_SECONDS)
 
     raise RunError(
-        f"Cannot initialize the RL-Insight connection at {url}: {last_error}", 503
+        f"Cannot fetch RL-Insight services at {url}: {last_error}", 503
     ) from last_error
+
+
+def initialize_server_connection(base_url: str | None = None) -> dict[str, Any]:
+    """Discover Server endpoints and validate compatibility during initialization."""
+    try:
+        services = get_server_services(base_url)
+    except RunError as exc:
+        if exc.status in {404, 405}:
+            require_version(None, "Server (services API unavailable)")
+        if exc.status == 409:
+            raise InvalidVersionError(str(exc), 409) from exc
+        raise
+    require_version(services.get("server_version"), "Server")
+    return services
 
 
 def create_app(conf: DictConfig) -> FastAPI:

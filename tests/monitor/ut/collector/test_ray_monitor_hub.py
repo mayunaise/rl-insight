@@ -38,7 +38,7 @@ def hub() -> Any:
     instance._registry = MagicMock()
     instance._trace_collector = MagicMock(enabled=True)
     instance._events_applied = 0
-    instance._context = None
+    instance._context = RunContext("p", "e", "http://server")
     instance._event_handlers = {
         MonitorEventKind.COUNTER: instance._handle_counter,
         MonitorEventKind.GAUGE: instance._handle_gauge,
@@ -55,7 +55,9 @@ def test_init_should_configure_collectors_and_register_scrape_target_when_create
     trace_collector = MagicMock(enabled=True)
     start_server = MagicMock()
     update_config = MagicMock()
-    monkeypatch.setattr(hub_module, "get_server_services", lambda: {"otlp_port": 4318})
+    monkeypatch.setattr(
+        hub_module, "initialize_server_connection", lambda: {"otlp_port": 4318}
+    )
     registry_factory = MagicMock(return_value=registry)
     monkeypatch.setattr(hub_module, "MetricRegistry", registry_factory)
     trace_factory = MagicMock(return_value=trace_collector)
@@ -95,7 +97,9 @@ def test_init_should_configure_collectors_and_register_scrape_target_when_create
         (
             {"kind": "counter", "name": "steps", "value": "2", "labels": {"w": 1}},
             "count",
-            call("steps", "", 2.0, {}, {"w": 1}),
+            call(
+                "steps", "", 2.0, {}, {"w": 1, "project": "p", "experiment_name": "e"}
+            ),
         ),
         (
             {
@@ -105,12 +109,25 @@ def test_init_should_configure_collectors_and_register_scrape_target_when_create
                 "documentation": "reward doc",
             },
             "value",
-            call("reward", "reward doc", 1.5, {}, {}),
+            call(
+                "reward",
+                "reward doc",
+                1.5,
+                {},
+                {"project": "p", "experiment_name": "e"},
+            ),
         ),
         (
             {"kind": "histogram", "name": "latency", "value": 12},
             "distribution",
-            call("latency", "", 12.0, {}, {}, buckets=None),
+            call(
+                "latency",
+                "",
+                12.0,
+                {},
+                {"project": "p", "experiment_name": "e"},
+                buckets=None,
+            ),
         ),
     ],
 )
