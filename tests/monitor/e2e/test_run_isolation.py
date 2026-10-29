@@ -550,7 +550,7 @@ def test_sink_remote_writes_to_real_prometheus(tmp_path, monkeypatch, ipv6):
     config.write_text("global: {scrape_interval: 1s}\nscrape_configs: []\n")
     registry = CollectorRegistry()
     latency = Histogram(
-        "native_push_latency_seconds", "Latency", buckets=[1, 3], registry=registry
+        "native:push_latency_seconds", "Latency", buckets=[1, 3], registry=registry
     )
     latency.observe(0.5)
     latency.observe(2)
@@ -623,7 +623,16 @@ def test_sink_remote_writes_to_real_prometheus(tmp_path, monkeypatch, ipv6):
                 assert probe.connect_ex(("127.0.0.1", failed_port)) != 0, (
                     "failed Agent startup left its metrics listener running"
                 )
-        monitor.init(project="platform", experiment_name="push", config=options)
+        from rl_insight.utils.constants import MonitorPaths
+        from rl_insight.utils.monitor_config_loader import load_monitor_config
+
+        resolved = load_monitor_config(options)
+        owner_root = tmp_path / "owner-state"
+        monkeypatch.setattr(MonitorPaths, "STATE_ROOT", owner_root)
+        monitor.init(project="platform", experiment_name="push", config=resolved)
+        assert Path(monitor.api._STATE.conf.server.state_file).is_relative_to(
+            owner_root
+        )
         monitor.metric_gauge("sdk_push_loss", 0.25, rank="0")
         monitor.metric_count("sdk_push_requests", 3)
         monitor.update_prometheus_config(
@@ -633,7 +642,16 @@ def test_sink_remote_writes_to_real_prometheus(tmp_path, monkeypatch, ipv6):
         assert (
             "rl_insight_monitor_sdk_push_loss" in session.get(endpoint, timeout=3).text
         )
-        owner = monitor.api._STATE.client._owner
+        response = session.get(
+            endpoint,
+            headers={"Accept": "application/openmetrics-text;version=1.0.0"},
+            timeout=3,
+        )
+        response.raise_for_status()
+        assert response.headers["Content-Type"].startswith("text/plain; version=0.0.4")
+        assert "native:push_latency_seconds_count" in response.text
+        assert "native_push_latency_seconds_count" not in response.text
+        owner = monitor.api._STATE.client
         state = json.loads(Path(owner.conf.server.state_file).read_text())
         assert [service["name"] for service in state["services"]] == ["prometheus"]
         assert any(
@@ -661,15 +679,15 @@ def test_sink_remote_writes_to_real_prometheus(tmp_path, monkeypatch, ipv6):
         )
         assert (
             float(
-                wait_for(lambda: query("native_push_latency_seconds_count"))[0][
+                wait_for(lambda: query("native:push_latency_seconds_count"))[0][
                     "value"
                 ][1]
             )
             == 2
         )
-        assert float(query("native_push_latency_seconds_sum")[0]["value"][1]) == 2.5
+        assert float(query("native:push_latency_seconds_sum")[0]["value"][1]) == 2.5
         assert (
-            float(query('native_push_latency_seconds_bucket{le="1.0"}')[0]["value"][1])
+            float(query('native:push_latency_seconds_bucket{le="1.0"}')[0]["value"][1])
             == 1
         )
         monitor.metric_gauge("sdk_push_final", 17)

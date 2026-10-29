@@ -218,6 +218,14 @@ class PrometheusSink(PushSink):
             self._server, self._thread = start_http_server(
                 port, addr=listen_host, registry=exposed
             )
+            app = self._server.get_app()
+
+            def prometheus_text(environ, start_response):
+                # OpenMetrics encoding escapes native names such as vllm:.
+                environ["HTTP_ACCEPT"] = "text/plain;version=0.0.4"
+                return app(environ, start_response)
+
+            self._server.set_app(prometheus_text)
         except BaseException:
             self._collector.close()
             raise

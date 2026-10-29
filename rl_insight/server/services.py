@@ -18,17 +18,11 @@ from __future__ import annotations
 
 import atexit
 import logging
-import json
 import os
-import subprocess
-import sys
-import time
-from uuid import uuid4
 from pathlib import Path
-from urllib.parse import urlsplit
 from typing import Any
+from uuid import uuid4
 
-import psutil
 import requests
 from omegaconf import DictConfig, OmegaConf
 
@@ -153,7 +147,7 @@ ObservabilityServiceManager = ServerServiceManager
 
 
 class SDKServices:
-    """Own the services required by an SDK configuration, independently of a framework."""
+    """Start or connect the bundled monitoring services on the Hub node."""
 
     def __init__(self, options):
         from ..utils.constants import MonitorPaths
@@ -166,17 +160,10 @@ class SDKServices:
         self.manager = None
         self.stack = None
         self.closed = False
-        self.watcher = None
-        self.external = self.conf.server.backend == "push"
-        ray = sys.modules.get("ray")
-        if not self.external and not (ray and ray.is_initialized()):
-            raise RuntimeError(
-                "Bundled SDK monitoring requires an initialized Ray runtime"
-            )
         self.sdk_config = OmegaConf.create(
             {
                 "server": {
-                    "backend": "push" if self.external else "ray",
+                    "backend": "ray",
                     "namespace": self.conf.server.namespace,
                     "url": self.conf.server.url,
                 },
@@ -184,10 +171,6 @@ class SDKServices:
                 "endpoint_ttl": self.conf.server.endpoint_ttl,
             }
         )
-        if self.external:
-            self.sdk_config.push = self.conf.push
-            atexit.register(self.close)
-            return
         try:
             with (
                 requests.Session() as session,
@@ -251,135 +234,11 @@ class SDKServices:
                 self.manager.stop()
             raise
 
-    def start_forwarder(self, endpoint):
-        """Start the existing Agent only after its sink has bound an actual port."""
-        if not self.external:
-            return
-        if (
-            OmegaConf.select(self.conf, "server.metrics_port") is not None
-            and not endpoint
-        ):
-            raise ValueError("Configured Prometheus metrics endpoint did not start")
-        self.sdk_config.server.metrics_endpoint = endpoint
-        if prometheus_agent_enabled(self.conf):
-            self.conf.prometheus.metrics_endpoint = endpoint
-            self.conf.server.metrics_port = urlsplit(endpoint).port
-            self.manager = ServerServiceManager(self.conf)
-            self.stack = self.manager.start(
-                detach=True, attach_logs=False, auto_port=True
-            )
-            owner = psutil.Process()
-            metadata = {
-                "owner": [owner.pid, owner.create_time()],
-                "services": [
-                    [s.process.pid, psutil.Process(s.process.pid).create_time()]
-                    for s in self.stack.services
-                ],
-                "state_file": str(self.stack.state_file),
-            }
-            root = Path(self.conf.server.log_dir)
-            with (root / "watchdog.log").open("ab") as log:
-                self.watcher = subprocess.Popen(
-                    [
-                        sys.executable,
-                        "-c",
-                        "from rl_insight.server.services import _watch_sdk_services;import sys;_watch_sdk_services(sys.argv[1])",
-                        json.dumps(metadata),
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=os.name == "posix",
-                )
-        if endpoint:
-            logging.getLogger(__name__).warning(
-                "[rl-insight] SDK metrics ready: %s", endpoint
-            )
-
-    def prepare_collector(self, conf):
-        """Resolve one job's backend and expose credential-free worker config."""
-        from ..client import create_monitor_client
-        from ..utils.monitor_config_loader import load_monitor_config
-
-        resolved = OmegaConf.merge(
-            load_monitor_config(),
-            self.sdk_config,
-            {
-                "run_metadata": conf.get("run_metadata", {}),
-                "task_signature": conf.task_signature,
-            },
-        )
-        backend = str(resolved.server.backend)
-        delegate = None
-        if backend != "ray":
-            delegate = create_monitor_client(resolved)
-            if delegate is None:
-                raise RuntimeError("No monitoring client was created for task outputs")
-            try:
-                self.start_forwarder(getattr(delegate, "metrics_endpoint", ""))
-            except BaseException:
-                delegate.close()
-                raise
-            resolved.server.metrics_endpoint = self.sdk_config.server.metrics_endpoint
-            resolved.server.backend = "ray"
-            resolved.pop("push", None)
-        resolved.collector_backend = backend
-        if resolved.server.url:
-            os.environ["RL_INSIGHT_SERVER_URL"] = str(resolved.server.url)
-        return resolved, delegate
-
     def close(self, *, failed=False):
+        """Clean up a failed start; retain running backends for historical data."""
         if self.closed:
             return
         self.closed = True
         atexit.unregister(self.close)
-        try:
-            if self.stack and (self.external or failed):
-                self.manager.stop()
-            # Full storage/query backends remain available for historical dashboards.
-        finally:
-            if self.watcher is not None:
-                self.watcher.terminate()
-                self.watcher.wait(timeout=5)
-
-
-def _watch_sdk_services(raw):
-    """Reap SDK-owned task services if their owner is killed without running finish."""
-    metadata = json.loads(raw)
-
-    def process(identity):
-        try:
-            p = psutil.Process(identity[0])
-            return (
-                p
-                if p.create_time() == identity[1]
-                and p.is_running()
-                and p.status() != psutil.STATUS_ZOMBIE
-                else None
-            )
-        except psutil.Error:
-            return None
-
-    while process(metadata["owner"]) is not None:
-        time.sleep(0.5)
-    children = [
-        p for identity in metadata["services"] if (p := process(identity)) is not None
-    ]
-    for p in reversed(children):
-        try:
-            p.terminate()
-        except psutil.Error:
-            pass
-    _, pending = psutil.wait_procs(children, timeout=10)
-    for p in pending:
-        try:
-            p.kill()
-        except psutil.Error:
-            pass
-    path = Path(metadata["state_file"])
-    if path.exists():
-        state = json.loads(path.read_text())
-        if {s["pid"] for s in state.get("services", [])} == {
-            s[0] for s in metadata["services"]
-        }:
-            path.unlink(missing_ok=True)
+        if self.stack and failed:
+            self.manager.stop()

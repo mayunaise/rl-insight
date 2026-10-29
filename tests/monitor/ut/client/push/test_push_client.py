@@ -369,6 +369,11 @@ def test_malformed_sink_config_is_skipped_without_raising(
                         "prefix": "p",
                         "streams": ["metric"],
                     },
+                    {
+                        "name": "bad-stream",
+                        "driver": "fake_push_sinks_mod:create_sink",
+                        "streams": ["unknown"],
+                    },
                     # Unknown op in metric_mapping -> this sink is dropped.
                     {
                         "name": "bad-op",
@@ -399,8 +404,7 @@ def test_malformed_sink_config_is_skipped_without_raising(
     assert client is not None  # malformed entries do not disable monitoring
 
     client.apply_event({"kind": "gauge", "name": "reward", "value": 1, "labels": {}})
-    # All three drivers loaded, but only the well-configured one was bound and
-    # received the event; the two malformed sinks were skipped with a warning.
+    # Only the well-configured sink receives the event; malformed ones are skipped.
     active = [s for s in sinks if s.calls]
     assert len(active) == 1
     assert active[0].calls[0][:2] == ("store", "p.trainer.reward")
@@ -511,6 +515,27 @@ def test_failing_sink_is_removed_but_others_keep_working(
     assert good[0].closed
     sys.modules.pop("fake_bad_mod", None)
     _ = good_mod
+
+
+def test_trace_only_output_consumes_unused_native_targets() -> None:
+    conf = OmegaConf.create(
+        {
+            "push": {
+                "sinks": [
+                    {
+                        "driver": "rl_insight.client.push.sinks.logging:create_sink",
+                        "streams": ["trace"],
+                    }
+                ]
+            }
+        }
+    )
+    client = create_push_monitor_client(conf)
+    assert client is not None
+    try:
+        assert client.register_metrics(["worker:9000"], "native", None)
+    finally:
+        client.close()
 
 
 def test_factory_returns_none_without_sinks() -> None:

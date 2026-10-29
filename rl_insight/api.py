@@ -126,7 +126,7 @@ def init(
             backend == MonitorBackend.RAY
             and not str(monitor_conf.server.url).strip()
             and configured
-            and monitor_conf.get("task_options") is None
+            and monitor_conf.get("hub") is None
         ):
             logger.error(
                 "[rl-insight] RL-Insight server URL is required; set RL_INSIGHT_SERVER_URL or server.url in init config."

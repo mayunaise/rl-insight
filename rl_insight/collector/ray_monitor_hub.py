@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import replace
 from typing import Any, TYPE_CHECKING
 
@@ -33,7 +34,7 @@ from ..utils import (
     start_metrics_http_server,
     update_prometheus_config,
 )
-from ..utils.constants import MonitorRayActor
+from ..utils.constants import MonitorEnv, MonitorRayActor
 from ..utils.protocol import RunContext, RunError, require_version
 from .base import MonitorCollector
 
@@ -74,12 +75,28 @@ class MonitorHubActor(MonitorCollector):
         Args:
             conf: Merged monitor config with ``server`` and ``prometheus`` sections.
         """
-        if conf.get("task_options") is not None:
+        startup = conf.get("hub", {})
+        self._conf = OmegaConf.create(OmegaConf.to_container(conf, resolve=False))
+        self._conf.pop("hub", None)
+        if startup.get("services") is not None:
             from ..server.services import SDKServices
 
-            self._sdk_services = SDKServices(conf.task_options)
-            conf, self._delegate = self._sdk_services.prepare_collector(conf)
-        self._conf = conf
+            self._sdk_services = SDKServices(startup.services)
+            self._conf = OmegaConf.merge(self._conf, self._sdk_services.sdk_config)
+            os.environ[MonitorEnv.SERVER_URL] = str(self._conf.server.url)
+        if startup.get("output") is not None:
+            from ..client import create_monitor_client
+
+            self._delegate = create_monitor_client(startup.output)
+            if self._delegate is None:
+                raise RuntimeError("No monitoring client was created for task outputs")
+            self._conf.server.metrics_endpoint = getattr(
+                self._delegate, "metrics_endpoint", ""
+            )
+        if startup:
+            self._conf.config_signature = startup.signature
+            self._conf.close_timeout = startup.close_timeout
+        conf = self._conf
         self._events_applied = 0
         self._node_ip = ray.util.get_node_ip_address()
         self._metrics_port = 0

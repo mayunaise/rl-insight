@@ -17,22 +17,32 @@
 from __future__ import annotations
 
 import atexit
-import logging
 import json
+import logging
+import os
+import subprocess
+import sys
+import time
+from uuid import uuid4
 from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
+import psutil
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from ...utils.constants import MonitorEventKind
-from ...server.catalog import SERVICE_NAMES
-from ...server.network import normalize_http_headers, normalize_http_url
 from ...utils.protocol import metric_labels
 from ..base import MonitorClient
 from .driver import build_sink, parse_sink_driver
 from .poller import PrometheusPoller, set_active_registry
 from .sinks.base import PushSink
 from .tags import collect_sink_tags
+
+if TYPE_CHECKING:
+    from ...server.runtime import StartedStack
+    from ...server.services import ServerServiceManager
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -92,7 +102,13 @@ class PushMonitorClient(MonitorClient):
         trace_prefix: str,
         bound: list[_BoundSink],
         poller: PrometheusPoller | None,
+        *,
+        conf: DictConfig,
     ) -> None:
+        self.conf = conf
+        self._services: ServerServiceManager | None = None
+        self._stack: StartedStack | None = None
+        self._watcher: subprocess.Popen[bytes] | None = None
         self._metric_prefix = metric_prefix
         self._trace_prefix = trace_prefix
         self._bound = bound
@@ -125,7 +141,61 @@ class PushMonitorClient(MonitorClient):
         registry = get_active_registry()
         if registry is not None:
             registry.set_targets(addresses, labels, job_name=job)
+        # This output owns the targets even when native metric collection is disabled.
         return True
+
+    def _start_services(self) -> None:
+        """Start a native Agent only after the output has bound its metrics port."""
+        from ...server.dependencies import prometheus_agent_enabled
+
+        endpoint = self.metrics_endpoint
+        if (
+            OmegaConf.select(self.conf, "server.metrics_port") is not None
+            and not endpoint
+        ):
+            raise ValueError("Configured Prometheus metrics endpoint did not start")
+        if endpoint:
+            OmegaConf.update(
+                self.conf, "server.metrics_endpoint", endpoint, force_add=True
+            )
+        if prometheus_agent_enabled(self.conf):
+            from ...server.services import ServerServiceManager
+
+            self.conf.prometheus.metrics_endpoint = endpoint
+            self.conf.server.metrics_port = urlsplit(endpoint).port
+            self._services = ServerServiceManager(self.conf)
+            self._stack = self._services.start(
+                detach=True, attach_logs=False, auto_port=True
+            )
+            if self._stack is None:
+                raise RuntimeError("Prometheus Agent runtime is already in use")
+            owner = psutil.Process()
+            metadata = {
+                "owner": [owner.pid, owner.create_time()],
+                "services": [
+                    [
+                        service.process.pid,
+                        psutil.Process(service.process.pid).create_time(),
+                    ]
+                    for service in self._stack.services
+                ],
+                "state_file": str(self._stack.state_file),
+            }
+            with (Path(self.conf.server.log_dir) / "watchdog.log").open("ab") as log:
+                self._watcher = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        "from rl_insight.client.push.client import _watch_push_services;import sys;_watch_push_services(sys.argv[1])",
+                        json.dumps(metadata),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=os.name == "posix",
+                )
+        if endpoint:
+            logger.warning("[rl-insight] SDK metrics ready: %s", endpoint)
 
     # -- routing -----------------------------------------------------------
     @staticmethod
@@ -226,9 +296,20 @@ class PushMonitorClient(MonitorClient):
             except Exception:
                 logger.debug("[rl-insight] sink close failed", exc_info=True)
         try:
+            if self._stack is not None and self._services is not None:
+                self._services.stop()
+        except Exception:
+            logger.warning("[rl-insight] Agent cleanup failed", exc_info=True)
+        finally:
+            if self._watcher is not None:
+                try:
+                    self._watcher.terminate()
+                    self._watcher.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    logger.debug(
+                        "[rl-insight] Agent watcher cleanup failed", exc_info=True
+                    )
             atexit.unregister(self.close)
-        except Exception:  # noqa: BLE001 - pragma: no cover
-            pass
 
 
 def _streams(sink_conf: Any) -> frozenset[str]:
@@ -361,12 +442,27 @@ def create_push_monitor_client(conf: DictConfig) -> PushMonitorClient | None:
     Returns ``None`` (monitoring off) when there is no ``push`` section, no
     usable sink, or every driver fails to load.
     """
+    if conf.get("task_config") is not None:
+        from ...utils.constants import MonitorPaths
+        from ...utils.monitor_config_loader import expand_task_config
+
+        conf = expand_task_config(
+            {"rl_insight": conf.task_config},
+            runtime_dir=MonitorPaths.STATE_ROOT / "tasks" / uuid4().hex,
+        )
     push_conf = OmegaConf.select(conf, "push")
     sink_confs = OmegaConf.select(push_conf, "sinks") if push_conf is not None else None
     if not sink_confs:
         logger.warning("[rl-insight] push backend selected but no sinks configured.")
         return None
 
+    if push_conf.get("validate_sinks", False):
+        sink_confs = OmegaConf.create(
+            _task_sinks(
+                OmegaConf.to_container(sink_confs, resolve=True),
+                metric_labels(conf.get("labels", {})),
+            )
+        )
     bound: list[_BoundSink] = []
     for sink_conf in sink_confs:
         sink = build_sink(sink_conf)
@@ -393,6 +489,7 @@ def create_push_monitor_client(conf: DictConfig) -> PushMonitorClient | None:
     rules = OmegaConf.select(push_conf, "rollout.metrics")
     interval = _parse_interval(push_conf)
     poller: PrometheusPoller | None = None
+    client: PushMonitorClient
     target_registries = [
         b.sink.target_registry for b in bound if hasattr(b.sink, "target_registry")
     ]
@@ -418,14 +515,15 @@ def create_push_monitor_client(conf: DictConfig) -> PushMonitorClient | None:
     else:
         set_active_registry(None)
 
-    client = PushMonitorClient(metric_prefix, trace_prefix, bound, poller)
-    if poller is not None:
-        poller.start()
-    return client
-
-
-_PROMETHEUS_SINK = "rl_insight.client.push.sinks.prometheus:create_sink"
-_OTLP_SINK = "rl_insight.client.push.sinks.otlp:create_sink"
+    client = PushMonitorClient(metric_prefix, trace_prefix, bound, poller, conf=conf)
+    try:
+        client._start_services()
+        if poller is not None:
+            poller.start()
+        return client
+    except BaseException:
+        client.close()
+        raise
 
 
 def _task_sinks(raw: Any, labels: dict[str, str]) -> list[dict[str, Any]]:
@@ -461,96 +559,43 @@ def _task_sinks(raw: Any, labels: dict[str, str]) -> list[dict[str, Any]]:
     return raw
 
 
-def configure_outputs(conf: DictConfig, options: dict[str, Any]) -> DictConfig:
-    """Translate external output options into existing push sinks and services."""
-    labels = dict(conf.labels)
-    advanced = "sinks" in options
-    if advanced and any(key in options for key in ("metrics", "traces")):
-        raise ValueError("Choose sinks or simplified metrics/traces configuration")
-    sinks = _task_sinks(options["sinks"], labels) if advanced else []
-    metrics = options.get("metrics", {})
-    traces = options.get("traces", {})
-    pull = metrics.get("pull", False)
-    destinations = metrics.get("remote_write", [])
-    if "remote_write" in metrics and (
-        not isinstance(destinations, list) or not destinations
-    ):
-        raise ValueError("remote_write requires a non-empty destination list")
-    for destination in destinations:
-        destination["url"] = normalize_http_url(
-            destination.get("url"), "metrics.remote_write.url"
-        )
-        if "headers" in destination:
-            destination["headers"] = normalize_http_headers(
-                destination["headers"], "metrics.remote_write.headers"
+def _watch_push_services(raw):
+    """Reap SDK-owned task services if their owner is killed without running finish."""
+    metadata = json.loads(raw)
+
+    def process(identity):
+        try:
+            p = psutil.Process(identity[0])
+            return (
+                p
+                if p.create_time() == identity[1]
+                and p.is_running()
+                and p.status() != psutil.STATUS_ZOMBIE
+                else None
             )
-    if pull and destinations:
-        raise ValueError("Choose metrics.pull or metrics.remote_write")
-    has_metrics = (
-        pull
-        or bool(destinations)
-        or any(s["driver"] == _PROMETHEUS_SINK for s in sinks)
-    )
-    if "metrics" in options and not has_metrics:
-        raise ValueError("metrics requires pull=true or remote_write destinations")
-    if "traces" in options:
-        traces["endpoint"] = normalize_http_url(
-            traces.get("endpoint"), "traces.endpoint"
-        )
-        traces["headers"] = normalize_http_headers(
-            traces.get("headers"), "traces.headers"
-        )
-    if has_metrics:
-        conf.server.metrics_port = conf.server.get("metrics_port", conf.server.port)
-    if "port" in metrics:
-        if type(metrics["port"]) is not int or not 0 <= metrics["port"] <= 65535:
-            raise ValueError("metrics.port must be an integer from 0 to 65535")
-        conf.server.metrics_port = metrics["port"]
-    conf.server.backend = "push"
-    conf.server.enable = False
-    if conf.server.url:
-        raise ValueError(
-            "server.url connects bundled monitoring; external outputs use sink endpoints"
-        )
-    for name in SERVICE_NAMES:
-        conf[name].enable = False
-    conf.prometheus.prometheus_port = 0
-    # Public control fields are consumed above; other declared metric options
-    # already use the existing Prometheus service config names.
-    conf.prometheus = OmegaConf.merge(
-        conf.prometheus,
-        {
-            key: value
-            for key, value in metrics.items()
-            if key not in {"pull", "port", "remote_write"}
-        },
-    )
-    if has_metrics and not advanced:
-        sinks.append(
-            {
-                "name": "prometheus",
-                "driver": _PROMETHEUS_SINK,
-                "streams": ["metric"],
-                "labels": labels,
-            }
-        )
-    for sink in sinks:
-        if sink["driver"] == _PROMETHEUS_SINK:
-            sink.setdefault("port", conf.server.metrics_port)
-            sink.setdefault("advertise_host", "${oc.env:POD_IP,null}")
-            sink.setdefault("drain_seconds", conf.server.endpoint_ttl)
-    if destinations:
-        conf.prometheus.remote_write = destinations
-        conf.prometheus.external_labels = labels
-    if traces:
-        sinks.append(
-            {
-                "name": "tempo",
-                "driver": _OTLP_SINK,
-                "streams": ["trace"],
-                **traces,
-                "labels": labels,
-            }
-        )
-    conf.push = {"metric_prefix": "rl_insight_monitor_", "sinks": sinks}
-    return conf
+        except psutil.Error:
+            return None
+
+    while process(metadata["owner"]) is not None:
+        time.sleep(0.5)
+    children = [
+        p for identity in metadata["services"] if (p := process(identity)) is not None
+    ]
+    for p in reversed(children):
+        try:
+            p.terminate()
+        except psutil.Error:
+            pass
+    _, pending = psutil.wait_procs(children, timeout=10)
+    for p in pending:
+        try:
+            p.kill()
+        except psutil.Error:
+            pass
+    path = Path(metadata["state_file"])
+    if path.exists():
+        state = json.loads(path.read_text())
+        if {s["pid"] for s in state.get("services", [])} == {
+            s[0] for s in metadata["services"]
+        }:
+            path.unlink(missing_ok=True)

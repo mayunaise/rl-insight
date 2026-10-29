@@ -210,7 +210,9 @@ def test_training_config_resolves_only_monitoring_fields(tmp_path, monkeypatch):
     ],
 )
 def test_invalid_task_outputs_fail_before_training(tmp_path, options):
+    from rl_insight.client import create_monitor_client
     from rl_insight.utils.monitor_config_loader import expand_task_config
 
     with pytest.raises(ValueError):
-        expand_task_config({"rl_insight": options}, runtime_dir=tmp_path)
+        conf = expand_task_config({"rl_insight": options}, runtime_dir=tmp_path)
+        create_monitor_client(conf)

@@ -77,13 +77,19 @@ def current_job_config() -> DictConfig | None:
 
 
 def register_job_metrics(addresses, job, labels) -> bool:
-    conf = current_job_config()
-    if conf is None or conf.get("collector_backend", "ray") == "ray":
+    if not ray.is_initialized():
         return False
-    hub = ray.get_actor(_current_job_actor_name(), namespace=MonitorRayActor.NAMESPACE)
+    try:
+        hub = ray.get_actor(
+            _current_job_actor_name(), namespace=MonitorRayActor.NAMESPACE
+        )
+    except ValueError:
+        return False
+    conf = _resolved_job_config(hub)
     _initialize_hub_connection(hub, timeout=15, conf=conf)
-    ray.get(hub.register_native_metrics.remote(addresses, job, labels), timeout=15)
-    return True
+    return bool(
+        ray.get(hub.register_native_metrics.remote(addresses, job, labels), timeout=15)
+    )
 
 
 def initialize_current_job_connection() -> RunContext | None:
@@ -128,11 +134,7 @@ def _initialize_hub_connection(
         )
         logger.error(message)
         raise RunError(message, 502) from exc
-    if (
-        context is None
-        and conf is not None
-        and conf.get("collector_backend", "ray") != "ray"
-    ):
+    if context is None and conf is not None:
         require_version(conf.get("sdk_version"), "Ray Hub")
         return None
     if not isinstance(context, RunContext):
@@ -156,7 +158,8 @@ def get_or_create_monitor_hub(conf: DictConfig, *, create: bool = True) -> Any:
         "get_if_exists": True,
     }
     env_vars = {}
-    if conf.get("task_options") is not None:
+    startup = conf.get("hub")
+    if startup is not None:
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
         head = next(
@@ -167,7 +170,7 @@ def get_or_create_monitor_hub(conf: DictConfig, *, create: bool = True) -> Any:
         actor_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
             head["NodeID"], soft=False
         )
-        if conf.get("retain_services", False):
+        if startup.get("retain_services", False):
             env_vars["RAY_kill_child_processes_on_worker_exit"] = "false"
     server_url = str(conf.server.url).strip()
     if server_url:
@@ -176,7 +179,7 @@ def get_or_create_monitor_hub(conf: DictConfig, *, create: bool = True) -> Any:
         actor_options["runtime_env"] = {"env_vars": env_vars}
 
     actor_cls = cast(Any, MonitorHubActor)
-    token = uuid4().hex if conf.get("task_options") is not None else ""
+    token = uuid4().hex if startup is not None else ""
     handle = (
         actor_cls.options(**actor_options).remote(conf, owner_token=token)
         if token
@@ -187,7 +190,7 @@ def get_or_create_monitor_hub(conf: DictConfig, *, create: bool = True) -> Any:
     return handle
 
 
-def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
+def create_ray_monitor_client(conf: DictConfig) -> MonitorClient | None:
     """Build a client that talks to ``MonitorHubActor`` over Ray.
 
     Args:
@@ -197,16 +200,27 @@ def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
         Client instance, or ``None`` if Ray is not initialized (monitoring disabled).
     """
     if not ray.is_initialized():
+        startup = conf.get("hub")
+        if startup is not None:
+            if startup.get("output") is None:
+                raise RuntimeError(
+                    "Bundled SDK monitoring requires an initialized Ray runtime"
+                )
+            from .base import create_monitor_client
+
+            client = create_monitor_client(startup.output)
+            if client is None:
+                raise RuntimeError("No monitoring client was created for task outputs")
+            return client
         logger.warning("[rl-insight] Ray is not initialized; monitoring is disabled.")
         return None
 
-    if str(conf.server.url).strip() and conf.get("task_options") is None:
+    startup = conf.get("hub")
+    if str(conf.server.url).strip() and startup is None:
         initialize_server_connection(str(conf.server.url))
     handle = get_or_create_monitor_hub(conf, create=bool(conf.get("run_metadata")))
     resolved = _resolved_job_config(handle) if handle is not None else conf
-    if conf.get("task_options") is not None and conf.get(
-        "task_signature"
-    ) != resolved.get("task_signature"):
+    if startup is not None and startup.signature != resolved.get("config_signature"):
         raise ValueError(
             "Worker monitoring configuration conflicts with the existing job"
         )
@@ -360,13 +374,10 @@ class MonitorRayClient(MonitorClient):
             try:
                 ray.get(
                     self._actor.close_services.remote(self._owner_token),
-                    timeout=30 + float(self.conf.get("endpoint_ttl", 0)),
+                    timeout=float(self.conf.get("close_timeout", 30)),
                 )
             finally:
                 _owned_hubs.pop(_current_job_actor_name(), None)
                 self._owner_token = ""
-        elif (
-            self.conf.get("collector_backend", "ray") != "ray"
-            and self._actor is not None
-        ):
+        elif self._initialized and self._actor is not None:
             ray.get(self._actor.get_context.remote(), timeout=15)

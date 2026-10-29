@@ -46,6 +46,15 @@ def test_create_ray_monitor_client_should_return_none_when_ray_is_not_initialize
     assert client_module.create_ray_monitor_client(OmegaConf.create({})) is None
 
 
+def test_configured_direct_output_cannot_silently_disable(monkeypatch):
+    from rl_insight.utils.monitor_config_loader import load_monitor_config
+
+    monkeypatch.setattr(client_module.ray, "is_initialized", lambda: False)
+    conf = load_monitor_config({"sinks": [{"driver": "missing_module_xyz:factory"}]})
+    with pytest.raises(RuntimeError, match="No monitoring client"):
+        client_module.create_ray_monitor_client(conf)
+
+
 def test_get_or_create_monitor_hub_should_reuse_actor_when_actor_exists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -140,7 +149,7 @@ def test_initialize_should_retry_config_after_transient_failure(monkeypatch):
             reads += 1
             if reads == 1:
                 raise failure
-            return {"collector_backend": "push", "sdk_version": __version__}
+            return {"sdk_version": __version__}
         return None
 
     monkeypatch.setattr(client_module.ray, "get", get)
@@ -148,5 +157,5 @@ def test_initialize_should_retry_config_after_transient_failure(monkeypatch):
     with pytest.raises(type(failure)):
         client.initialize()
     assert client.initialize()
-    assert client.conf.collector_backend == "push"
+    assert client.conf.sdk_version == __version__
     assert client.get_context() is None

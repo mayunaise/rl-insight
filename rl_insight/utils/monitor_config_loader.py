@@ -28,7 +28,7 @@ from omegaconf import DictConfig, OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
 from ..server.catalog import SERVICE_NAMES
-from ..server.network import normalize_http_url
+from ..server.network import normalize_http_headers, normalize_http_url
 
 from .constants import MonitorBackend, MonitorDefaults, MonitorEnv, MonitorPaths
 from .protocol import metric_labels
@@ -251,15 +251,29 @@ def _load_task_config(node: DictConfig) -> DictConfig:
         raise ValueError("Server URL environment conflicts with training configuration")
     if os.environ.get(MonitorEnv.SERVER_BACKEND):
         raise ValueError("Training configuration selects its own outputs")
+    hub = {
+        "signature": hashlib.sha256(
+            json.dumps(options, sort_keys=True).encode()
+        ).hexdigest(),
+        "retain_services": any(expanded[name].enable for name in SERVICE_NAMES),
+        "close_timeout": 30 + expanded.server.endpoint_ttl,
+    }
+    if expanded.server.backend == MonitorBackend.PUSH:
+        hub["output"] = {
+            "server": {"backend": MonitorBackend.PUSH},
+            "task_config": options,
+        }
+    else:
+        hub["services"] = options
     return OmegaConf.merge(
         _copy_defaults(),
         {
-            "task_options": options,
-            "task_signature": hashlib.sha256(
-                json.dumps(options, sort_keys=True).encode()
-            ).hexdigest(),
+            "server": {
+                "namespace": expanded.server.namespace,
+                "url": expanded.server.url,
+            },
             "labels": expanded.labels,
-            "retain_services": any(expanded[name].enable for name in SERVICE_NAMES),
+            "hub": hub,
         },
     )
 
@@ -314,7 +328,106 @@ def _expand_task_options(
     )
     conf.labels = metric_labels(options.get("labels", {}))
     if options.keys() & (_TASK_SELECTORS - {"enabled"}):
-        from ..client.push.client import configure_outputs
+        return _configure_outputs(conf, options)
+    return conf
 
-        return configure_outputs(conf, options)
+
+_PROMETHEUS_SINK = "rl_insight.client.push.sinks.prometheus:create_sink"
+_OTLP_SINK = "rl_insight.client.push.sinks.otlp:create_sink"
+
+
+def _configure_outputs(conf: DictConfig, options: dict[str, Any]) -> DictConfig:
+    """Project task output settings onto existing sink and service configuration."""
+    labels = dict(conf.labels)
+    advanced = "sinks" in options
+    if advanced and any(key in options for key in ("metrics", "traces")):
+        raise ValueError("Choose sinks or simplified metrics/traces configuration")
+    sinks = options["sinks"] if advanced else []
+    prometheus_sinks = [
+        sink
+        for sink in sinks
+        if ":".join(part.strip() for part in str(sink.get("driver", "")).split(":"))
+        == _PROMETHEUS_SINK
+    ]
+    metrics = options.get("metrics", {})
+    traces = options.get("traces", {})
+    pull = metrics.get("pull", False)
+    destinations = metrics.get("remote_write", [])
+    if "remote_write" in metrics and not destinations:
+        raise ValueError("remote_write requires a non-empty destination list")
+    for destination in destinations:
+        destination["url"] = normalize_http_url(
+            destination.get("url"), "metrics.remote_write.url"
+        )
+        if "headers" in destination:
+            destination["headers"] = normalize_http_headers(
+                destination["headers"], "metrics.remote_write.headers"
+            )
+    if pull and destinations:
+        raise ValueError("Choose metrics.pull or metrics.remote_write")
+    has_metrics = pull or bool(destinations) or bool(prometheus_sinks)
+    if "metrics" in options and not has_metrics:
+        raise ValueError("metrics requires pull=true or remote_write destinations")
+    if "traces" in options:
+        traces["endpoint"] = normalize_http_url(
+            traces.get("endpoint"), "traces.endpoint"
+        )
+        traces["headers"] = normalize_http_headers(
+            traces.get("headers"), "traces.headers"
+        )
+    if has_metrics:
+        conf.server.metrics_port = conf.server.port
+    if "port" in metrics:
+        if type(metrics["port"]) is not int or not 0 <= metrics["port"] <= 65535:
+            raise ValueError("metrics.port must be an integer from 0 to 65535")
+        conf.server.metrics_port = metrics["port"]
+    conf.server.backend = MonitorBackend.PUSH
+    conf.server.enable = False
+    if conf.server.url:
+        raise ValueError(
+            "server.url connects bundled monitoring; external outputs use sink endpoints"
+        )
+    for name in SERVICE_NAMES:
+        conf[name].enable = False
+    conf.prometheus.prometheus_port = 0
+    conf.prometheus = OmegaConf.merge(
+        conf.prometheus,
+        {
+            key: value
+            for key, value in metrics.items()
+            if key not in {"pull", "port", "remote_write"}
+        },
+    )
+    if has_metrics and not advanced:
+        prometheus_sinks = [
+            {
+                "name": "prometheus",
+                "driver": _PROMETHEUS_SINK,
+                "streams": ["metric"],
+                "labels": labels,
+            }
+        ]
+        sinks.extend(prometheus_sinks)
+    for sink in prometheus_sinks:
+        sink.setdefault("port", conf.server.metrics_port)
+        sink.setdefault("advertise_host", "${oc.env:POD_IP,null}")
+        sink.setdefault("drain_seconds", conf.server.endpoint_ttl)
+    if destinations:
+        conf.prometheus.remote_write = destinations
+        conf.prometheus.external_labels = labels
+    if traces:
+        sinks.append(
+            {
+                "name": "tempo",
+                "driver": _OTLP_SINK,
+                "streams": ["trace"],
+                **traces,
+                "labels": labels,
+            }
+        )
+    conf.push = {
+        "metric_prefix": "rl_insight_monitor_",
+        "validate_sinks": True,
+        "sinks": sinks,
+    }
     return conf

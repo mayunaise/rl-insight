@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import logging
-import sys
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
@@ -84,68 +83,15 @@ def create_monitor_client(conf: DictConfig) -> MonitorClient | None:
     """
     if conf.get("enabled") is False:
         return None
-    owner = None
-    client = None
-    ray = sys.modules.get("ray")
-    try:
-        if conf.get("task_options") is not None and not (ray and ray.is_initialized()):
-            from ..server.services import SDKServices
-            from ..utils.monitor_config_loader import load_monitor_config
+    backend_type = str(OmegaConf.select(conf, "server.backend") or "").strip()
+    if not backend_type:
+        raise ValueError("monitor config server.backend is required")
 
-            owner = SDKServices(conf.task_options)
-            conf = OmegaConf.merge(
-                load_monitor_config(owner.sdk_config),
-                {"run_metadata": conf.get("run_metadata", {})},
-            )
-        backend_type = str(OmegaConf.select(conf, "server.backend") or "").strip()
-        if not backend_type:
-            raise ValueError("monitor config server.backend is required")
-        factory = MONITOR_CLIENT_REGISTRY.get(backend_type)
-        if factory is None:
-            supported = ", ".join(sorted(MONITOR_CLIENT_REGISTRY)) or "(none installed)"
-            raise ValueError(
-                f"Unsupported monitor backend {backend_type!r}; supported: {supported}"
-            )
-        client = factory(conf)
-        if owner is not None:
-            if client is None:
-                raise RuntimeError("No monitoring client was created for task outputs")
-            endpoint = getattr(client, "metrics_endpoint", "")
-            owner.start_forwarder(endpoint)
-            conf.server.metrics_endpoint = endpoint
-            return _OwnedClient(client, owner, conf)
-        return client
-    except BaseException:
-        try:
-            if client is not None:
-                client.close()
-        finally:
-            if owner is not None:
-                owner.close(failed=True)
-        raise
+    factory = MONITOR_CLIENT_REGISTRY.get(backend_type)
+    if factory is None:
+        supported = ", ".join(sorted(MONITOR_CLIENT_REGISTRY)) or "(none installed)"
+        raise ValueError(
+            f"Unsupported monitor backend {backend_type!r}; supported: {supported}"
+        )
 
-
-class _OwnedClient(MonitorClient):
-    """Keep a client's service lifetime behind the same client interface."""
-
-    def __init__(self, client, owner, conf):
-        self._client, self._owner, self.conf = client, owner, conf
-
-    @property
-    def ready(self):
-        return self._client.ready
-
-    def apply_event(self, event):
-        self._client.apply_event(event)
-
-    def get_context(self):
-        return self._client.get_context()
-
-    def register_metrics(self, addresses, job, labels):
-        return self._client.register_metrics(addresses, job, labels)
-
-    def close(self):
-        try:
-            self._client.close()
-        finally:
-            self._owner.close()
+    return factory(conf)

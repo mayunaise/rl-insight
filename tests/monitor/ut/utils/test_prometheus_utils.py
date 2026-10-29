@@ -298,9 +298,7 @@ def test_native_registration_retries_transient_ray_failures(monkeypatch):
     monkeypatch.setattr(prometheus_module, "_bootstrap_push_registry", lambda: None)
     monkeypatch.setattr(poller, "get_active_registry", lambda: None)
     monkeypatch.setattr(client, "initialize_current_job_connection", lambda: None)
-    monkeypatch.setattr(
-        client, "current_job_config", lambda: {"collector_backend": "push"}
-    )
+    monkeypatch.setattr(client, "current_job_config", lambda: {"sdk_version": "0.4.0"})
     monkeypatch.setattr(prometheus_module.time, "sleep", lambda seconds: None)
     attempts = 0
 

@@ -73,9 +73,7 @@ def _wait_for_context() -> None:
             if context is None:
                 context = initialize_current_job_connection()
             conf = current_job_config() if context is None else None
-            if context or (
-                conf is not None and conf.get("collector_backend", "ray") != "ray"
-            ):
+            if context is not None or conf is not None:
                 flush_pending_targets(context)
         except (GetTimeoutError, ActorUnavailableError):
             pass  # Keep pending targets while their Hub is temporarily unavailable.
