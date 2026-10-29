@@ -20,9 +20,10 @@ import logging
 import threading
 from collections import deque
 from typing import Any, cast
+from uuid import uuid4
 
 import ray
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from .. import __version__
 from ..collector.ray_monitor_hub import MonitorHubActor
@@ -49,6 +50,42 @@ def _current_job_actor_name() -> str:
     return f"{MonitorRayActor.NAME}_{job_id}"
 
 
+_owned_hubs: dict[str, str] = {}
+
+
+def _resolved_job_config(hub):
+    value = ray.get(hub.get_monitor_config.remote(), timeout=90)
+    if not isinstance(value, dict):
+        raise RunError("Ray Hub returned invalid monitoring configuration", 502)
+    return OmegaConf.create(value)
+
+
+def current_job_config() -> DictConfig | None:
+    """Read an existing job's resolved configuration without creating services."""
+    if not ray.is_initialized():
+        return None
+    try:
+        hub = ray.get_actor(
+            _current_job_actor_name(), namespace=MonitorRayActor.NAMESPACE
+        )
+    except ValueError:
+        return None
+    try:
+        return _resolved_job_config(hub)
+    except (ray.exceptions.GetTimeoutError, ray.exceptions.ActorUnavailableError):
+        return None
+
+
+def register_job_metrics(addresses, job, labels) -> bool:
+    conf = current_job_config()
+    if conf is None or conf.get("collector_backend", "ray") == "ray":
+        return False
+    hub = ray.get_actor(_current_job_actor_name(), namespace=MonitorRayActor.NAMESPACE)
+    _initialize_hub_connection(hub, timeout=15, conf=conf)
+    ray.get(hub.register_native_metrics.remote(addresses, job, labels), timeout=15)
+    return True
+
+
 def initialize_current_job_connection() -> RunContext | None:
     """Initialize native collection against an existing Hub, without creating one."""
     if not ray.is_initialized():
@@ -60,12 +97,15 @@ def initialize_current_job_connection() -> RunContext | None:
     except ValueError:
         return None
     try:
-        return _initialize_hub_connection(hub, timeout=2)
+        conf = _resolved_job_config(hub)
+        return _initialize_hub_connection(hub, timeout=2, conf=conf)
     except (ray.exceptions.GetTimeoutError, ray.exceptions.ActorUnavailableError):
         return None
 
 
-def _initialize_hub_connection(hub: Any, *, timeout: float) -> RunContext:
+def _initialize_hub_connection(
+    hub: Any, *, timeout: float, conf: DictConfig | None = None
+) -> RunContext | None:
     if not hasattr(hub, "connect"):
         require_version(None, "Ray Hub (initialization API unavailable)")
     try:
@@ -88,6 +128,13 @@ def _initialize_hub_connection(hub: Any, *, timeout: float) -> RunContext:
         )
         logger.error(message)
         raise RunError(message, 502) from exc
+    if (
+        context is None
+        and conf is not None
+        and conf.get("collector_backend", "ray") != "ray"
+    ):
+        require_version(conf.get("sdk_version"), "Ray Hub")
+        return None
     if not isinstance(context, RunContext):
         raise RunError("Ray Hub returned an invalid Context", 502)
     require_version(getattr(context, "version", None), "Ray Hub")
@@ -108,13 +155,36 @@ def get_or_create_monitor_hub(conf: DictConfig, *, create: bool = True) -> Any:
         "namespace": namespace,
         "get_if_exists": True,
     }
+    env_vars = {}
+    if conf.get("task_options") is not None:
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        head = next(
+            node
+            for node in ray.nodes()
+            if node["Alive"] and node["Resources"].get("node:__internal_head__")
+        )
+        actor_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+            head["NodeID"], soft=False
+        )
+        if conf.get("retain_services", False):
+            env_vars["RAY_kill_child_processes_on_worker_exit"] = "false"
     server_url = str(conf.server.url).strip()
     if server_url:
-        actor_options["runtime_env"] = {
-            "env_vars": {MonitorEnv.SERVER_URL: server_url},
-        }
+        env_vars[MonitorEnv.SERVER_URL] = server_url
+    if env_vars:
+        actor_options["runtime_env"] = {"env_vars": env_vars}
 
-    return cast(Any, MonitorHubActor).options(**actor_options).remote(conf)
+    actor_cls = cast(Any, MonitorHubActor)
+    token = uuid4().hex if conf.get("task_options") is not None else ""
+    handle = (
+        actor_cls.options(**actor_options).remote(conf, owner_token=token)
+        if token
+        else actor_cls.options(**actor_options).remote(conf)
+    )
+    if token:
+        _owned_hubs[actor_name] = token
+    return handle
 
 
 def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
@@ -130,9 +200,19 @@ def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
         logger.warning("[rl-insight] Ray is not initialized; monitoring is disabled.")
         return None
 
-    initialize_server_connection(str(conf.server.url))
+    if str(conf.server.url).strip() and conf.get("task_options") is None:
+        initialize_server_connection(str(conf.server.url))
     handle = get_or_create_monitor_hub(conf, create=bool(conf.get("run_metadata")))
-    client = MonitorRayClient(handle)
+    resolved = _resolved_job_config(handle) if handle is not None else conf
+    if conf.get("task_options") is not None and conf.get(
+        "task_signature"
+    ) != resolved.get("task_signature"):
+        raise ValueError(
+            "Worker monitoring configuration conflicts with the existing job"
+        )
+    client = MonitorRayClient(
+        handle, resolved, _owned_hubs.get(_current_job_actor_name(), "")
+    )
     if not client.initialize():
         client._start_waiter()
     return client
@@ -141,11 +221,15 @@ def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
 class MonitorRayClient(MonitorClient):
     """Ray facade: ``apply_event`` submits work to the hub without blocking on completion."""
 
-    def __init__(self, actor_handle: Any) -> None:
+    def __init__(
+        self, actor_handle: Any, conf: DictConfig | None = None, owner_token: str = ""
+    ) -> None:
         """
         Args:
             actor_handle: Return value of ``get_or_create_monitor_hub``.
         """
+        self.conf = conf if conf is not None else OmegaConf.create({})
+        self._owner_token = owner_token
         self._actor = actor_handle
         self._actor_name = _current_job_actor_name() if actor_handle is None else ""
         self._pending: deque[dict[str, Any]] = deque()
@@ -174,18 +258,26 @@ class MonitorRayClient(MonitorClient):
                 return True
             if self._actor is None:
                 try:
-                    self._actor = ray.get_actor(
+                    actor = ray.get_actor(
                         self._actor_name, namespace=MonitorRayActor.NAMESPACE
                     )
                 except ValueError:
                     return False
+                self.conf = _resolved_job_config(actor)
+                self._actor = actor
             try:
-                _initialize_hub_connection(self._actor, timeout=self._timeout)
+                _initialize_hub_connection(
+                    self._actor, timeout=self._timeout, conf=self.conf
+                )
             except RunError as exc:
                 self._compatibility_error = exc
                 raise
             self._initialized = True
             return True
+
+    @property
+    def ready(self) -> bool:
+        return self._initialized
 
     def get_context(self) -> RunContext | None:
         if self._compatibility_error is not None:
@@ -264,3 +356,17 @@ class MonitorRayClient(MonitorClient):
                         len(self._pending),
                     )
                     self._pending.clear()
+        if self._owner_token:
+            try:
+                ray.get(
+                    self._actor.close_services.remote(self._owner_token),
+                    timeout=30 + float(self.conf.get("endpoint_ttl", 0)),
+                )
+            finally:
+                _owned_hubs.pop(_current_job_actor_name(), None)
+                self._owner_token = ""
+        elif (
+            self.conf.get("collector_backend", "ray") != "ray"
+            and self._actor is not None
+        ):
+            ray.get(self._actor.get_context.remote(), timeout=15)

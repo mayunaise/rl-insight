@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -58,6 +59,26 @@ def require_version(value: Any, component: str) -> None:
         )
         logger.error(message)
         raise InvalidVersionError(message, 409)
+
+
+def metric_labels(labels: Mapping[str, Any]) -> dict[str, str]:
+    """Validate reusable exporter labels before creating network resources."""
+    if not isinstance(labels, Mapping):
+        raise RunError("Endpoint labels must be an object")
+    for key, val in labels.items():
+        if (
+            not isinstance(key, str)
+            or not re.fullmatch(r"[a-zA-Z_][a-zA-Z_0-9]*", key)
+            or key.startswith("__")
+            or not isinstance(val, (str, int, float, bool))
+        ):
+            raise RunError("Invalid endpoint label")
+    if any(
+        key in labels
+        for key in ("endpoint_id", "component", "exported_job", "exported_instance")
+    ):
+        raise RunError("Reserved endpoint label")
+    return {k: str(v) for k, v in labels.items()}
 
 
 @dataclass(frozen=True)

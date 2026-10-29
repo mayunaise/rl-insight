@@ -55,9 +55,12 @@ _pending_probe: threading.Thread | None = None
 def _wait_for_context() -> None:
     """Retry pending native targets for the lifetime of their worker process."""
     global _pending_probe
-    from ray.exceptions import RayActorError
+    from ray.exceptions import ActorUnavailableError, GetTimeoutError, RayActorError
 
-    from ..client.ray_monitor_client import initialize_current_job_connection
+    from ..client.ray_monitor_client import (
+        initialize_current_job_connection,
+        current_job_config,
+    )
 
     delay = 0.1
     context: RunContext | None = None
@@ -69,8 +72,13 @@ def _wait_for_context() -> None:
         try:
             if context is None:
                 context = initialize_current_job_connection()
-            if context:
+            conf = current_job_config() if context is None else None
+            if context or (
+                conf is not None and conf.get("collector_backend", "ray") != "ray"
+            ):
                 flush_pending_targets(context)
+        except (GetTimeoutError, ActorUnavailableError):
+            pass  # Keep pending targets while their Hub is temporarily unavailable.
         except (RunError, RayActorError) as exc:
             logger.error("[rl-insight] Cannot resolve native target identity: %s", exc)
             with _pending_lock:
@@ -79,6 +87,25 @@ def _wait_for_context() -> None:
             return
         time.sleep(delay)
         delay = min(delay * 2, 2)
+
+
+def _defer_targets(addresses, job, labels):
+    global _pending_probe
+    item = (
+        list(addresses),
+        job,
+        [dict(x) if x else None for x in labels] if labels else None,
+    )
+    with _pending_lock:
+        if item not in _pending_targets:
+            if len(_pending_targets) >= 64:
+                raise ValueError("Too many targets waiting for SDK initialization")
+            _pending_targets.append(item)
+        if _pending_probe is None or not _pending_probe.is_alive():
+            _pending_probe = threading.Thread(
+                target=_wait_for_context, name="insight-context", daemon=True
+            )
+            _pending_probe.start()
 
 
 def flush_pending_targets(context: RunContext | None) -> None:
@@ -294,7 +321,9 @@ def start_metrics_http_server(port: int, addr: str = "") -> None:
 class MetricRegistry:
     """Lazy registry of ``prometheus_client`` Counter/Gauge/Histogram objects keyed by metric name + label set."""
 
-    def __init__(self, namespace: str = "", subsystem: str = "") -> None:
+    def __init__(
+        self, namespace: str = "", subsystem: str = "", *, registry=None
+    ) -> None:
         """
         Args:
             namespace: Passed as Prometheus metric namespace (prefix segment).
@@ -302,6 +331,7 @@ class MetricRegistry:
         """
         self._namespace = namespace
         self._subsystem = subsystem
+        self._registry_options = {} if registry is None else {"registry": registry}
         self._counters: dict[tuple[str, tuple[str, ...]], object] = {}
         self._gauges: dict[tuple[str, tuple[str, ...]], object] = {}
         self._histograms: dict[tuple[str, tuple[str, ...]], object] = {}
@@ -318,6 +348,7 @@ class MetricRegistry:
                 labelnames=label_names,
                 namespace=self._namespace,
                 subsystem=self._subsystem,
+                **self._registry_options,
             )
         return self._counters[key]
 
@@ -333,6 +364,7 @@ class MetricRegistry:
                 labelnames=label_names,
                 namespace=self._namespace,
                 subsystem=self._subsystem,
+                **self._registry_options,
             )
         return self._gauges[key]
 
@@ -346,7 +378,7 @@ class MetricRegistry:
         """Return a cached or new ``Histogram`` for ``(name, label_names)`` with optional bucket boundaries."""
         key = (name, label_names)
         if key not in self._histograms:
-            kw = {}
+            kw: dict[str, Any] = {}
             if buckets is not None:
                 kw["buckets"] = buckets
             self._histograms[key] = Histogram(
@@ -356,6 +388,7 @@ class MetricRegistry:
                 namespace=self._namespace,
                 subsystem=self._subsystem,
                 **kw,
+                **self._registry_options,
             )
         return self._histograms[key]
 
@@ -496,13 +529,28 @@ def update_prometheus_config(
         # it in this process once; its poller owns the scrape target registry.
         registry = _bootstrap_push_registry()
     if registry is not None:
-        registry.set_targets(server_addresses, labels)
+        registry.set_targets(server_addresses, labels, job_name=job_name)
         logger.info(
             "[rl-insight] Registered %d push scrape targets in-process",
             len(server_addresses),
         )
         return
 
+    if context is None:
+        from ..client.ray_monitor_client import (
+            register_job_metrics,
+            initialize_current_job_connection,
+        )
+
+        from ray.exceptions import ActorUnavailableError, GetTimeoutError
+
+        try:
+            if register_job_metrics(server_addresses, job_name, labels):
+                return
+            context = initialize_current_job_connection()
+        except (GetTimeoutError, ActorUnavailableError):
+            _defer_targets(server_addresses, job_name, labels)
+            return
     initialized = True
     if context is None:
         from ..api import _client_initialized, get_context
@@ -515,6 +563,11 @@ def update_prometheus_config(
         else str(os.environ.get(MonitorEnv.SERVER_URL, "")).strip().rstrip("/")
     )
     if not base_url:
+        import ray
+
+        if ray.is_initialized():
+            _defer_targets(server_addresses, job_name, labels)
+            return
         logger.error(
             "[rl-insight] RL-Insight server URL is required; "
             "set %s to register Prometheus targets",
@@ -531,28 +584,8 @@ def update_prometheus_config(
             from ..client.ray_monitor_client import initialize_current_job_connection
 
             context = initialize_current_job_connection()
-            item: tuple[
-                list[str], str | None, list[Mapping[str, Any] | None] | None
-            ] = (
-                list(server_addresses),
-                job_name,
-                [dict(x) if x else None for x in labels] if labels else None,
-            )
             if context is None:
-                with _pending_lock:
-                    if item not in _pending_targets:
-                        if len(_pending_targets) >= 64:
-                            raise ValueError(
-                                "Too many targets waiting for Run initialization"
-                            )
-                        _pending_targets.append(item)
-                    if _pending_probe is None or not _pending_probe.is_alive():
-                        _pending_probe = threading.Thread(
-                            target=_wait_for_context,
-                            name="insight-context",
-                            daemon=True,
-                        )
-                        _pending_probe.start()
+                _defer_targets(server_addresses, job_name, labels)
                 return
 
     _register_targets(
@@ -572,7 +605,12 @@ def _register_targets(
     *,
     identity_in_metrics: bool = False,
 ) -> bool:
-    """Report success so deferred targets remain queued after a failed request."""
+    """Register managed targets or publish task-only targets with a renewable TTL."""
+    if context is None:
+        from ..client.ray_monitor_client import register_job_metrics
+
+        if register_job_metrics(server_addresses, job_name, labels):
+            return True
     base_url = (
         context.server_url
         if context

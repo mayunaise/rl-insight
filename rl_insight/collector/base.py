@@ -35,5 +35,5 @@ class MonitorCollector(ABC):
         """Handle one monitor event forwarded by a client."""
 
     @abstractmethod
-    def get_context(self) -> RunContext:
+    def get_context(self) -> RunContext | None:
         """Return the current identity, connection and status snapshot."""

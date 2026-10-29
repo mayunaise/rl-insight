@@ -73,6 +73,28 @@ class MissingDependencyError(RuntimeError):
         self.missing = list(missing)
 
 
+def task_collector_enabled(conf: DictConfig) -> bool:
+    return OmegaConf.select(
+        conf, "server.backend", default="local"
+    ) == "push" and not any(
+        bool(OmegaConf.select(conf, f"{name}.enable", default=True))
+        for name in ("prometheus", "tempo", "grafana")
+    )
+
+
+def prometheus_agent_enabled(conf: DictConfig) -> bool:
+    """A configured remote-write destination enables forwarding without a TSDB."""
+    return not bool(OmegaConf.select(conf, "prometheus.enable", default=True)) and bool(
+        OmegaConf.select(conf, "prometheus.remote_write")
+    )
+
+
+def service_enabled(conf: DictConfig, name: str) -> bool:
+    return bool(OmegaConf.select(conf, f"{name}.enable", default=True)) or (
+        name == "prometheus" and prometheus_agent_enabled(conf)
+    )
+
+
 def install_root_from_config(
     conf: DictConfig, install_dir: str | Path | None = None
 ) -> Path:
@@ -93,7 +115,7 @@ class DependencyManager:
         """Return services enabled by stack YAML."""
         services: list[str] = []
         for name in SERVICE_NAMES:
-            enabled = bool(OmegaConf.select(self.conf, f"{name}.enable", default=True))
+            enabled = service_enabled(self.conf, name)
             if enabled:
                 services.append(name)
         return services
@@ -103,7 +125,7 @@ class DependencyManager:
         manifest = self._read_manifest()
         statuses: list[ServiceStatus] = []
         for name in SERVICE_NAMES:
-            enabled = bool(OmegaConf.select(self.conf, f"{name}.enable", default=True))
+            enabled = service_enabled(self.conf, name)
             if not enabled:
                 statuses.append(
                     ServiceStatus(name=name, enabled=False, detail="disabled by config")
@@ -111,6 +133,9 @@ class DependencyManager:
                 continue
 
             min_version = _select_str(self.conf, f"{name}.min_version")
+            if name == "prometheus" and prometheus_agent_enabled(self.conf):
+                if not min_version or _version_tuple(min_version) < (2, 32, 0):
+                    min_version = "2.32.0"
             statuses.append(
                 self._resolve_status(
                     name=name,

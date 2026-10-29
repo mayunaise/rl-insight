@@ -286,3 +286,33 @@ def test_deferred_targets_drop_permanent_errors_and_keep_transient_failures(
     post.side_effect = prometheus_module.requests.ConnectionError("offline")
     prometheus_module.flush_pending_targets(context)
     assert prometheus_module._pending_targets == [item]
+
+
+def test_native_registration_retries_transient_ray_failures(monkeypatch):
+    from rl_insight.client import ray_monitor_client as client
+    from rl_insight.client.push import poller
+
+    error = client.ray.exceptions.GetTimeoutError()
+    monkeypatch.setattr(prometheus_module, "_pending_targets", [])
+    monkeypatch.setattr(prometheus_module, "_pending_probe", MagicMock())
+    monkeypatch.setattr(prometheus_module, "_bootstrap_push_registry", lambda: None)
+    monkeypatch.setattr(poller, "get_active_registry", lambda: None)
+    monkeypatch.setattr(client, "initialize_current_job_connection", lambda: None)
+    monkeypatch.setattr(
+        client, "current_job_config", lambda: {"collector_backend": "push"}
+    )
+    monkeypatch.setattr(prometheus_module.time, "sleep", lambda seconds: None)
+    attempts = 0
+
+    def register(*args):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise error
+        return True
+
+    monkeypatch.setattr(client, "register_job_metrics", register)
+    prometheus_module.update_prometheus_config(["worker:9000"], "native")
+    assert prometheus_module._pending_targets == [(["worker:9000"], "native", None)]
+    prometheus_module._wait_for_context()
+    assert not prometheus_module._pending_targets

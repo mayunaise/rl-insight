@@ -124,3 +124,29 @@ def test_apply_event_should_submit_without_waiting_when_hub_is_verified(
 
     actor.connect.remote.assert_called_once_with(__version__)
     actor.apply_event.remote.assert_called_once_with(event)
+
+
+def test_initialize_should_retry_config_after_transient_failure(monkeypatch):
+    failure = client_module.ray.exceptions.GetTimeoutError()
+    _patch_actor_name(monkeypatch)
+    actor = MagicMock()
+    actor.get_monitor_config.remote.return_value = "config"
+    monkeypatch.setattr(client_module.ray, "get_actor", lambda *a, **k: actor)
+    reads = 0
+
+    def get(reference, **kwargs):
+        nonlocal reads
+        if reference == "config":
+            reads += 1
+            if reads == 1:
+                raise failure
+            return {"collector_backend": "push", "sdk_version": __version__}
+        return None
+
+    monkeypatch.setattr(client_module.ray, "get", get)
+    client = client_module.MonitorRayClient(None)
+    with pytest.raises(type(failure)):
+        client.initialize()
+    assert client.initialize()
+    assert client.conf.collector_backend == "push"
+    assert client.get_context() is None

@@ -25,6 +25,8 @@ from typing import Any, Mapping
 
 from omegaconf import OmegaConf
 
+from ...utils.protocol import metric_labels
+
 MISSING = object()
 
 
@@ -87,3 +89,11 @@ def collect_env_tags(
             text = str(fmt).format(value=text)
         tags[str(tag)] = text
     return tags
+
+
+def collect_sink_tags(conf: Any) -> dict[str, str]:
+    """Configured task labels are authoritative over environment-derived tags."""
+    return {
+        **collect_env_tags(OmegaConf.select(conf, "tags_from_env")),
+        **metric_labels(dict(OmegaConf.select(conf, "labels") or {})),
+    }

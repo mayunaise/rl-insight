@@ -489,3 +489,17 @@ def test_init_without_config_should_use_backend_from_env(
 
     assert selected_backends == ["custom"]
     assert api._STATE.enabled is True
+
+
+def test_finish_keeps_training_success_when_owned_service_cleanup_fails(
+    recording_client,
+):
+    class UnavailableClient:
+        def close(self):
+            raise OSError("service process is unavailable")
+
+    api._STATE.client = UnavailableClient()
+    api.finish()
+    api.metric_gauge("after_finish", 9)
+    assert not api._STATE.enabled
+    assert recording_client.events == []

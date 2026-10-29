@@ -20,18 +20,23 @@ import argparse
 import logging
 import os
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Sequence
 
 import requests
 import uvicorn
-from fastapi import Body, FastAPI, Header, HTTPException, status
+from fastapi import Body, FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import Response
 from omegaconf import DictConfig, OmegaConf
 
 from .. import __version__
 from ..utils.constants import MonitorEnv, MonitorServer, PrometheusScrape
 from ..utils.monitor_config_loader import load_server_config_file
-from ..utils.prometheus_utils import PrometheusTarget, PrometheusTargetStore
+from ..utils.prometheus_utils import (
+    PrometheusTarget,
+    PrometheusTargetStore,
+)
 from ..utils.protocol import (
     SDK_VERSION_HEADER,
     InvalidVersionError,
@@ -39,6 +44,7 @@ from ..utils.protocol import (
     require_version,
 )
 from .network import local_addresses
+from .dependencies import task_collector_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +115,10 @@ def initialize_server_connection(base_url: str | None = None) -> dict[str, Any]:
 
 def create_app(conf: DictConfig) -> FastAPI:
     """Create the RL-Insight server application."""
+    if task_collector_enabled(conf):
+        from ..client.push.sinks.prometheus import create_task_collector
+
+        return create_task_collector(conf)
     app = FastAPI(title="RL-Insight server", version=__version__)
     store = PrometheusTargetStore.from_config(conf)
 
@@ -226,7 +236,33 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     conf = load_server_config_file(args.config)
     port = int(OmegaConf.select(conf, "server.port", default=18080))
-    uvicorn.run(create_app(conf), host=local_addresses()["bind"], port=port)
+    metrics_port = int(OmegaConf.select(conf, "server.metrics_port", default=port))
+    config = uvicorn.Config(None, host=local_addresses()["bind"], port=port)
+    with ExitStack() as listeners:
+        api_socket = listeners.enter_context(config.bind_socket())
+        conf.server.port = api_socket.getsockname()[1]
+        sockets = [api_socket]
+        if metrics_port != port or (
+            metrics_port == 0 and "metrics_port" in conf.server
+        ):
+            metrics_config = uvicorn.Config(None, host=config.host, port=metrics_port)
+            metrics_socket = listeners.enter_context(metrics_config.bind_socket())
+            conf.server.metrics_port = metrics_socket.getsockname()[1]
+            sockets.append(metrics_socket)
+        app = create_app(conf)
+        if len(sockets) == 2:
+
+            @app.middleware("http")
+            async def metrics_only(request: Request, call_next):
+                if request.scope["server"][1] == conf.server.metrics_port and not (
+                    request.method in {"GET", "HEAD"}
+                    and (request.url.path in {"/metrics", "/healthz"})
+                ):
+                    return Response(status_code=404)
+                return await call_next(request)
+
+        config.app = app
+        uvicorn.Server(config).run(sockets=sockets)
     return 0
 
 

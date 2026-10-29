@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import ray
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
+from .. import __version__
 from ..server.http_api import initialize_server_connection
 from ..server.network import format_host_port, service_url_from_server_url
 from ..utils import (
@@ -33,8 +34,12 @@ from ..utils import (
     update_prometheus_config,
 )
 from ..utils.constants import MonitorRayActor
-from ..utils.protocol import RunContext, require_version
+from ..utils.protocol import RunContext, RunError, require_version
 from .base import MonitorCollector
+
+if TYPE_CHECKING:
+    from ..server.services import SDKServices
+    from ..client.base import MonitorClient
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -51,12 +56,35 @@ class MonitorHubActor(MonitorCollector):
     On startup it registers its metrics endpoint with the RL-Insight server.
     """
 
-    def __init__(self, conf: DictConfig) -> None:
+    def __init__(self, conf: DictConfig, owner_token: str = "") -> None:
+        self._sdk_services: SDKServices | None = None
+        self._delegate: MonitorClient | None = None
+        self._owner_token = owner_token
+        try:
+            self._initialize(conf)
+        except BaseException:
+            if self._delegate is not None:
+                self._delegate.close()
+            if self._sdk_services is not None:
+                self._sdk_services.close(failed=True)
+            raise
+
+    def _initialize(self, conf: DictConfig) -> None:
         """
         Args:
             conf: Merged monitor config with ``server`` and ``prometheus`` sections.
         """
+        if conf.get("task_options") is not None:
+            from ..server.services import SDKServices
+
+            self._sdk_services = SDKServices(conf.task_options)
+            conf, self._delegate = self._sdk_services.prepare_collector(conf)
         self._conf = conf
+        self._events_applied = 0
+        self._node_ip = ray.util.get_node_ip_address()
+        self._metrics_port = 0
+        if self._delegate is not None:
+            return
 
         namespace = str(self._conf.server.namespace)
         metadata = conf.get("run_metadata", {})
@@ -109,7 +137,7 @@ class MonitorHubActor(MonitorCollector):
             self._metrics_port,
         )
 
-    def connect(self, client_version: str | None = None) -> RunContext:
+    def connect(self, client_version: str | None = None) -> RunContext | None:
         """Verify the connecting SDK once before it submits monitor events."""
         require_version(client_version, "Client")
         return self.get_context()
@@ -121,6 +149,9 @@ class MonitorHubActor(MonitorCollector):
             event: Must include ``kind``; metric kinds need ``name``/``value``; trace needs ``start_time_ns``/``end_time_ns``.
         """
         self._events_applied += 1
+        if self._delegate is not None:
+            self._delegate.apply_event(event)
+            return
         event = dict(event)
         field = (
             "attributes" if event.get("kind") == MonitorEventKind.TRACE else "labels"
@@ -136,7 +167,9 @@ class MonitorHubActor(MonitorCollector):
             raise ValueError(f"Unknown event kind: {kind!r}")
         handler(event)
 
-    def get_context(self) -> RunContext:
+    def get_context(self) -> RunContext | None:
+        if self._delegate is not None:
+            return self._delegate.get_context()
         return replace(
             self._context,
             actor_name=MonitorRayActor.NAME,
@@ -154,6 +187,25 @@ class MonitorHubActor(MonitorCollector):
             otel_traces_enabled=self._trace_collector.enabled,
             events_applied=self._events_applied,
         )
+
+    def get_monitor_config(self):
+        return {
+            **OmegaConf.to_container(self._conf, resolve=False),
+            "sdk_version": __version__,
+        }
+
+    def register_native_metrics(self, addresses, job, labels):
+        if self._delegate is not None:
+            return self._delegate.register_metrics(addresses, job, labels)
+        return False
+
+    def close_services(self, token):
+        if token != self._owner_token:
+            raise RunError("Only the initializing process can close task services", 409)
+        if self._delegate is not None:
+            self._delegate.close()
+        if self._sdk_services is not None:
+            self._sdk_services.close()
 
     def _handle_counter(self, event: dict[str, Any]) -> None:
         """Increment a Prometheus counter from a ``counter`` event payload."""

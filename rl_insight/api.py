@@ -33,7 +33,7 @@ from omegaconf import DictConfig, OmegaConf
 from .client import create_monitor_client
 from .utils import MonitorBackend, MonitorEventKind
 from .utils.monitor_config_loader import load_monitor_config
-from .utils.protocol import RunContext, RunError
+from .utils.protocol import RunContext, RunError, metric_labels
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -72,6 +72,7 @@ class _MonitorState:
     process_id: str = field(default_factory=lambda: str(os.getpid()))
     labels: dict[str, Any] = field(default_factory=dict)
     context: RunContext | None = None
+    fixed_labels: dict[str, str] = field(default_factory=dict)
 
 
 _STATE = _MonitorState()
@@ -116,55 +117,82 @@ def init(
         return
 
     monitor_conf = load_monitor_config(config)
-    backend = str(OmegaConf.select(monitor_conf, "server.backend") or "").strip()
-    # Only the Ray backend talks to the external RL-Insight server; direct-emit
-    # backends (e.g. push) intentionally run without a server URL.
-    if backend == MonitorBackend.RAY and not str(monitor_conf.server.url).strip():
-        logger.error(
-            "[rl-insight] RL-Insight server URL is required; set RL_INSIGHT_SERVER_URL "
-            "or server.url in init config."
-        )
+    if monitor_conf.get("enabled") is False:
         return
-    if configured or backend != MonitorBackend.RAY:
-        OmegaConf.update(
-            monitor_conf,
-            "run_metadata",
-            {
-                "project": project or "uncategorized",
-                "experiment_name": experiment_name or "unnamed",
-            },
-            force_add=True,
+    client = None
+    try:
+        backend = str(OmegaConf.select(monitor_conf, "server.backend") or "").strip()
+        if (
+            backend == MonitorBackend.RAY
+            and not str(monitor_conf.server.url).strip()
+            and configured
+            and monitor_conf.get("task_options") is None
+        ):
+            logger.error(
+                "[rl-insight] RL-Insight server URL is required; set RL_INSIGHT_SERVER_URL or server.url in init config."
+            )
+            return
+        if configured or backend != MonitorBackend.RAY:
+            OmegaConf.update(
+                monitor_conf,
+                "run_metadata",
+                {
+                    "project": project or "uncategorized",
+                    "experiment_name": experiment_name or "unnamed",
+                },
+                force_add=True,
+            )
+        client = create_monitor_client(monitor_conf)
+        monitor_conf = getattr(client, "conf", monitor_conf)
+        fixed_labels = metric_labels(
+            dict(OmegaConf.select(monitor_conf, "labels") or {})
         )
-    client = create_monitor_client(monitor_conf)
-    context = getattr(client, "get_context", lambda: None)() if client else None
-    if context and (
-        (project and project != context.project)
-        or (experiment_name and experiment_name != context.original_experiment_name)
-    ):
-        raise RunError("Experiment metadata conflicts with the existing Run")
-    labels = {
-        key: value
-        for key, value in {
-            "project": context.project if context else project,
-            "experiment_name": context.experiment_name if context else experiment_name,
-        }.items()
-        if value is not None
-    }
-    previous = _STATE.client
-    _STATE = _MonitorState(
-        enabled=client is not None,
-        client=client,
-        conf=monitor_conf,
-        namespace=str(monitor_conf.server.namespace),
-        labels=labels,
-        context=context,
-    )
-    if previous is not None and previous is not client and hasattr(previous, "close"):
-        previous.close()
-    if client and (context is not None or backend != MonitorBackend.RAY):
-        from .utils.prometheus_utils import flush_pending_targets
+        context = getattr(client, "get_context", lambda: None)() if client else None
+        if context and (
+            (project and project != context.project)
+            or (experiment_name and experiment_name != context.original_experiment_name)
+        ):
+            raise RunError("Experiment metadata conflicts with the existing Run")
+        labels = {
+            key: value
+            for key, value in {
+                "project": context.project if context else project,
+                "experiment_name": context.experiment_name
+                if context
+                else experiment_name,
+            }.items()
+            if value is not None
+        }
+        previous = _STATE.client
+        _STATE = _MonitorState(
+            enabled=client is not None,
+            client=client,
+            conf=monitor_conf,
+            namespace=str(monitor_conf.server.namespace),
+            labels=labels,
+            context=context,
+            fixed_labels=fixed_labels,
+        )
+        if (
+            previous is not None
+            and previous is not client
+            and hasattr(previous, "close")
+        ):
+            previous.close()
+        if client and _client_initialized():
+            from .utils.prometheus_utils import flush_pending_targets
 
-        flush_pending_targets(context)
+            flush_pending_targets(context)
+    except BaseException:
+        if client is not None and hasattr(client, "close"):
+            try:
+                client.close()
+            except Exception:
+                logger.exception(
+                    "[rl-insight] Client cleanup after initialization failure failed"
+                )
+        _STATE = _MonitorState()
+        raise
 
 
 def get_context() -> RunContext | None:
@@ -173,12 +201,7 @@ def get_context() -> RunContext | None:
 
 
 def _client_initialized() -> bool:
-    return _STATE.enabled and (
-        _STATE.context is not None
-        or (
-            _STATE.conf is not None and _STATE.conf.server.backend != MonitorBackend.RAY
-        )
-    )
+    return _STATE.enabled and bool(getattr(_STATE.client, "ready", True))
 
 
 def finish() -> None:
@@ -563,9 +586,9 @@ def _emit(
         "documentation": documentation,
         "value": value,
         "labels": (
-            _STATE.context.labels({**_STATE.labels, **labels})
+            _STATE.context.labels({**_STATE.labels, **labels, **_STATE.fixed_labels})
             if _STATE.context
-            else {**_STATE.labels, **labels}
+            else {**_STATE.labels, **labels, **_STATE.fixed_labels}
         ),
     }
     _STATE.client.apply_event(event)
@@ -594,6 +617,7 @@ def _emit_trace_span(
         **_STATE.labels,
     }
     merged_attributes.update(attributes)
+    merged_attributes.update(_STATE.fixed_labels)
     if _STATE.context:
         merged_attributes = _STATE.context.labels(merged_attributes)
 

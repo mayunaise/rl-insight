@@ -24,6 +24,7 @@ from __future__ import annotations
 from collections.abc import Generator
 
 import pytest
+from omegaconf import OmegaConf
 
 from rl_insight.utils.constants import MonitorBackend, MonitorEnv
 from rl_insight.utils.monitor_config_loader import load_monitor_config
@@ -161,3 +162,55 @@ def test_empty_server_backend_env_should_be_ignored(
     conf = load_monitor_config({"server": {"backend": "custom"}})
 
     assert conf.server.backend == "custom"
+
+
+def test_training_config_resolves_only_monitoring_fields(tmp_path, monkeypatch):
+    from rl_insight.utils.monitor_config_loader import (
+        expand_task_config,
+        load_monitor_config,
+    )
+
+    monkeypatch.setenv("TASK_ID", "platform-task")
+    conf = expand_task_config(
+        OmegaConf.create(
+            {
+                "model": "${framework_only:unavailable}",
+                "rl_insight": {
+                    "metrics": {"pull": True, "port": 18480},
+                    "labels": {"task_id": "${oc.env:TASK_ID}"},
+                },
+            }
+        ),
+        runtime_dir=tmp_path,
+    )
+    assert conf.server.port == 18080
+    assert conf.server.metrics_port == 18480
+    inherited = expand_task_config(
+        {"rl_insight": {"server": {"port": 18481}, "metrics": {"pull": True}}},
+        runtime_dir=tmp_path,
+    )
+    assert inherited.server.get("metrics_port", inherited.server.port) == 18481
+    assert conf.push.sinks[0].labels.task_id == "platform-task"
+    assert not any(conf[name].enable for name in ("prometheus", "tempo", "grafana"))
+    assert "model" not in conf
+    monkeypatch.setenv("RL_INSIGHT_SERVER_URL", "http://127.0.0.1:1")
+    with pytest.raises(ValueError, match="conflict"):
+        load_monitor_config({"metrics": {"pull": True}})
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"metrics": {"pull": True, "remote_write": [{"url": "http://receiver/write"}]}},
+        {"metrics": {"pull": True}, "sinks": [{"driver": "custom:factory"}]},
+        {
+            "labels": {"task_id": "fixed"},
+            "sinks": [{"driver": "custom:factory", "labels": {"task_id": "other"}}],
+        },
+    ],
+)
+def test_invalid_task_outputs_fail_before_training(tmp_path, options):
+    from rl_insight.utils.monitor_config_loader import expand_task_config
+
+    with pytest.raises(ValueError):
+        expand_task_config({"rl_insight": options}, runtime_dir=tmp_path)

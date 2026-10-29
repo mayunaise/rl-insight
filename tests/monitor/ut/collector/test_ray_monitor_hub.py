@@ -39,6 +39,7 @@ def hub() -> Any:
     instance._trace_collector = MagicMock(enabled=True)
     instance._events_applied = 0
     instance._context = RunContext("p", "e", "http://server")
+    instance._delegate = None
     instance._event_handlers = {
         MonitorEventKind.COUNTER: instance._handle_counter,
         MonitorEventKind.GAUGE: instance._handle_gauge,
