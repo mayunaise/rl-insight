@@ -85,9 +85,9 @@ def test_init_should_configure_collectors_and_register_scrape_target_when_create
         ["10.0.0.8:9092"], context=instance._context, identity_in_metrics=True
     )
     assert instance._registry is registry
-    assert instance._context.original_experiment_name == "unnamed"
+    assert instance._context.original_experiment_name == "default"
     assert re.fullmatch(
-        r"unnamed_[0-9]{8}-[0-9]{6}_[0-9a-f]{8}", instance._context.experiment_name
+        r"default_[0-9]{8}-[0-9]{6}_[0-9a-f]{8}", instance._context.experiment_name
     )
 
 

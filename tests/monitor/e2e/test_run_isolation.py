@@ -153,8 +153,13 @@ def test_same_named_executions_register_distinct_native_labels(stack):
 def test_ray_workers_share_execution_name_and_registration_recovers(stack):
     pytest.importorskip("ray")
     stack.backend.lose_response = True
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    config_file = stack.path / "training.yaml"
+    config_file.write_text(json.dumps({"prometheus": {"metrics_report_port": port}}))
     script = r"""
-import json, socket, sys, time
+import json, sys, time, warnings
 import requests
 import ray
 import rl_insight as insight
@@ -164,36 +169,34 @@ url = sys.argv[1]
 ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
 try:
     insight.init()
-    with insight.trace_state("driver_prepare", state_lane_id="early_driver"):
-        pass
-    assert insight.get_context() is None
+    default = insight.get_context()
+    assert default.project == "default"
+    assert default.original_experiment_name == "default"
+    insight.metric_gauge("default_names", 1)
+    assert insight.get_context().events_applied == 1
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        insight.init(project="ignored")
+    assert caught and insight.get_context().experiment_name == default.experiment_name
+    insight.init(refresh=True)
+    assert insight.get_context().experiment_name == default.experiment_name
+finally:
+    insight.finish()
+    ray.shutdown()
 
+ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
+try:
     @ray.remote(num_cpus=0)
-    class EarlyWorker:
-        def trace_before_training(self):
+    class Worker:
+        def trace_with_defaults(self):
             insight.init()
             with insight.trace_state("sleep", state_lane_id="early_replica"):
                 pass
-            context = insight.get_context()
-            return context.to_dict() if context else None
+            return insight.get_context().to_dict()
 
-        def wait_for_context(self):
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline:
-                context = insight.get_context()
-                if context:
-                    return context.to_dict()
-                time.sleep(0.1)
-            raise TimeoutError("Early worker did not connect to the training Run")
-
-    early_workers = [EarlyWorker.remote(), EarlyWorker.remote()]
-    early_contexts = ray.get(
-        [worker.trace_before_training.remote() for worker in early_workers], timeout=20
-    )
-    assert early_contexts == [None, None], (
-        "Argument-free worker init must defer Run creation until training init", early_contexts
-    )
-    delayed_context = early_workers[1].wait_for_context.remote()
+        def refresh(self):
+            insight.init(refresh=True)
+            return insight.get_context().to_dict()
 
     @ray.remote
     def native():
@@ -207,13 +210,14 @@ try:
         raise TimeoutError("Hub did not become ready")
     waiting = native.remote()
     time.sleep(1)
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    insight.init(project="ray", experiment_name="same", config={"server": {"url": url}, "prometheus": {"metrics_report_port": port}})
+    insight.init(project="ray", experiment_name="same", config={"server": {"url": url}})
     first = insight.get_context()
-    assert ray.get(delayed_context)["experiment_name"] == first.experiment_name
-    assert ray.get(early_workers[0].wait_for_context.remote())["experiment_name"] == first.experiment_name
+    with insight.trace_state("driver_prepare", state_lane_id="early_driver"):
+        pass
+    workers = [Worker.remote(), Worker.remote()]
+    contexts = ray.get([worker.trace_with_defaults.remote() for worker in workers], timeout=20)
+    assert {context["experiment_name"] for context in contexts} == {first.experiment_name}
+    assert ray.get(workers[0].refresh.remote())["experiment_name"] == first.experiment_name
     insight.metric_gauge("reward", 2)
     @ray.remote
     def worker():
@@ -241,7 +245,11 @@ finally:
         text=True,
         capture_output=True,
         timeout=100,
-        env={**os.environ, "RL_INSIGHT_SERVER_URL": stack.url},
+        env={
+            **os.environ,
+            "RL_INSIGHT_SERVER_URL": stack.url,
+            "RL_INSIGHT_CONFIG": str(config_file),
+        },
     )
     assert result.returncode == 0, result.stdout + result.stderr
     context = json.loads(

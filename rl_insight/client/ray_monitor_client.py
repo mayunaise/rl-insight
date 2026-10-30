@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections import deque
 from typing import Any, cast
 
 import ray
@@ -41,6 +40,9 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 
 __all__ = ["MonitorRayClient", "create_ray_monitor_client", "get_or_create_monitor_hub"]
+
+# Named handles are weak; retain creating handles for the Ray job's lifetime.
+_hub_owners: list[Any] = []
 
 
 def _current_job_actor_name() -> str:
@@ -94,15 +96,14 @@ def _initialize_hub_connection(hub: Any, *, timeout: float) -> RunContext:
     return context
 
 
-def get_or_create_monitor_hub(conf: DictConfig, *, create: bool = True) -> Any:
-    """Reuse the current job's Hub; Ray handles concurrent creation if allowed."""
+def get_or_create_monitor_hub(conf: DictConfig) -> Any:
+    """Reuse the current job's Hub; Ray handles concurrent creation."""
     actor_name = _current_job_actor_name()
     namespace = MonitorRayActor.NAMESPACE
     try:
         return ray.get_actor(actor_name, namespace=namespace)
     except ValueError:
-        if not create:
-            return None
+        pass
     actor_options: dict[str, Any] = {
         "name": actor_name,
         "namespace": namespace,
@@ -114,7 +115,9 @@ def get_or_create_monitor_hub(conf: DictConfig, *, create: bool = True) -> Any:
             "env_vars": {MonitorEnv.SERVER_URL: server_url},
         }
 
-    return cast(Any, MonitorHubActor).options(**actor_options).remote(conf)
+    hub = cast(Any, MonitorHubActor).options(**actor_options).remote(conf)
+    _hub_owners.append(hub)
+    return hub
 
 
 def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
@@ -131,10 +134,9 @@ def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
         return None
 
     initialize_server_connection(str(conf.server.url))
-    handle = get_or_create_monitor_hub(conf, create=bool(conf.get("run_metadata")))
+    handle = get_or_create_monitor_hub(conf)
     client = MonitorRayClient(handle)
-    if not client.initialize():
-        client._start_waiter()
+    client.initialize()
     return client
 
 
@@ -147,12 +149,9 @@ class MonitorRayClient(MonitorClient):
             actor_handle: Return value of ``get_or_create_monitor_hub``.
         """
         self._actor = actor_handle
-        self._actor_name = _current_job_actor_name() if actor_handle is None else ""
-        self._pending: deque[dict[str, Any]] = deque()
         self._lock = threading.Lock()
         self._init_lock = threading.Lock()
-        self._closed = threading.Event()
-        self._waiter: threading.Thread | None = None
+        self._closed = False
         self._compatibility_error: RunError | None = None
         self._initialized = False
         # Includes service discovery and actor scheduling during initialization.
@@ -165,27 +164,19 @@ class MonitorRayClient(MonitorClient):
             + 30
         )
 
-    def initialize(self) -> bool:
+    def initialize(self) -> None:
         """Establish and validate the Hub connection before collecting data."""
         with self._init_lock:
             if self._compatibility_error is not None:
                 raise self._compatibility_error
             if self._initialized:
-                return True
-            if self._actor is None:
-                try:
-                    self._actor = ray.get_actor(
-                        self._actor_name, namespace=MonitorRayActor.NAMESPACE
-                    )
-                except ValueError:
-                    return False
+                return
             try:
                 _initialize_hub_connection(self._actor, timeout=self._timeout)
             except RunError as exc:
                 self._compatibility_error = exc
                 raise
             self._initialized = True
-            return True
 
     def get_context(self) -> RunContext | None:
         if self._compatibility_error is not None:
@@ -206,61 +197,12 @@ class MonitorRayClient(MonitorClient):
         with self._lock:
             if self._compatibility_error is not None:
                 raise self._compatibility_error
-            if self._closed.is_set():
+            if self._closed:
                 raise RunError("Monitor client is closed")
-            if self._initialized and not self._pending:
-                self._actor.apply_event.remote(event)
-                return
-            if len(self._pending) >= 1024:
-                raise RunError(
-                    "Too many events waiting for configured Run initialization"
-                )
-            self._pending.append(event)
-            self._start_waiter()
-
-    def _start_waiter(self) -> None:
-        if self._closed.is_set():
-            return
-        if self._waiter is None or not self._waiter.is_alive():
-            self._waiter = threading.Thread(
-                target=self._wait_for_hub, name="insight-events", daemon=True
-            )
-            self._waiter.start()
-
-    def _flush_pending(self) -> None:
-        with self._lock:
-            while self._pending:
-                self._actor.apply_event.remote(self._pending[0])
-                self._pending.popleft()
-
-    def _wait_for_hub(self) -> None:
-        delay = 0.1
-        while not self._closed.is_set():
-            try:
-                if self.initialize():
-                    self._flush_pending()
-                    return
-            except RunError as exc:
-                with self._lock:
-                    self._compatibility_error = exc
-                    self._pending.clear()
-                logger.error("[rl-insight] Cannot initialize pending events: %s", exc)
-                return
-            except ray.exceptions.RayError:
-                logger.exception("[rl-insight] Cannot attach pending events to the Run")
-            if self._closed.wait(delay):
-                return
-            delay = min(delay * 2, 2)
+            if not self._initialized:
+                raise RunError("Monitor client is not initialized")
+            self._actor.apply_event.remote(event)
 
     def close(self) -> None:
-        self._closed.set()
-        if self._pending:
-            if self.initialize():
-                self._flush_pending()
-            else:
-                with self._lock:
-                    logger.warning(
-                        "[rl-insight] Discarding %d events: no configured Run was initialized",
-                        len(self._pending),
-                    )
-                    self._pending.clear()
+        with self._lock:
+            self._closed = True

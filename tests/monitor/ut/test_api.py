@@ -489,3 +489,9 @@ def test_init_without_config_should_use_backend_from_env(
 
     assert selected_backends == ["custom"]
     assert api._STATE.enabled is True
+    api.metric_gauge("default_names", 1)
+    assert api._STATE.client is not None
+    assert api._STATE.client.events[-1]["labels"] == {
+        "project": "default",
+        "experiment_name": "default",
+    }

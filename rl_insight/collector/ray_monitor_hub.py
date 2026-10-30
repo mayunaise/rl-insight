@@ -32,7 +32,7 @@ from ..utils import (
     start_metrics_http_server,
     update_prometheus_config,
 )
-from ..utils.constants import MonitorRayActor
+from ..utils.constants import MonitorDefaults, MonitorRayActor
 from ..utils.protocol import RunContext, require_version
 from .base import MonitorCollector
 
@@ -61,8 +61,8 @@ class MonitorHubActor(MonitorCollector):
         namespace = str(self._conf.server.namespace)
         metadata = conf.get("run_metadata", {})
         self._context = RunContext.create(
-            str(metadata.get("project", "uncategorized")),
-            str(metadata.get("experiment_name", "unnamed")),
+            str(metadata.get("project", MonitorDefaults.PROJECT_NAME)),
+            str(metadata.get("experiment_name", MonitorDefaults.EXPERIMENT_NAME)),
             str(conf.server.url),
         )
         services = initialize_server_connection()
