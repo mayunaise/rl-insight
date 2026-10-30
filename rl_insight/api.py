@@ -187,24 +187,11 @@ def init(
     )
     if previous is not None and previous is not client and hasattr(previous, "close"):
         previous.close()
-    if client and (context is not None or backend != MonitorBackend.RAY):
-        from .utils.prometheus_utils import flush_pending_targets
-
-        flush_pending_targets(context)
 
 
 def get_context() -> RunContext | None:
     """Return an immutable snapshot of the current Run identity and live status."""
     return _STATE.client.get_context() if _STATE.client else None
-
-
-def _client_initialized() -> bool:
-    return _STATE.enabled and (
-        _STATE.context is not None
-        or (
-            _STATE.conf is not None and _STATE.conf.server.backend != MonitorBackend.RAY
-        )
-    )
 
 
 def finish() -> None:

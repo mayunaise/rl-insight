@@ -44,6 +44,10 @@ class InvalidVersionError(RunError):
     """The peer does not provide a supported RL-Insight version."""
 
 
+def create_execution_suffix() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S_") + uuid4().hex[:8]
+
+
 def require_version(value: Any, component: str) -> None:
     try:
         supported = isinstance(value, str) and Version(value) >= MIN_SUPPORTED_VERSION
@@ -77,8 +81,15 @@ class RunContext:
     version: str = field(default_factory=lambda: __version__)
 
     @classmethod
-    def create(cls, project: str, experiment_name: str, server_url: str) -> RunContext:
-        suffix = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S_") + uuid4().hex[:8]
+    def create(
+        cls,
+        project: str,
+        experiment_name: str,
+        server_url: str,
+        *,
+        suffix: str | None = None,
+    ) -> RunContext:
+        suffix = suffix if suffix is not None else create_execution_suffix()
         return cls(
             project,
             f"{experiment_name}_{suffix}",

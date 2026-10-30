@@ -159,16 +159,24 @@ def test_ray_workers_share_execution_name_and_registration_recovers(stack):
     config_file = stack.path / "training.yaml"
     config_file.write_text(json.dumps({"prometheus": {"metrics_report_port": port}}))
     script = r"""
-import json, sys, time, warnings
+import json, os, sys, time, warnings
 import requests
 import ray
 import rl_insight as insight
-from rl_insight.client.ray_monitor_client import initialize_current_job_connection
+import yaml
+from pathlib import Path
+from rl_insight.client.ray_monitor_client import _current_job_actor_name
+from rl_insight.utils.constants import MonitorRayActor
+from rl_insight.utils.protocol import RunError
 
 url = sys.argv[1]
 ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
 try:
-    insight.init()
+    try:
+        insight.init()
+    except RunError as exc:
+        assert exc.status == 503
+        insight.init()
     default = insight.get_context()
     assert default.project == "default"
     assert default.original_experiment_name == "default"
@@ -199,19 +207,18 @@ try:
             return insight.get_context().to_dict()
 
     @ray.remote
-    def native():
-        insight.update_prometheus_config(["127.0.0.1:19999"])
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            context = initialize_current_job_connection()
-            if context:
-                return context.experiment_name
-            time.sleep(0.1)
-        raise TimeoutError("Hub did not become ready")
-    waiting = native.remote()
-    time.sleep(1)
+    def native(address):
+        os.environ.pop("RL_INSIGHT_SERVER_URL", None)
+        insight.update_prometheus_config([address])
+        hub = ray.get_actor(_current_job_actor_name(), namespace=MonitorRayActor.NAMESPACE)
+        return hub._actor_id.hex()
+    early_actor = ray.get(native.remote("127.0.0.1:19999"))
+    targets = yaml.safe_load(Path(sys.argv[2]).read_text())
+    assert not any("127.0.0.1:19999" in group["targets"] for group in targets)
     insight.init(project="ray", experiment_name="same", config={"server": {"url": url}})
     first = insight.get_context()
+    actor = ray.get(native.remote("127.0.0.1:19998"))
+    assert actor == early_actor
     with insight.trace_state("driver_prepare", state_lane_id="early_driver"):
         pass
     workers = [Worker.remote(), Worker.remote()]
@@ -229,7 +236,7 @@ try:
         insight.finish()
         return context.experiment_name
     experiment_name = ray.get(worker.remote())
-    assert experiment_name == ray.get(waiting) == first.experiment_name
+    assert experiment_name == first.experiment_name
     assert insight.get_context().events_applied > first.events_applied
     snapshot = insight.get_context().to_dict()
     snapshot["metrics"] = requests.get(snapshot["metrics_endpoint"], timeout=5).text
@@ -241,7 +248,13 @@ finally:
     ray.shutdown()
 """
     result = subprocess.run(
-        [sys.executable, "-c", script, stack.url],
+        [
+            sys.executable,
+            "-c",
+            script,
+            stack.url,
+            str(stack.path / "data/targets/prometheus-targets.yml"),
+        ],
         text=True,
         capture_output=True,
         timeout=100,
@@ -290,8 +303,9 @@ finally:
     targets = yaml.safe_load(
         (stack.path / "data/targets/prometheus-targets.yml").read_text()
     )
-    assert any(
-        "127.0.0.1:19999" in group["targets"]
-        and group["labels"]["experiment_name"] == context["experiment_name"]
-        for group in targets
-    )
+    for address in ("127.0.0.1:19999", "127.0.0.1:19998"):
+        assert any(
+            address in group["targets"]
+            and group["labels"]["experiment_name"] == context["experiment_name"]
+            for group in targets
+        )

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import multiprocessing
 from functools import partial
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -26,7 +26,7 @@ import yaml
 from prometheus_client import CollectorRegistry, Gauge, make_wsgi_app
 
 from rl_insight.utils import prometheus_utils as prometheus_module
-from rl_insight.utils.protocol import RunContext
+from rl_insight.utils.protocol import RunContext, RunError
 
 
 def _register_target_in_process(
@@ -270,19 +270,27 @@ def test_update_prometheus_config_should_register_in_process_when_push_active(
     post.assert_not_called()
 
 
-def test_deferred_targets_drop_permanent_errors_and_keep_transient_failures(
+def test_hub_targets_keep_registration_failures_for_explicit_retry(
     monkeypatch,
 ):
-    from rl_insight.utils.protocol import RunContext
+    from rl_insight.collector.ray_monitor_hub import MonitorHubActor
 
     context = RunContext.create("p", "e", "http://server")
-    item = (["host:9000"], "workers", None)
-    monkeypatch.setattr(prometheus_module, "_pending_targets", [item])
+    implementation = cast(Any, MonitorHubActor).__ray_metadata__.modified_class
+    hub = implementation.__new__(implementation)
+    hub._context = context
+    hub._pending_targets = []
+    item = (["host:9000"], "workers", None, False)
     post = MagicMock(return_value=MagicMock(status_code=409, text="identity conflict"))
     monkeypatch.setattr(prometheus_module.requests, "post", post)
-    prometheus_module.flush_pending_targets(context)
-    assert not prometheus_module._pending_targets
-    prometheus_module._pending_targets.append(item)
+    with pytest.raises(RunError, match="identity conflict"):
+        hub.register_targets(*item[:3])
+    assert hub._pending_targets == [item]
     post.side_effect = prometheus_module.requests.ConnectionError("offline")
-    prometheus_module.flush_pending_targets(context)
-    assert prometheus_module._pending_targets == [item]
+    with pytest.raises(RunError, match="Cannot register"):
+        hub.register_targets([])
+    assert hub._pending_targets == [item]
+    post.side_effect = None
+    post.return_value.status_code = 200
+    hub.register_targets([])
+    assert not hub._pending_targets

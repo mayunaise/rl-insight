@@ -23,9 +23,10 @@ from unittest.mock import MagicMock, call
 import pytest
 from omegaconf import OmegaConf
 
+from rl_insight import __version__
 from rl_insight.collector import ray_monitor_hub as hub_module
 from rl_insight.utils.constants import MonitorEventKind, MonitorRayActor
-from rl_insight.utils.protocol import RunContext
+from rl_insight.utils.protocol import RunContext, RunError
 
 HubImplementation = cast(
     Any, hub_module.MonitorHubActor
@@ -54,16 +55,18 @@ def test_init_should_configure_collectors_and_register_scrape_target_when_create
     registry = MagicMock()
     trace_collector = MagicMock(enabled=True)
     start_server = MagicMock()
-    update_config = MagicMock()
+    update_config = MagicMock(return_value=True)
     monkeypatch.setattr(
-        hub_module, "initialize_server_connection", lambda: {"otlp_port": 4318}
+        hub_module,
+        "initialize_server_connection",
+        lambda _url=None: {"otlp_port": 4318},
     )
     registry_factory = MagicMock(return_value=registry)
     monkeypatch.setattr(hub_module, "MetricRegistry", registry_factory)
     trace_factory = MagicMock(return_value=trace_collector)
     monkeypatch.setattr(hub_module, "OpenTelemetryTraceCollector", trace_factory)
     monkeypatch.setattr(hub_module, "start_metrics_http_server", start_server)
-    monkeypatch.setattr(hub_module, "update_prometheus_config", update_config)
+    monkeypatch.setattr(hub_module, "_register_targets", update_config, raising=False)
     monkeypatch.setattr(hub_module.ray.util, "get_node_ip_address", lambda: "10.0.0.8")
     conf = OmegaConf.create(
         {
@@ -73,7 +76,19 @@ def test_init_should_configure_collectors_and_register_scrape_target_when_create
     )
 
     instance = HubImplementation.__new__(HubImplementation)
-    instance.__init__(conf)
+    instance.__init__()
+
+    registry_factory.assert_not_called()
+    start_server.assert_not_called()
+    update_config.assert_not_called()
+    suffix = instance._execution_suffix
+    assert instance.connect(__version__) == __version__
+    instance.register_targets(["10.0.0.9:1234"], "vllm", [{"replica": 0}])
+    update_config.assert_not_called()
+    with pytest.raises(RunError, match="not initialized"):
+        instance.get_context()
+    conf.run_metadata = {"project": "p", "experiment_name": "chosen"}
+    instance.connect(__version__, conf)
 
     registry_factory.assert_called_once_with(namespace="trainer")
     trace_factory.assert_called_once_with(
@@ -81,14 +96,25 @@ def test_init_should_configure_collectors_and_register_scrape_target_when_create
         endpoint="http://host:4318/v1/traces",
     )
     start_server.assert_called_once_with(9092, addr="10.0.0.8")
-    update_config.assert_called_once_with(
-        ["10.0.0.8:9092"], context=instance._context, identity_in_metrics=True
+    update_config.assert_any_call(
+        ["10.0.0.9:1234"],
+        "vllm",
+        [{"replica": 0}],
+        instance._context,
+        identity_in_metrics=False,
+    )
+    update_config.assert_any_call(
+        ["10.0.0.8:9092"], None, None, instance._context, identity_in_metrics=True
     )
     assert instance._registry is registry
-    assert instance._context.original_experiment_name == "default"
+    assert instance._context.original_experiment_name == "chosen"
+    assert instance._context.experiment_name == f"chosen_{suffix}"
     assert re.fullmatch(
-        r"default_[0-9]{8}-[0-9]{6}_[0-9a-f]{8}", instance._context.experiment_name
+        r"chosen_[0-9]{8}-[0-9]{6}_[0-9a-f]{8}", instance._context.experiment_name
     )
+    instance.connect(__version__, conf)
+    registry_factory.assert_called_once()
+    start_server.assert_called_once()
 
 
 @pytest.mark.parametrize(

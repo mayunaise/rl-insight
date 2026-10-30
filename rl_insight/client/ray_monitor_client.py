@@ -26,10 +26,9 @@ from omegaconf import DictConfig
 from .. import __version__
 from ..collector.ray_monitor_hub import MonitorHubActor
 from ..server.http_api import initialize_server_connection
-from ..utils.constants import MonitorEnv, MonitorRayActor, MonitorServer
+from ..utils.constants import MonitorRayActor, MonitorServer
 from ..utils.protocol import (
     MIN_SUPPORTED_VERSION,
-    InvalidVersionError,
     RunContext,
     RunError,
     require_version,
@@ -51,33 +50,24 @@ def _current_job_actor_name() -> str:
     return f"{MonitorRayActor.NAME}_{job_id}"
 
 
-def initialize_current_job_connection() -> RunContext | None:
-    """Initialize native collection against an existing Hub, without creating one."""
-    if not ray.is_initialized():
-        return None
-    try:
-        hub = ray.get_actor(
-            _current_job_actor_name(), namespace=MonitorRayActor.NAMESPACE
-        )
-    except ValueError:
-        return None
-    try:
-        return _initialize_hub_connection(hub, timeout=2)
-    except (ray.exceptions.GetTimeoutError, ray.exceptions.ActorUnavailableError):
-        return None
-
-
-def _initialize_hub_connection(hub: Any, *, timeout: float) -> RunContext:
+def _initialize_hub_connection(
+    hub: Any, *, timeout: float, conf: DictConfig | None = None
+) -> None:
     if not hasattr(hub, "connect"):
         require_version(None, "Ray Hub (initialization API unavailable)")
     try:
-        context = ray.get(hub.connect.remote(__version__), timeout=timeout)
+        connection = (
+            hub.connect.remote(__version__, conf)
+            if conf is not None
+            else hub.connect.remote(__version__)
+        )
+        version = ray.get(connection, timeout=timeout)
     except ray.exceptions.ActorUnavailableError:
         # Preserve the caller's retry path for temporary unavailability.
         raise
     except (ray.exceptions.RayActorError, ray.exceptions.RayTaskError) as exc:
         if isinstance(exc, ray.exceptions.RayTaskError) and isinstance(
-            exc.cause, InvalidVersionError
+            exc.cause, RunError
         ):
             raise exc.cause from exc
         if "No module named 'rl_insight.utils.protocol'" in str(exc):
@@ -90,13 +80,10 @@ def _initialize_hub_connection(hub: Any, *, timeout: float) -> RunContext:
         )
         logger.error(message)
         raise RunError(message, 502) from exc
-    if not isinstance(context, RunContext):
-        raise RunError("Ray Hub returned an invalid Context", 502)
-    require_version(getattr(context, "version", None), "Ray Hub")
-    return context
+    require_version(version, "Ray Hub")
 
 
-def get_or_create_monitor_hub(conf: DictConfig) -> Any:
+def get_or_create_monitor_hub() -> Any:
     """Reuse the current job's Hub; Ray handles concurrent creation."""
     actor_name = _current_job_actor_name()
     namespace = MonitorRayActor.NAMESPACE
@@ -109,13 +96,7 @@ def get_or_create_monitor_hub(conf: DictConfig) -> Any:
         "namespace": namespace,
         "get_if_exists": True,
     }
-    server_url = str(conf.server.url).strip()
-    if server_url:
-        actor_options["runtime_env"] = {
-            "env_vars": {MonitorEnv.SERVER_URL: server_url},
-        }
-
-    hub = cast(Any, MonitorHubActor).options(**actor_options).remote(conf)
+    hub = cast(Any, MonitorHubActor).options(**actor_options).remote()
     _hub_owners.append(hub)
     return hub
 
@@ -134,9 +115,9 @@ def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
         return None
 
     initialize_server_connection(str(conf.server.url))
-    handle = get_or_create_monitor_hub(conf)
+    handle = get_or_create_monitor_hub()
     client = MonitorRayClient(handle)
-    client.initialize()
+    client.initialize(conf)
     return client
 
 
@@ -164,7 +145,7 @@ class MonitorRayClient(MonitorClient):
             + 30
         )
 
-    def initialize(self) -> None:
+    def initialize(self, conf: DictConfig | None = None) -> None:
         """Establish and validate the Hub connection before collecting data."""
         with self._init_lock:
             if self._compatibility_error is not None:
@@ -172,7 +153,9 @@ class MonitorRayClient(MonitorClient):
             if self._initialized:
                 return
             try:
-                _initialize_hub_connection(self._actor, timeout=self._timeout)
+                _initialize_hub_connection(
+                    self._actor, timeout=self._timeout, conf=conf
+                )
             except RunError as exc:
                 self._compatibility_error = exc
                 raise
@@ -183,7 +166,10 @@ class MonitorRayClient(MonitorClient):
             raise self._compatibility_error
         if not self._initialized:
             return None
-        return ray.get(self._actor.get_context.remote(), timeout=self._timeout)
+        context = ray.get(self._actor.get_context.remote(), timeout=self._timeout)
+        if not isinstance(context, RunContext):
+            raise RunError("Ray Hub returned an invalid Context", 502)
+        return context
 
     def apply_event(self, event: dict[str, Any]) -> None:
         """Submit ``MonitorHubActor.apply_event`` on the actor (fire-and-forget; no ``ray.get``).

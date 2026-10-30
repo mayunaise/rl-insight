@@ -17,12 +17,14 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
 import ray
 from omegaconf import DictConfig
 
+from .. import __version__
 from ..server.http_api import initialize_server_connection
 from ..server.network import format_host_port, service_url_from_server_url
 from ..utils import (
@@ -30,10 +32,15 @@ from ..utils import (
     MonitorEventKind,
     OpenTelemetryTraceCollector,
     start_metrics_http_server,
-    update_prometheus_config,
 )
 from ..utils.constants import MonitorDefaults, MonitorRayActor
-from ..utils.protocol import RunContext, require_version
+from ..utils.prometheus_utils import _register_targets
+from ..utils.protocol import (
+    RunContext,
+    RunError,
+    create_execution_suffix,
+    require_version,
+)
 from .base import MonitorCollector
 
 logger = logging.getLogger(__name__)
@@ -44,49 +51,20 @@ __all__ = ["MonitorHubActor"]
 
 @ray.remote
 class MonitorHubActor(MonitorCollector):
-    """Ray detached actor: receives monitor events from trainers, serves ``/metrics``, optional OTLP traces.
+    """Job-scoped actor receiving monitor events and native exporter addresses.
 
     Actor methods run one at a time (no ``max_concurrency``), so hub state updates are serialized.
 
-    On startup it registers its metrics endpoint with the RL-Insight server.
+    Collection starts when a client supplies its formal configuration.
     """
 
-    def __init__(self, conf: DictConfig) -> None:
-        """
-        Args:
-            conf: Merged monitor config with ``server`` and ``prometheus`` sections.
-        """
-        self._conf = conf
-
-        namespace = str(self._conf.server.namespace)
-        metadata = conf.get("run_metadata", {})
-        self._context = RunContext.create(
-            str(metadata.get("project", MonitorDefaults.PROJECT_NAME)),
-            str(metadata.get("experiment_name", MonitorDefaults.EXPERIMENT_NAME)),
-            str(conf.server.url),
-        )
-        services = initialize_server_connection()
-        self._services = services
-        trace_endpoint = service_url_from_server_url(
-            str(self._conf.server.url),
-            services.get("otlp_port"),
-            "/v1/traces",
-        )
-        self._registry = MetricRegistry(namespace=namespace)
-        self._registry.value(
-            "experiment_info",
-            "Experiment execution identity.",
-            1,
-            {},
-            self._context.labels(),
-        )
-        self._trace_collector = OpenTelemetryTraceCollector(
-            namespace=namespace, endpoint=trace_endpoint
-        )
-
+    def __init__(self) -> None:
+        self._execution_suffix = create_execution_suffix()
+        self._context: RunContext | None = None
         self._events_applied = 0
-        self._node_ip = ray.util.get_node_ip_address()
-        self._metrics_port = int(self._conf.prometheus.metrics_report_port)
+        self._pending_targets: list[
+            tuple[list[str], str | None, list[Mapping[str, Any] | None] | None, bool]
+        ] = []
         self._event_handlers = {
             MonitorEventKind.COUNTER: self._handle_counter,
             MonitorEventKind.GAUGE: self._handle_gauge,
@@ -94,25 +72,78 @@ class MonitorHubActor(MonitorCollector):
             MonitorEventKind.TRACE: self._handle_trace,
         }
 
-        start_metrics_http_server(self._metrics_port, addr=self._node_ip)
-        update_prometheus_config(
-            [format_host_port(self._node_ip, self._metrics_port)],
-            context=self._context,
-            identity_in_metrics=True,
-        )
-        logger.info(
-            "[rl-insight] MonitorHubActor HTTP bind %s:%s, "
-            "Prometheus scrape target %s:%s",
-            self._node_ip,
-            self._metrics_port,
-            self._node_ip,
-            self._metrics_port,
-        )
-
-    def connect(self, client_version: str | None = None) -> RunContext:
-        """Verify the connecting SDK once before it submits monitor events."""
+    def connect(
+        self, client_version: str | None = None, conf: DictConfig | None = None
+    ) -> str:
+        """Verify the SDK and apply the first explicit initialization config."""
         require_version(client_version, "Client")
-        return self.get_context()
+        if conf is not None:
+            if self._context is None:
+                metadata = conf.get("run_metadata", {})
+                context = RunContext.create(
+                    str(metadata.get("project", MonitorDefaults.PROJECT_NAME)),
+                    str(
+                        metadata.get("experiment_name", MonitorDefaults.EXPERIMENT_NAME)
+                    ),
+                    str(conf.server.url),
+                    suffix=self._execution_suffix,
+                )
+                services = initialize_server_connection(str(conf.server.url))
+                self._conf = conf
+                self._services = services
+                namespace = str(conf.server.namespace)
+                self._registry = MetricRegistry(namespace=namespace)
+                self._registry.value(
+                    "experiment_info",
+                    "Experiment execution identity.",
+                    1,
+                    {},
+                    context.labels(),
+                )
+                self._trace_collector = OpenTelemetryTraceCollector(
+                    namespace=namespace,
+                    endpoint=service_url_from_server_url(
+                        context.server_url, services.get("otlp_port"), "/v1/traces"
+                    ),
+                )
+                self._node_ip = ray.util.get_node_ip_address()
+                self._metrics_port = int(conf.prometheus.metrics_report_port)
+                start_metrics_http_server(self._metrics_port, addr=self._node_ip)
+                self._context = context
+                self.register_targets(
+                    [format_host_port(self._node_ip, self._metrics_port)],
+                    identity_in_metrics=True,
+                )
+            else:
+                self.register_targets([])
+        return __version__
+
+    def register_targets(
+        self,
+        addresses: list[str],
+        job_name: str | None = None,
+        labels: list[Mapping[str, Any] | None] | None = None,
+        *,
+        identity_in_metrics: bool = False,
+    ) -> None:
+        """Save exporter addresses until formal init, then register them directly."""
+        if labels is not None and len(labels) != len(addresses):
+            raise RunError("labels length must match server_addresses length")
+        item = (addresses, job_name, labels, identity_in_metrics)
+        if addresses and item not in self._pending_targets:
+            if len(self._pending_targets) >= 64:
+                raise RunError("Too many targets waiting for initialization")
+            self._pending_targets.append(item)
+        if self._context is None:
+            return
+        for pending in list(self._pending_targets):
+            if not _register_targets(
+                *pending[:3], self._context, identity_in_metrics=pending[3]
+            ):
+                raise RunError(
+                    "Cannot register Prometheus targets; retry init(refresh=True)", 503
+                )
+            self._pending_targets.remove(pending)
 
     def apply_event(self, event: dict[str, Any]) -> None:
         """Dispatch one event by ``kind``: counter/gauge/histogram update Prometheus registry, trace exports OTLP.
@@ -120,6 +151,10 @@ class MonitorHubActor(MonitorCollector):
         Args:
             event: Must include ``kind``; metric kinds need ``name``/``value``; trace needs ``start_time_ns``/``end_time_ns``.
         """
+        if self._context is None:
+            raise RunError(
+                "Monitor Hub is not initialized; call rl_insight.init() first"
+            )
         self._events_applied += 1
         event = dict(event)
         field = (
@@ -137,6 +172,10 @@ class MonitorHubActor(MonitorCollector):
         handler(event)
 
     def get_context(self) -> RunContext:
+        if self._context is None:
+            raise RunError(
+                "Monitor Hub is not initialized; call rl_insight.init() first"
+            )
         return replace(
             self._context,
             actor_name=MonitorRayActor.NAME,
