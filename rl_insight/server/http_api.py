@@ -52,6 +52,10 @@ def get_server_services(base_url: str | None = None) -> dict[str, Any]:
     """Fetch the Server's service endpoints, retrying transient failures."""
     base_url = (base_url or server_url()).strip().rstrip("/")
     if not base_url:
+        logger.error(
+            "[rl-insight] RL-Insight server URL is required; set %s",
+            MonitorEnv.SERVER_URL,
+        )
         raise RunError(f"RL-Insight requires a Server URL; set {MonitorEnv.SERVER_URL}")
 
     url = f"{base_url}{MonitorServer.API_PREFIX}/services"
@@ -88,6 +92,11 @@ def get_server_services(base_url: str | None = None) -> dict[str, Any]:
         if attempt + 1 < MonitorServer.SERVICE_DISCOVERY_RETRIES:
             time.sleep(MonitorServer.SERVICE_DISCOVERY_RETRY_DELAY_SECONDS)
 
+    logger.error(
+        "[rl-insight] Failed to fetch RL-Insight server services at %s: %s",
+        url,
+        last_error,
+    )
     raise RunError(
         f"Cannot fetch RL-Insight services at {url}: {last_error}", 503
     ) from last_error

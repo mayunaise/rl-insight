@@ -27,12 +27,7 @@ from .. import __version__
 from ..collector.ray_monitor_hub import MonitorHubActor
 from ..server.http_api import initialize_server_connection
 from ..utils.constants import MonitorRayActor, MonitorServer
-from ..utils.protocol import (
-    MIN_SUPPORTED_VERSION,
-    RunContext,
-    RunError,
-    require_version,
-)
+from ..utils.protocol import RunContext, RunError, require_version
 from .base import MonitorClient
 
 logger = logging.getLogger(__name__)
@@ -47,37 +42,18 @@ _hub_owners: list[Any] = []
 def _current_job_actor_name() -> str:
     """Return a hub actor name scoped to the current Ray job."""
     job_id = ray.get_runtime_context().get_job_id()
-    return f"{MonitorRayActor.NAME}_{job_id}"
+    job_id_str = job_id if isinstance(job_id, str) else job_id.hex()
+    return f"{MonitorRayActor.NAME}_{job_id_str}"
 
 
 def _initialize_hub_connection(
     hub: Any, *, timeout: float, conf: DictConfig | None = None
 ) -> None:
-    if not hasattr(hub, "connect"):
-        require_version(None, "Ray Hub (initialization API unavailable)")
-    try:
-        version = ray.get(hub.connect.remote(__version__), timeout=timeout)
-        require_version(version, "Ray Hub")
-        if conf is not None:
-            ray.get(hub.init.remote(conf), timeout=timeout)
-    except ray.exceptions.ActorUnavailableError:
-        # Preserve the caller's retry path for temporary unavailability.
-        raise
-    except (ray.exceptions.RayActorError, ray.exceptions.RayTaskError) as exc:
-        if isinstance(exc, ray.exceptions.RayTaskError) and isinstance(
-            exc.cause, RunError
-        ):
-            raise exc.cause from exc
-        if "No module named 'rl_insight.utils.protocol'" in str(exc):
-            require_version(None, "Ray worker SDK (version protocol unavailable)")
-        message = (
-            "Failed to communicate with the RL-Insight Ray Hub. "
-            f"The SDK on the driver, Hub and all workers must be >= {MIN_SUPPORTED_VERSION}. "
-            "Upgrade older SDKs and restart the training job. "
-            "See the chained Ray error for the underlying cause."
-        )
-        logger.error(message)
-        raise RunError(message, 502) from exc
+    """Verify the Hub version before applying task configuration."""
+    version = ray.get(hub.connect.remote(__version__), timeout=timeout)
+    require_version(version, "Ray Hub")
+    if conf is not None:
+        ray.get(hub.init.remote(conf), timeout=timeout)
 
 
 def get_or_create_monitor_hub() -> Any:
@@ -85,9 +61,16 @@ def get_or_create_monitor_hub() -> Any:
     actor_name = _current_job_actor_name()
     namespace = MonitorRayActor.NAMESPACE
     try:
-        return ray.get_actor(actor_name, namespace=namespace)
+        handle = ray.get_actor(actor_name, namespace=namespace)
+        logger.info(
+            "[rl-insight] Connected to existing monitor hub actor %r.", actor_name
+        )
+        return handle
     except ValueError:
-        pass
+        logger.info(
+            "[rl-insight] No existing monitor hub actor %r found; creating one.",
+            actor_name,
+        )
     actor_options: dict[str, Any] = {
         "name": actor_name,
         "namespace": namespace,

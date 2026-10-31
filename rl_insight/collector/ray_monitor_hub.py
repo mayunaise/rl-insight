@@ -115,6 +115,14 @@ class MonitorHubActor(MonitorCollector):
             [format_host_port(self._node_ip, self._metrics_port)],
             identity_in_metrics=True,
         )
+        logger.info(
+            "[rl-insight] MonitorHubActor HTTP bind %s:%s, "
+            "Prometheus scrape target %s:%s",
+            self._node_ip,
+            self._metrics_port,
+            self._node_ip,
+            self._metrics_port,
+        )
 
     def register_targets(
         self,

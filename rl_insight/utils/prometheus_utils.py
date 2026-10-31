@@ -497,6 +497,11 @@ def _register_targets(
         else str(os.environ.get(MonitorEnv.SERVER_URL, "")).strip().rstrip("/")
     )
     if not base_url:
+        logger.error(
+            "[rl-insight] RL-Insight server URL is required; "
+            "set %s to register Prometheus targets",
+            MonitorEnv.SERVER_URL,
+        )
         return False
     payload: dict[str, Any] = {
         "job_name": job_name or PrometheusScrape.TRAINER_METRICS_JOB,
