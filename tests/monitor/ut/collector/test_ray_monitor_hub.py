@@ -26,7 +26,7 @@ from omegaconf import OmegaConf
 from rl_insight import __version__
 from rl_insight.collector import ray_monitor_hub as hub_module
 from rl_insight.utils.constants import MonitorEventKind, MonitorRayActor
-from rl_insight.utils.protocol import RunContext, RunError
+from rl_insight.utils.protocol import RunContext
 
 HubImplementation = cast(
     Any, hub_module.MonitorHubActor
@@ -85,10 +85,12 @@ def test_init_should_configure_collectors_and_register_scrape_target_when_create
     assert instance.connect(__version__) == __version__
     instance.register_targets(["10.0.0.9:1234"], "vllm", [{"replica": 0}])
     update_config.assert_not_called()
-    with pytest.raises(RunError, match="not initialized"):
-        instance.get_context()
+    assert instance.get_context() is None
+    instance.apply_event({"kind": "counter", "name": "early", "value": 1})
+    registry.count.assert_not_called()
+    assert instance._events_applied == 0
     conf.run_metadata = {"project": "p", "experiment_name": "chosen"}
-    instance.connect(__version__, conf)
+    instance.init(conf)
 
     registry_factory.assert_called_once_with(namespace="trainer")
     trace_factory.assert_called_once_with(
@@ -112,7 +114,7 @@ def test_init_should_configure_collectors_and_register_scrape_target_when_create
     assert re.fullmatch(
         r"chosen_[0-9]{8}-[0-9]{6}_[0-9a-f]{8}", instance._context.experiment_name
     )
-    instance.connect(__version__, conf)
+    instance.init(conf)
     registry_factory.assert_called_once()
     start_server.assert_called_once()
 

@@ -72,51 +72,49 @@ class MonitorHubActor(MonitorCollector):
             MonitorEventKind.TRACE: self._handle_trace,
         }
 
-    def connect(
-        self, client_version: str | None = None, conf: DictConfig | None = None
-    ) -> str:
-        """Verify the SDK and apply the first explicit initialization config."""
+    def connect(self, client_version: str | None = None) -> str:
+        """Verify the SDK without binding task names or starting collection."""
         require_version(client_version, "Client")
-        if conf is not None:
-            if self._context is None:
-                metadata = conf.get("run_metadata", {})
-                context = RunContext.create(
-                    str(metadata.get("project", MonitorDefaults.PROJECT_NAME)),
-                    str(
-                        metadata.get("experiment_name", MonitorDefaults.EXPERIMENT_NAME)
-                    ),
-                    str(conf.server.url),
-                    suffix=self._execution_suffix,
-                )
-                services = initialize_server_connection(str(conf.server.url))
-                self._conf = conf
-                self._services = services
-                namespace = str(conf.server.namespace)
-                self._registry = MetricRegistry(namespace=namespace)
-                self._registry.value(
-                    "experiment_info",
-                    "Experiment execution identity.",
-                    1,
-                    {},
-                    context.labels(),
-                )
-                self._trace_collector = OpenTelemetryTraceCollector(
-                    namespace=namespace,
-                    endpoint=service_url_from_server_url(
-                        context.server_url, services.get("otlp_port"), "/v1/traces"
-                    ),
-                )
-                self._node_ip = ray.util.get_node_ip_address()
-                self._metrics_port = int(conf.prometheus.metrics_report_port)
-                start_metrics_http_server(self._metrics_port, addr=self._node_ip)
-                self._context = context
-                self.register_targets(
-                    [format_host_port(self._node_ip, self._metrics_port)],
-                    identity_in_metrics=True,
-                )
-            else:
-                self.register_targets([])
         return __version__
+
+    def init(self, conf: DictConfig) -> None:
+        """Apply task configuration and start collecting with the selected names."""
+        if self._context is not None:
+            self.register_targets([])
+            return
+        metadata = conf.get("run_metadata", {})
+        project = str(metadata.get("project", MonitorDefaults.PROJECT_NAME))
+        experiment_name = str(
+            metadata.get("experiment_name", MonitorDefaults.EXPERIMENT_NAME)
+        )
+        context = RunContext.create(
+            project,
+            experiment_name,
+            str(conf.server.url),
+            suffix=self._execution_suffix,
+        )
+        services = initialize_server_connection(str(conf.server.url))
+        self._conf = conf
+        self._services = services
+        namespace = str(conf.server.namespace)
+        self._registry = MetricRegistry(namespace=namespace)
+        self._registry.value(
+            "experiment_info", "Experiment execution identity.", 1, {}, context.labels()
+        )
+        self._trace_collector = OpenTelemetryTraceCollector(
+            namespace=namespace,
+            endpoint=service_url_from_server_url(
+                context.server_url, services.get("otlp_port"), "/v1/traces"
+            ),
+        )
+        self._node_ip = ray.util.get_node_ip_address()
+        self._metrics_port = int(conf.prometheus.metrics_report_port)
+        start_metrics_http_server(self._metrics_port, addr=self._node_ip)
+        self._context = context
+        self.register_targets(
+            [format_host_port(self._node_ip, self._metrics_port)],
+            identity_in_metrics=True,
+        )
 
     def register_targets(
         self,
@@ -152,9 +150,7 @@ class MonitorHubActor(MonitorCollector):
             event: Must include ``kind``; metric kinds need ``name``/``value``; trace needs ``start_time_ns``/``end_time_ns``.
         """
         if self._context is None:
-            raise RunError(
-                "Monitor Hub is not initialized; call rl_insight.init() first"
-            )
+            return
         self._events_applied += 1
         event = dict(event)
         field = (
@@ -171,11 +167,9 @@ class MonitorHubActor(MonitorCollector):
             raise ValueError(f"Unknown event kind: {kind!r}")
         handler(event)
 
-    def get_context(self) -> RunContext:
+    def get_context(self) -> RunContext | None:
         if self._context is None:
-            raise RunError(
-                "Monitor Hub is not initialized; call rl_insight.init() first"
-            )
+            return None
         return replace(
             self._context,
             actor_name=MonitorRayActor.NAME,

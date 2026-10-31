@@ -172,14 +172,21 @@ from rl_insight.utils.protocol import RunError
 url = sys.argv[1]
 ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
 try:
+    os.environ.pop("RL_INSIGHT_SERVER_URL", None)
+    insight.init()
+    assert insight.get_context() is None
+    insight.metric_gauge("before_init", 1)
+    assert insight.get_context() is None
+    os.environ["RL_INSIGHT_SERVER_URL"] = url
     try:
-        insight.init()
+        insight.init(config={})
     except RunError as exc:
         assert exc.status == 503
-        insight.init()
+        insight.init(config={})
     default = insight.get_context()
     assert default.project == "default"
     assert default.original_experiment_name == "default"
+    assert default.events_applied == 0
     insight.metric_gauge("default_names", 1)
     assert insight.get_context().events_applied == 1
     with warnings.catch_warnings(record=True) as caught:
@@ -200,7 +207,8 @@ try:
             insight.init()
             with insight.trace_state("sleep", state_lane_id="early_replica"):
                 pass
-            return insight.get_context().to_dict()
+            context = insight.get_context()
+            return context.to_dict() if context else None
 
         def refresh(self):
             insight.init(refresh=True)
@@ -215,13 +223,14 @@ try:
     early_actor = ray.get(native.remote("127.0.0.1:19999"))
     targets = yaml.safe_load(Path(sys.argv[2]).read_text())
     assert not any("127.0.0.1:19999" in group["targets"] for group in targets)
+    workers = [Worker.remote(), Worker.remote()]
+    assert ray.get([worker.trace_with_defaults.remote() for worker in workers], timeout=20) == [None, None]
     insight.init(project="ray", experiment_name="same", config={"server": {"url": url}})
     first = insight.get_context()
     actor = ray.get(native.remote("127.0.0.1:19998"))
     assert actor == early_actor
     with insight.trace_state("driver_prepare", state_lane_id="early_driver"):
         pass
-    workers = [Worker.remote(), Worker.remote()]
     contexts = ray.get([worker.trace_with_defaults.remote() for worker in workers], timeout=20)
     assert {context["experiment_name"] for context in contexts} == {first.experiment_name}
     assert ray.get(workers[0].refresh.remote())["experiment_name"] == first.experiment_name

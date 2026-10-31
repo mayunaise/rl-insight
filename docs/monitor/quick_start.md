@@ -103,15 +103,6 @@ while True:
     time.sleep(0.5)
 ```
 
-
-Names passed to `init()` take precedence over defaults. Omitting both names uses project `default` and experiment `default`; the execution name shown in Grafana still includes a timestamp and short suffix. Initialize the driver with the intended names before starting SDK workers so they share that execution.
-
-Repeated `init()` calls are ignored unless you pass `refresh=True`. A refresh merges explicit configuration overrides, retains omitted names and reconnects to the job's existing execution:
-
-```python
-insight.init(refresh=True)
-```
-
 ## 5. Open Grafana
 
 Open the Grafana URL printed by `rl-insight server start`. By default, Grafana listens at:

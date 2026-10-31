@@ -97,13 +97,19 @@ def init(
             Omitted names retain their current values during a refresh.
 
     Note:
-        Ray requires ``ray.init()`` first. Initial calls default to project
-        ``default`` and experiment ``default``. Repeated calls require
-        ``refresh=True``; otherwise they are ignored with ``RuntimeWarning``.
+        Ray requires ``ray.init()`` first. A no-argument call connects to the
+        current task; pass configuration or names to start monitoring. Use
+        ``init(config={})`` to start with default names. After monitoring starts,
+        repeated calls require ``refresh=True``; otherwise they are ignored with ``RuntimeWarning``.
         The existing job's Hub keeps its execution identity during a refresh.
     """
     global _STATE
-    if _STATE.enabled and not refresh:
+    if (
+        _STATE.enabled
+        and _STATE.conf is not None
+        and _STATE.conf.get("run_metadata") is not None
+        and not refresh
+    ):
         warnings.warn(
             "[rl-insight] monitor.init() called more than once; "
             "use refresh=True to refresh its configuration.",
@@ -138,15 +144,27 @@ def init(
     )
     monitor_conf = load_monitor_config(overrides)
     backend = str(OmegaConf.select(monitor_conf, "server.backend") or "").strip()
+    initialize_task = (
+        backend != MonitorBackend.RAY
+        or any(value is not None for value in (project, experiment_name, config))
+        or refresh
+    )
     # Only the Ray backend talks to the external RL-Insight server; direct-emit
     # backends (e.g. push) intentionally run without a server URL.
-    if backend == MonitorBackend.RAY and not str(monitor_conf.server.url).strip():
+    if (
+        backend == MonitorBackend.RAY
+        and initialize_task
+        and not str(monitor_conf.server.url).strip()
+    ):
         logger.error(
             "[rl-insight] RL-Insight server URL is required; set RL_INSIGHT_SERVER_URL "
             "or server.url in init config."
         )
         return
-    OmegaConf.update(monitor_conf, "run_metadata", metadata, force_add=True)
+    if initialize_task:
+        OmegaConf.update(monitor_conf, "run_metadata", metadata, force_add=True)
+    else:
+        monitor_conf.pop("run_metadata", None)
     client = create_monitor_client(monitor_conf)
     if client is None:
         return

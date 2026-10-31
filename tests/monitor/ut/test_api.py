@@ -65,6 +65,9 @@ def test_init_should_enable_monitoring_when_server_and_client_are_available(
         "project": "project-a",
         "experiment_name": "experiment-a",
     }
+    api.finish()
+    api.init(config={"server": {"url": "http://monitor:18080"}})
+    assert api._STATE.labels == {"project": "default", "experiment_name": "default"}
 
 
 def test_init_should_leave_monitoring_disabled_when_server_url_is_missing(

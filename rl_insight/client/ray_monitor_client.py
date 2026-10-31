@@ -56,12 +56,10 @@ def _initialize_hub_connection(
     if not hasattr(hub, "connect"):
         require_version(None, "Ray Hub (initialization API unavailable)")
     try:
-        connection = (
-            hub.connect.remote(__version__, conf)
-            if conf is not None
-            else hub.connect.remote(__version__)
-        )
-        version = ray.get(connection, timeout=timeout)
+        version = ray.get(hub.connect.remote(__version__), timeout=timeout)
+        require_version(version, "Ray Hub")
+        if conf is not None:
+            ray.get(hub.init.remote(conf), timeout=timeout)
     except ray.exceptions.ActorUnavailableError:
         # Preserve the caller's retry path for temporary unavailability.
         raise
@@ -80,7 +78,6 @@ def _initialize_hub_connection(
         )
         logger.error(message)
         raise RunError(message, 502) from exc
-    require_version(version, "Ray Hub")
 
 
 def get_or_create_monitor_hub() -> Any:
@@ -114,10 +111,12 @@ def create_ray_monitor_client(conf: DictConfig) -> MonitorRayClient | None:
         logger.warning("[rl-insight] Ray is not initialized; monitoring is disabled.")
         return None
 
-    initialize_server_connection(str(conf.server.url))
+    task_conf = conf if conf.get("run_metadata") is not None else None
+    if task_conf is not None:
+        initialize_server_connection(str(task_conf.server.url))
     handle = get_or_create_monitor_hub()
     client = MonitorRayClient(handle)
-    client.initialize(conf)
+    client.initialize(task_conf)
     return client
 
 
@@ -167,7 +166,7 @@ class MonitorRayClient(MonitorClient):
         if not self._initialized:
             return None
         context = ray.get(self._actor.get_context.remote(), timeout=self._timeout)
-        if not isinstance(context, RunContext):
+        if context is not None and not isinstance(context, RunContext):
             raise RunError("Ray Hub returned an invalid Context", 502)
         return context
 
