@@ -20,6 +20,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -161,7 +162,14 @@ class PrometheusTargetStore:
         )
         try:
             tmp_path.write_text(payload, encoding="utf-8")
-            os.replace(tmp_path, self.targets_file)
+            for attempt in range(5):
+                try:
+                    os.replace(tmp_path, self.targets_file)
+                    break
+                except OSError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05)
         except BaseException:
             try:
                 tmp_path.unlink()
