@@ -80,9 +80,9 @@ class _MonitorState:
 _STATE = _MonitorState()
 
 
-def _uses_ray_backend() -> bool:
+def _get_monitor_backend() -> str:
     conf = _STATE.conf if _STATE.conf is not None else load_monitor_config()
-    return str(conf.server.backend).strip() == MonitorBackend.RAY
+    return str(conf.server.backend).strip()
 
 
 def init(
@@ -357,7 +357,9 @@ def trace_state(
     """
 
     try:
-        if _STATE.client is None and (_STATE.conf is None or _uses_ray_backend()):
+        if _STATE.client is None and (
+            _STATE.conf is None or _get_monitor_backend() == MonitorBackend.RAY
+        ):
             _STATE.client = create_monitor_client()
     except Exception as e:
         logger.error(

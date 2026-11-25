@@ -34,6 +34,7 @@ from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 from ..server.network import format_host_port, local_addresses
 from .constants import (
+    MonitorBackend,
     MonitorPaths,
     PrometheusScrape,
     prometheus_targets_file_from_config,
@@ -418,9 +419,9 @@ def update_prometheus_config(
         )
         return
 
-    from ..api import _uses_ray_backend
+    from ..api import _get_monitor_backend
 
-    if not _uses_ray_backend():
+    if _get_monitor_backend() != MonitorBackend.RAY:
         return
 
     import ray
