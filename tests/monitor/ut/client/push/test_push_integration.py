@@ -21,11 +21,13 @@ import sys
 import types
 from collections.abc import Generator
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 from omegaconf import OmegaConf
 
-from rl_insight import api
+from rl_insight import api, update_prometheus_config
+from rl_insight.client import ray_monitor_client
 from rl_insight.client.push import poller as poller_module
 from rl_insight.client.push.sinks.base import PushSink
 
@@ -129,6 +131,25 @@ def test_init_push_registers_rollout_targets_and_finish_releases(
     assert poller_module.get_active_registry() is None
     assert sinks and sinks[0].closed is True
     assert api._STATE.enabled is False
+
+
+@pytest.mark.parametrize("trace_sink", [True, False])
+def test_push_does_not_connect_to_ray_without_a_rollout_poller(
+    monkeypatch: pytest.MonkeyPatch, trace_sink: bool
+) -> None:
+    monkeypatch.delenv("RL_INSIGHT_CONFIG", raising=False)
+    monkeypatch.delenv("RL_INSIGHT_SERVER_BACKEND", raising=False)
+    monkeypatch.setattr(ray_monitor_client.ray, "is_initialized", lambda: True)
+    connect = Mock()
+    monkeypatch.setattr(ray_monitor_client, "get_or_create_monitor_hub", connect)
+
+    sinks = [{"driver": LOGGING_DRIVER, "streams": ["trace"]}] if trace_sink else []
+    api.init(config={"server": {"backend": "push"}, "push": {"sinks": sinks}})
+    with api.trace_state("worker"):
+        pass
+    update_prometheus_config(["127.0.0.1:9000"], "vllm")
+
+    connect.assert_not_called()
 
 
 def test_init_ray_without_server_url_stays_disabled(

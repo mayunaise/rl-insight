@@ -80,6 +80,11 @@ class _MonitorState:
 _STATE = _MonitorState()
 
 
+def _uses_ray_backend() -> bool:
+    conf = _STATE.conf if _STATE.conf is not None else load_monitor_config()
+    return str(conf.server.backend).strip() == MonitorBackend.RAY
+
+
 def init(
     project: str | None = None,
     experiment_name: str | None = None,
@@ -109,6 +114,7 @@ def init(
         return
 
     monitor_conf = load_monitor_config(config)
+    _STATE.conf = monitor_conf
     backend = str(OmegaConf.select(monitor_conf, "server.backend") or "").strip()
     metadata = {
         "project": project if project is not None else MonitorDefaults.PROJECT_NAME,
@@ -351,7 +357,7 @@ def trace_state(
     """
 
     try:
-        if _STATE.client is None:
+        if _STATE.client is None and (_STATE.conf is None or _uses_ray_backend()):
             _STATE.client = create_monitor_client()
     except Exception as e:
         logger.error(

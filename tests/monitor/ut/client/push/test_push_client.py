@@ -527,18 +527,9 @@ def test_factory_returns_none_when_all_drivers_fail(
     assert create_push_monitor_client(conf) is None
 
 
-def _reset_bootstrap() -> None:
-    api.finish()
-    poller_module.set_active_registry(None)
-    prom_utils._push_bootstrap_attempted = False
-
-
-def test_register_targets_bootstraps_push_client_in_uninitialized_process(
+def test_register_targets_requires_initialized_push_client(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
-    # Simulate a Ray rollout actor process: rl_insight.init() was never called,
-    # but RL_INSIGHT_CONFIG points at a push config and the engine registers its
-    # scrape targets via update_prometheus_config().
     sinks: list[RecordingSink] = []
     _install_driver("fake_boot_mod", sinks)
     conf_path = tmp_path / "push.yaml"
@@ -562,13 +553,16 @@ push:
     )
     monkeypatch.setenv("RL_INSIGHT_CONFIG", str(conf_path))
     monkeypatch.delenv("RL_INSIGHT_SERVER_URL", raising=False)
-    _reset_bootstrap()
+    api.finish()
     try:
-        prom_utils.update_prometheus_config(
-            ["[fdbd::1]:1", "127.0.0.1:2"],
-            "vllm",
-            [{"replica": 0}, {"replica": 1}],
-        )
+        addresses = ["[fdbd::1]:1", "127.0.0.1:2"]
+        labels = [{"replica": 0}, {"replica": 1}]
+        prom_utils.update_prometheus_config(addresses, "vllm", labels)
+        assert poller_module.get_active_registry() is None
+        assert not sinks
+
+        api.init(project="project", experiment_name="experiment")
+        prom_utils.update_prometheus_config(addresses, "vllm", labels)
         registry = poller_module.get_active_registry()
         assert registry is not None
         snap = {t.address: t.labels for t in registry.snapshot()}
@@ -578,7 +572,7 @@ push:
         }
         assert len(sinks) == 1
     finally:
-        _reset_bootstrap()
+        api.finish()
         sys.modules.pop("fake_boot_mod", None)
 
 
@@ -595,9 +589,9 @@ server:
     )
     monkeypatch.setenv("RL_INSIGHT_CONFIG", str(conf_path))
     monkeypatch.delenv("RL_INSIGHT_SERVER_URL", raising=False)
-    _reset_bootstrap()
+    api.finish()
     try:
         prom_utils.update_prometheus_config(["127.0.0.1:1"])
         assert poller_module.get_active_registry() is None
     finally:
-        _reset_bootstrap()
+        api.finish()
