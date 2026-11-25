@@ -39,6 +39,7 @@ from .constants import (
     PrometheusScrape,
     prometheus_targets_file_from_config,
 )
+from .monitor_config_loader import load_monitor_config
 from .protocol import RunContext
 
 logger = logging.getLogger(__file__)
@@ -380,16 +381,15 @@ _push_bootstrap_lock = threading.Lock()
 _push_bootstrap_attempted = False
 
 
-def _bootstrap_push_registry():
+def _bootstrap_push_registry(conf: DictConfig):
     """Start the push backend in a process without an explicit ``init()``.
 
     Some integrations (e.g. Ray rollout actors in verl) call
     :func:`update_prometheus_config` from a worker process that never ran
     ``rl_insight.init()``. For the direct-emit push backend the client needs no
     external server, so it is safe to construct it lazily here: building the
-    push client also creates its :class:`PrometheusPoller` and publishes the
-    process-wide scrape target registry. Returns that registry, or ``None``
-    when the configured backend is not ``push`` / bootstrap is unavailable.
+    push client starts its :class:`PrometheusPoller` when rollout metrics are
+    configured. Returns its scrape target registry when available.
     """
     global _push_bootstrap_attempted
     with _push_bootstrap_lock:
@@ -403,12 +403,6 @@ def _bootstrap_push_registry():
         _push_bootstrap_attempted = True
         try:
             from .. import api as _api
-            from .monitor_config_loader import load_monitor_config
-
-            conf = load_monitor_config(None)
-            backend = str(OmegaConf.select(conf, "server.backend") or "").strip()
-            if backend != MonitorBackend.PUSH:
-                return None
             from ..client.push.tags import collect_env_tags
 
             # Use the same task names as early Push events.
@@ -437,11 +431,11 @@ def update_prometheus_config(
     *,
     context: RunContext | None = None,
 ) -> None:
-    """Register trainer metrics endpoints with the RL-Insight server.
+    """Register trainer metrics endpoints with the configured backend.
 
-    The RL-Insight server writes these targets into its file_sd discovery file;
-    Prometheus observes the update automatically. ``server_addresses`` should
-    contain scrape targets in ``host:port`` or ``[ipv6]:port`` form, not full URLs.
+    Ray publishes targets for Prometheus file_sd discovery. Push registers them
+    with the process-local rollout poller. Pass scrape targets in ``host:port``
+    or ``[ipv6]:port`` form.
 
     Args:
         server_addresses: Prometheus scrape targets exposed by trainer-side
@@ -460,23 +454,32 @@ def update_prometheus_config(
             f"{len(labels)} != {len(server_addresses)}"
         )
 
-    # Push backend: no external RL-Insight server is involved. Register targets
-    # in-process so the local rollout poller scrapes them directly.
-    from ..client.push.poller import get_active_registry
+    from .. import api as _api
 
-    registry = get_active_registry()
-    if registry is None:
-        # Targets may be registered from a Ray actor process that never called
-        # rl_insight.init() (e.g. the verl colocated rollout actor). For the
-        # direct-emit push backend the client is self-contained, so lazily start
-        # it in this process once; its poller owns the scrape target registry.
-        registry = _bootstrap_push_registry()
-    if registry is not None:
-        registry.set_targets(server_addresses, labels)
-        logger.info(
-            "[rl-insight] Registered %d push scrape targets in-process",
-            len(server_addresses),
-        )
+    try:
+        conf = _api._STATE.conf
+        if conf is None:
+            conf = load_monitor_config()
+        backend = str(OmegaConf.select(conf, "server.backend") or "").strip()
+    except Exception:
+        logger.exception("[rl-insight] Cannot resolve backend for Prometheus targets")
+        return
+
+    if backend == MonitorBackend.PUSH:
+        from ..client.push.poller import get_active_registry
+
+        registry = get_active_registry()
+        if registry is None and not _api._STATE.enabled:
+            registry = _bootstrap_push_registry(conf)
+        if registry is not None:
+            registry.set_targets(server_addresses, labels)
+            logger.info(
+                "[rl-insight] Registered %d push scrape targets in-process",
+                len(server_addresses),
+            )
+        return
+
+    if backend != MonitorBackend.RAY:
         return
 
     import ray

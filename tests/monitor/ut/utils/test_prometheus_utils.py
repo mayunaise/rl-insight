@@ -270,6 +270,7 @@ def test_update_prometheus_config_should_register_in_process_when_push_active(
     registry = poller_module.TargetRegistry()
     poller_module.set_active_registry(registry)
     post = MagicMock(side_effect=AssertionError("push backend must not POST"))
+    monkeypatch.setenv("RL_INSIGHT_SERVER_BACKEND", "push")
     monkeypatch.delenv("RL_INSIGHT_SERVER_URL", raising=False)
     monkeypatch.setattr(prometheus_module.requests, "post", post)
     try:
