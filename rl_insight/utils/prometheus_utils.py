@@ -34,12 +34,10 @@ from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 from ..server.network import format_host_port, local_addresses
 from .constants import (
-    MonitorBackend,
     MonitorPaths,
     PrometheusScrape,
     prometheus_targets_file_from_config,
 )
-from .monitor_config_loader import load_monitor_config
 from .protocol import RunContext
 
 logger = logging.getLogger(__file__)
@@ -377,53 +375,6 @@ class MetricRegistry:
             histogram.observe(value)
 
 
-_push_bootstrap_lock = threading.Lock()
-_push_bootstrap_attempted = False
-
-
-def _bootstrap_push_registry(conf: DictConfig):
-    """Start the push backend in a process without an explicit ``init()``.
-
-    Some integrations (e.g. Ray rollout actors in verl) call
-    :func:`update_prometheus_config` from a worker process that never ran
-    ``rl_insight.init()``. For the direct-emit push backend the client needs no
-    external server, so it is safe to construct it lazily here: building the
-    push client starts its :class:`PrometheusPoller` when rollout metrics are
-    configured. Returns its scrape target registry when available.
-    """
-    global _push_bootstrap_attempted
-    with _push_bootstrap_lock:
-        from ..client.push.poller import get_active_registry
-
-        existing = get_active_registry()
-        if existing is not None:
-            return existing
-        if _push_bootstrap_attempted:
-            return None
-        _push_bootstrap_attempted = True
-        try:
-            from .. import api as _api
-            from ..client.push.tags import collect_env_tags
-
-            # Use the same task names as early Push events.
-            tags: dict[str, str] = {}
-            for sink_conf in OmegaConf.select(conf, "push.sinks") or []:
-                try:
-                    tags.update(
-                        collect_env_tags(OmegaConf.select(sink_conf, "tags_from_env"))
-                    )
-                except Exception:  # noqa: BLE001 - the factory logs and skips this sink
-                    continue
-            _api.init(
-                project=tags.get("project"),
-                experiment_name=tags.get("experiment_name"),
-            )
-        except Exception:  # noqa: BLE001 - monitoring must never break training
-            logger.exception("[rl-insight] push backend in-process bootstrap failed")
-            return None
-        return get_active_registry()
-
-
 def update_prometheus_config(
     server_addresses: list[str],
     job_name: str | None = None,
@@ -454,73 +405,11 @@ def update_prometheus_config(
             f"{len(labels)} != {len(server_addresses)}"
         )
 
-    from .. import api as _api
+    from ..api import _get_worker_client
 
-    try:
-        conf = _api._STATE.conf
-        if conf is None:
-            conf = load_monitor_config()
-        backend = str(OmegaConf.select(conf, "server.backend") or "").strip()
-    except Exception:
-        logger.exception("[rl-insight] Cannot resolve backend for Prometheus targets")
-        return
-
-    if backend == MonitorBackend.PUSH:
-        from ..client.push.poller import get_active_registry
-
-        registry = get_active_registry()
-        if registry is None and not _api._STATE.enabled:
-            registry = _bootstrap_push_registry(conf)
-        if registry is not None:
-            registry.set_targets(server_addresses, labels)
-            logger.info(
-                "[rl-insight] Registered %d push scrape targets in-process",
-                len(server_addresses),
-            )
-        return
-
-    if backend != MonitorBackend.RAY:
-        return
-
-    import ray
-
-    from ..client.ray_monitor_client import (
-        get_or_create_monitor_hub,
-        initialize_hub_connection,
-    )
-
-    if not ray.is_initialized():
-        logger.warning(
-            "[rl-insight] Ray is not initialized; Prometheus targets are not registered."
-        )
-        return
-    try:
-        hub = get_or_create_monitor_hub()
-        initialize_hub_connection(hub, timeout=30)
-        hub_context = ray.get(hub.get_context.remote(), timeout=30)
-        if hub_context is not None and hub_context.initialized:
-            context = context if context is not None else hub_context
-            register_prometheus_targets(
-                server_addresses,
-                job_name,
-                [
-                    context.labels(target_labels)
-                    for target_labels in (labels or [None] * len(server_addresses))
-                ],
-                context,
-            )
-        else:
-            ray.get(
-                hub.register_targets.remote(server_addresses, job_name, labels),
-                timeout=30,
-            )
-    except Exception as e:
-        logger.error(
-            "[rl-insight] Cannot register Prometheus targets through Ray (%s): %s",
-            type(e).__name__,
-            e,
-            exc_info=True,
-        )
+    client = _get_worker_client()
+    if client is not None:
+        client.register_targets(server_addresses, job_name, labels, context=context)
 
 
 def register_prometheus_targets(

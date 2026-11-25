@@ -31,6 +31,7 @@ from typing import Any
 from omegaconf import DictConfig, OmegaConf
 
 from .client import create_monitor_client
+from .client.base import MonitorClient
 from .utils.monitor_config_loader import load_monitor_config
 from .utils import MonitorBackend, MonitorEventKind
 from .utils.constants import MonitorDefaults
@@ -75,6 +76,8 @@ class _MonitorState:
 
 
 _STATE = _MonitorState()
+_push_bootstrap_lock = threading.Lock()
+_push_bootstrap_attempted = False
 
 
 def init(
@@ -139,6 +142,57 @@ def init(
             type(e).__name__,
             e,
             exc_info=True,
+        )
+
+
+def _prepare_monitor_client(conf: DictConfig | None = None) -> MonitorClient | None:
+    """Get the local client or prepare it without formal initialization."""
+    if _STATE.client is None:
+        try:
+            _STATE.client = create_monitor_client(conf)
+        except Exception:
+            logger.exception("[rl-insight] Cannot prepare monitor client")
+    return _STATE.client
+
+
+def _get_worker_client() -> MonitorClient | None:
+    """Reuse the local client, or connect to Ray / start Push for a worker."""
+    if _STATE.client is not None:
+        return _STATE.client
+
+    try:
+        conf = load_monitor_config()
+        backend = str(OmegaConf.select(conf, "server.backend") or "").strip()
+        if backend == MonitorBackend.RAY:
+            conf.pop("run_metadata", None)
+            return _prepare_monitor_client(conf)
+        if backend == MonitorBackend.PUSH:
+            _start_push_worker(conf)
+    except Exception:
+        logger.exception("[rl-insight] Cannot start worker monitor client")
+    return _STATE.client
+
+
+def _start_push_worker(conf: DictConfig) -> None:
+    global _push_bootstrap_attempted
+    with _push_bootstrap_lock:
+        if _STATE.client is not None or _push_bootstrap_attempted:
+            return
+        _push_bootstrap_attempted = True
+        from .client.push.tags import collect_env_tags
+
+        # Use the same task names as early Push events.
+        tags: dict[str, str] = {}
+        for sink_conf in OmegaConf.select(conf, "push.sinks") or []:
+            try:
+                tags.update(
+                    collect_env_tags(OmegaConf.select(sink_conf, "tags_from_env"))
+                )
+            except Exception:  # noqa: BLE001 - the factory logs and skips this sink
+                continue
+        init(
+            project=tags.get("project"),
+            experiment_name=tags.get("experiment_name"),
         )
 
 
@@ -340,17 +394,7 @@ def trace_state(
         Control during the covered code block; the span is emitted on exit.
     """
 
-    try:
-        if _STATE.client is None:
-            _STATE.client = create_monitor_client()
-    except Exception as e:
-        logger.error(
-            "[rl-insight] Cannot prepare state tracing (%s): %s",
-            type(e).__name__,
-            e,
-            exc_info=True,
-        )
-    if _STATE.client is None:
+    if _prepare_monitor_client() is None:
         yield
         return
 

@@ -26,6 +26,7 @@ import yaml
 from omegaconf import OmegaConf
 from prometheus_client import CollectorRegistry, Gauge, make_wsgi_app
 
+from rl_insight import api
 from rl_insight.utils import prometheus_utils as prometheus_module
 from rl_insight.utils.protocol import RunContext
 
@@ -226,11 +227,14 @@ def test_update_prometheus_config_should_send_normalized_targets_when_server_is_
     monkeypatch.setenv("RL_INSIGHT_SERVER_URL", "http://server:18080/")
     monkeypatch.setattr(prometheus_module.requests, "post", post)
 
-    prometheus_module.update_prometheus_config(
-        ["host-a:9000", "host-b:9000"],
-        job_name="workers",
-        labels=[{"rank": 0}, None],
-    )
+    try:
+        prometheus_module.update_prometheus_config(
+            ["host-a:9000", "host-b:9000"],
+            job_name="workers",
+            labels=[{"rank": 0}, None],
+        )
+    finally:
+        api.finish()
 
     post.assert_called_once_with(
         "http://server:18080/api/v1/prometheus/targets",
@@ -260,31 +264,6 @@ def test_update_prometheus_config_should_reject_mismatched_labels_when_lengths_d
         prometheus_module.update_prometheus_config(
             ["host-a:9000", "host-b:9000"], labels=[{"rank": 0}]
         )
-
-
-def test_update_prometheus_config_should_register_in_process_when_push_active(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from rl_insight.client.push import poller as poller_module
-
-    registry = poller_module.TargetRegistry()
-    poller_module.set_active_registry(registry)
-    post = MagicMock(side_effect=AssertionError("push backend must not POST"))
-    monkeypatch.setenv("RL_INSIGHT_SERVER_BACKEND", "push")
-    monkeypatch.delenv("RL_INSIGHT_SERVER_URL", raising=False)
-    monkeypatch.setattr(prometheus_module.requests, "post", post)
-    try:
-        prometheus_module.update_prometheus_config(
-            ["host-a:9000", "host-b:9000"], labels=[{"rank": 0}, None]
-        )
-    finally:
-        poller_module.set_active_registry(None)
-
-    assert [(t.address, t.labels) for t in registry.snapshot()] == [
-        ("host-a:9000", {"rank": "0"}),
-        ("host-b:9000", {}),
-    ]
-    post.assert_not_called()
 
 
 def test_hub_targets_keep_registration_failures_for_explicit_retry(

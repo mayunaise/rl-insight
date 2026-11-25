@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import atexit
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
 from ...utils.constants import MonitorEventKind
+from ...utils.protocol import RunContext
 from ..base import MonitorClient
 from .driver import build_sink
 from .poller import PrometheusPoller, set_active_registry
@@ -104,6 +106,22 @@ class PushMonitorClient(MonitorClient):
             self._route_trace(event)
         else:
             self._route_metric(kind, event)
+
+    def register_targets(
+        self,
+        server_addresses: list[str],
+        job_name: str | None,
+        labels: list[Mapping[str, Any] | None] | None,
+        *,
+        context: RunContext | None,
+    ) -> None:
+        """Register scrape targets with the local rollout poller."""
+        if self._poller is not None:
+            self._poller.targets.set_targets(server_addresses, labels)
+            logger.info(
+                "[rl-insight] Registered %d push scrape targets in-process",
+                len(server_addresses),
+            )
 
     # -- routing -----------------------------------------------------------
     @staticmethod
