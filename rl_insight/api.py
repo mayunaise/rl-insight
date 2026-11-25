@@ -179,21 +179,10 @@ def _start_push_worker(conf: DictConfig) -> None:
         if _STATE.client is not None or _push_bootstrap_attempted:
             return
         _push_bootstrap_attempted = True
-        from .client.push.tags import collect_env_tags
+        from .client.push.client import get_push_task_names
 
-        # Use the same task names as early Push events.
-        tags: dict[str, str] = {}
-        for sink_conf in OmegaConf.select(conf, "push.sinks") or []:
-            try:
-                tags.update(
-                    collect_env_tags(OmegaConf.select(sink_conf, "tags_from_env"))
-                )
-            except Exception:  # noqa: BLE001 - the factory logs and skips this sink
-                continue
-        init(
-            project=tags.get("project"),
-            experiment_name=tags.get("experiment_name"),
-        )
+        project, experiment_name = get_push_task_names(conf)
+        init(project=project, experiment_name=experiment_name)
 
 
 def get_context() -> RunContext | None:
