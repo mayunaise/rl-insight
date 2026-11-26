@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
@@ -52,16 +52,6 @@ class MonitorClient(ABC):
     def get_context(self) -> RunContext | None:
         """Optional identity support; existing third-party clients remain valid."""
         return None
-
-    def register_targets(
-        self,
-        server_addresses: list[str],
-        job_name: str | None,
-        labels: list[Mapping[str, Any] | None] | None,
-        *,
-        context: RunContext | None,
-    ) -> None:
-        """Optionally register Prometheus scrape targets with this backend."""
 
 
 def register_monitor_client(backend: str, factory: MonitorClientFactory) -> None:

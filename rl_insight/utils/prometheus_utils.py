@@ -406,10 +406,11 @@ def update_prometheus_config(
         )
 
     from ..api import _get_worker_client
+    from ..client import register_targets
 
     client = _get_worker_client()
     if client is not None:
-        client.register_targets(server_addresses, job_name, labels, context=context)
+        register_targets(client, server_addresses, job_name, labels, context=context)
 
 
 def register_prometheus_targets(

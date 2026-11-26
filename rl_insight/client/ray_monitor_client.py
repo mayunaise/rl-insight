@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
 from typing import Any, cast
 
 import ray
@@ -27,7 +26,6 @@ from .. import __version__
 from ..collector.ray_monitor_hub import MonitorHubActor
 from ..server.http_api import initialize_server_connection
 from ..utils.constants import MonitorRayActor, MonitorServer
-from ..utils.prometheus_utils import register_prometheus_targets
 from ..utils.protocol import RunContext, require_version
 from .base import MonitorClient
 
@@ -148,40 +146,6 @@ class MonitorRayClient(MonitorClient):
 
     def get_context(self) -> RunContext | None:
         return ray.get(self._actor.get_context.remote(), timeout=self._timeout)
-
-    def register_targets(
-        self,
-        server_addresses: list[str],
-        job_name: str | None,
-        labels: list[Mapping[str, Any] | None] | None,
-        *,
-        context: RunContext | None,
-    ) -> None:
-        """Publish scrape targets or queue them in the Hub before task initialization."""
-        try:
-            hub_context = ray.get(self._actor.get_context.remote(), timeout=30)
-            if hub_context is not None and hub_context.initialized:
-                context = context if context is not None else hub_context
-                register_prometheus_targets(
-                    server_addresses,
-                    job_name,
-                    [
-                        context.labels(target_labels)
-                        for target_labels in (labels or [None] * len(server_addresses))
-                    ],
-                    context,
-                )
-            else:
-                ray.get(
-                    self._actor.register_targets.remote(
-                        server_addresses, job_name, labels
-                    ),
-                    timeout=30,
-                )
-        except Exception:
-            logger.exception(
-                "[rl-insight] Cannot register Prometheus targets through Ray"
-            )
 
     def apply_event(self, event: dict[str, Any]) -> None:
         """Submit ``MonitorHubActor.apply_event`` on the actor (fire-and-forget; no ``ray.get``).
